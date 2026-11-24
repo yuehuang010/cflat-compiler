@@ -2436,7 +2436,12 @@ bool LLVMBackend::CxxConstructorNeedsClangResolution(
         const CxxClassInfo* info = GetCxxClassInfo(typeName);
         if (info == nullptr || !info->hasCtorTemplate) return false;
         if (selected == nullptr) return true;
-        if (selected->isCopyCtor || selected->isMoveCtor) return false;
+        // A copy / move ctor picked for a DERIVED source can lose to an exact template (`T(const U&)`).
+        const bool derivedSource = argTypes.size() == 1 && !argTypes[0].Pointer
+            && IsCxxRecord(argTypes[0].TypeName)
+            && ResolveTypeAlias(argTypes[0].TypeName) != ResolveTypeAlias(typeName)
+            && IsCxxBaseOf(typeName, argTypes[0].TypeName);
+        if ((selected->isCopyCtor || selected->isMoveCtor) && !derivedSource) return false;
         if (selected->params.size() < argTypes.size() + 1) return true;
         for (size_t i = 0; i < argTypes.size(); ++i)
         {

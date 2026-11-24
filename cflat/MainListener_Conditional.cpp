@@ -1658,7 +1658,8 @@ bool MainListener::UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContex
                               const std::function<void()>& atFalse,
                               size_t trueOccurrence, size_t falseOccurrence,
                               bool trueIsUnsigned, bool falseIsUnsigned,
-                              const std::string& interfaceDestination, bool destinationPointer) {
+                              const std::string& interfaceDestination, bool destinationPointer,
+                              const LLVMBackend::TypeAndValue* storeDestination) {
         auto* compiler = Compiler(ctx);
         if (!trueValue || !falseValue) return true;
 
@@ -1707,10 +1708,40 @@ bool MainListener::UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContex
                 || (trueShape.hasSourceType && trueShape.sourceType.IsCxxNullptrT);
             const bool falseNullArm = llvm::isa_and_nonnull<llvm::ConstantPointerNull>(falseValue)
                 || (falseShape.hasSourceType && falseShape.sourceType.IsCxxNullptrT);
-            if (TernaryPointerJoinIsRejected(compiler, trueNamed, falseNamed,
+            const bool joinRejected = TernaryPointerJoinIsRejected(compiler, trueNamed, falseNamed,
                     trueNamed.IsSimd, falseNamed.IsSimd,
                     trueShape.isArrayView, falseShape.isArrayView,
-                    trueNullArm, falseNullArm, interfaceDestination, destinationPointer))
+                    trueNullArm, falseNullArm, interfaceDestination, destinationPointer);
+            // Agreeing arms still have to fit a pointer destination: the joined value carries no
+            // struct pointee, so the store check after the join cannot see `NY*` arms into `NS*`.
+            if (!joinRejected && destinationPointer && storeDestination != nullptr
+                && !DeclExpectedTypeScope::explicitCast)
+            {
+                // A string literal arm is left to the literal-store gate, which names that case.
+                auto isLiteral = [&](llvm::Value* value) {
+                    auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(value);
+                    return constant != nullptr && compiler->IsStringLiteralConstant(constant);
+                };
+                const std::pair<const LLVMBackend::TypeAndValue*, llvm::Value*> arms[] = {
+                    { &trueNamed, trueValue }, { &falseNamed, falseValue } };
+                for (const auto& [named, value] : arms)
+                {
+                    if (!isLiteral(value)
+                        && compiler->IsImplicitUnrelatedStructPointeeConversion(*named, *storeDestination))
+                    {
+                        LogErrorContext(ctx, compiler->ImplicitIntegerPointeeConversionText(
+                            *named, *storeDestination));
+                        break;
+                    }
+                    // A `T**` join reaches the store as a bare pointer, so a cross-class C++ arm
+                    // (`B** = c ? d1 : d2`) is refused per arm; depth 1 converts per arm below.
+                    if (LLVMBackend::ArrayDecayedPointer(*named).ValuePointerDepth() >= 2
+                        && compiler->RejectCxxClassPointerStore(
+                            *storeDestination, *named, "conditional expression"))
+                        break;
+                }
+            }
+            if (joinRejected)
             {
                 LogErrorContext(ctx, UnrelatedPointerJoinDiagnostic(
                     compiler, trueNamed, falseNamed, "?:"));
@@ -2472,7 +2503,21 @@ void MainListener::JoinTernaryClassPointee(LLVMBackend::TypedValue& result,
             isNull = llvm::isa_and_nonnull<llvm::ConstantPointerNull>(arm.value)
                 || (arm.hasSourceType && arm.sourceType.IsCxxNullptrT);
             depth = 0;
-            if (isNull || arm.value == nullptr || !arm.value->getType()->isPointerTy()) return {};
+            if (isNull || arm.value == nullptr) return {};
+            // A borrowed `unique<T>` arm joins as its `T*` (the join converts it).
+            if (arm.value->getType()->isStructTy() && !arm.isExplicitMove)
+            {
+                const auto type = InferTernaryArmType(arm);
+                if (type.Pointer || !compiler->IsCoreUniqueType(type.TypeName)) return {};
+                std::string name = compiler->ResolveTypeAlias(
+                    MangledGenericArgument(*compiler, type.TypeName));
+                if (name.empty() || compiler->IsInterfaceType(name)
+                    || compiler->dataStructures.find(name) == compiler->dataStructures.end())
+                    return {};
+                depth = 1;
+                return name;
+            }
+            if (!arm.value->getType()->isPointerTy()) return {};
             if (!arm.joinClassPointee.empty())
             {
                 depth = arm.joinClassPointeeDepth;
@@ -3154,7 +3199,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
         const bool autoDeclTernary = std::exchange(autoDeclTernaryActive_, false)
             || deferredNewCxxTernarySlot;
         LLVMBackend::TypeAndValue pointerJoinDest;
-        if (outerExpected.Pointer && compiler->IsCxxRecord(outerExpected.TypeName))
+        if (outerExpected.Pointer && compiler->IsCxxRecord(outerExpected.TypeName)
+            && !inCallArgument_)
             pointerJoinDest = outerExpected;
         auto adjustCxxPointerArm = [&](llvm::Value*& value,
                                        const LLVMBackend::TypeAndValue* sourceOverride = nullptr) {
@@ -5893,7 +5939,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                         trueStorage, falseStorage, atTrue, atFalse,
                         trueOcc, falseOcc, trueUnsigned, falseUnsigned,
                         TernaryInterfaceDestination(*compiler, outerExpected),
-                        !inCallArgument_ && (outerExpected.Pointer || outerExpected.PointerDepth > 0));
+                        !inCallArgument_ && (outerExpected.Pointer || outerExpected.PointerDepth > 0),
+                        &outerExpected);
                     saveActiveArmEnd();
                     if (!validTypes)
                     {
@@ -6309,7 +6356,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
         if (!UnifyTernaryArmTypes(ctx, trueValue, falseValue, trueShape, falseShape,
                 trueStorage, falseStorage, atTrue, atFalse, trueOcc, falseOcc,
                 trueUnsigned, falseUnsigned, TernaryInterfaceDestination(*compiler, outerExpected),
-                !inCallArgument_ && (outerExpected.Pointer || outerExpected.PointerDepth > 0)))
+                !inCallArgument_ && (outerExpected.Pointer || outerExpected.PointerDepth > 0),
+                        &outerExpected))
         {
             atTrue(); compiler->CreateJump(resumeBlock);
             atFalse(); compiler->CreateJump(resumeBlock);
@@ -6381,10 +6429,19 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
         }
         if (!compositeCxxPointee.Pointer)
         {
+            // A fixed array arm (or a row `arr[1]`) converts as the pointer it decays to
+            // (`c ? derivedArr : basePtr`).
+            auto decayedArm = [&](const LLVMBackend::TypedValue& shape) {
+                const auto type = InferTernaryArmType(shape);
+                return type.ConstArraySize > 0 || !type.ConstInnerDimensions.empty()
+                    ? LLVMBackend::ArrayDecayedPointer(type) : LLVMBackend::TypeAndValue{};
+            };
+            const auto trueArray = decayedArm(trueShape);
+            const auto falseArray = decayedArm(falseShape);
             atTrue();
-            adjustCxxPointerArm(trueValue);
+            adjustCxxPointerArm(trueValue, trueArray.Pointer ? &trueArray : nullptr);
             atFalse();
-            adjustCxxPointerArm(falseValue);
+            adjustCxxPointerArm(falseValue, falseArray.Pointer ? &falseArray : nullptr);
         }
         // The fat interface LLVM type is shared by every interface. Rebox each moved arm against
         // the declared return interface after unification, using the per-value source-interface
@@ -7543,7 +7600,8 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
             }
         };
         auto cxxPointerJoinDest = [&]() -> LLVMBackend::TypeAndValue {
-            if (outerExpected.Pointer && compiler->IsCxxRecord(outerExpected.TypeName))
+            if (outerExpected.Pointer && compiler->IsCxxRecord(outerExpected.TypeName)
+                && !inCallArgument_)
                 return outerExpected;
             return {};
         };
@@ -8026,6 +8084,27 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 auto rhsSourceType = InferTernaryArmType(rhsShape);
                 compiler->RejectImplicitIntegerPointeePointerConversion(
                     lhsSourceType, rhsSourceType);
+                // Agreeing operands still have to fit a pointer destination (the `?:` twin above).
+                if (!inCallArgument_ && (outerExpected.Pointer || outerExpected.PointerDepth > 0)
+                    && !DeclExpectedTypeScope::explicitCast
+                    && !compiler->IsImplicitUnrelatedStructPointeeConversion(lhsSourceType, rhsSourceType)
+                    && !compiler->IsImplicitUnrelatedStructPointeeConversion(rhsSourceType, lhsSourceType))
+                {
+                    for (const auto* operand : { &lhsSourceType, &rhsSourceType })
+                    {
+                        if (compiler->IsImplicitUnrelatedStructPointeeConversion(*operand, outerExpected))
+                        {
+                            LogErrorContext(ctx, compiler->ImplicitIntegerPointeeConversionText(
+                                *operand, outerExpected));
+                            break;
+                        }
+                        // The `?:` twin above: a cross-class C++ `T**` operand is refused here.
+                        if (LLVMBackend::ArrayDecayedPointer(*operand).ValuePointerDepth() >= 2
+                            && compiler->RejectCxxClassPointerStore(
+                                outerExpected, *operand, "conditional expression"))
+                            break;
+                    }
+                }
                 if (resultAlloca->getAllocatedType()->isPointerTy())
                     rhs = compiler->BareFunctionToThinValue(rhs, nullptr);
                 compiler->CreateAssignment(rhs, resultAlloca);
@@ -8481,7 +8560,8 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                         compiler->CurrentCastOccurrence(), compiler->CurrentCastOccurrence(),
                         trueUnsigned, falseUnsigned,
                         TernaryInterfaceDestination(*compiler, outerExpected),
-                        !inCallArgument_ && (outerExpected.Pointer || outerExpected.PointerDepth > 0)))
+                        !inCallArgument_ && (outerExpected.Pointer || outerExpected.PointerDepth > 0),
+                        &outerExpected))
                     return {};
 
                 auto pointerJoinDest = cxxPointerJoinDest();

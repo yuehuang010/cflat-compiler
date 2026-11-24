@@ -2728,8 +2728,21 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
         // conversion into a user-defined base copy, even when the base has a copy constructor.
         if (param.IsAlias && !param.ElemPointer && IsCxxDerivedToBaseValue(argType, param, nullptr))
             return CxxArgConversion::NotApplicable;
-        // A derived-class value slices to a PUBLIC base parameter through the base's copy ctor.
-        if (IsCxxDerivedToBaseValue(argType, param, nullptr)) argType.TypeName = param.TypeName;
+        // A derived-class value slices to a PUBLIC base parameter through the base's copy ctor,
+        // unless a base ctor taking the derived type (`B(const D&)`) outranks it.
+        NamedVariable slicedArg = arg;
+        bool slicedNonVirtual = false;
+        if (IsCxxDerivedToBaseValue(argType, param, nullptr)
+            && !SelectsCxxNonCopyCtorForDerived(param.TypeName, arg, argType, allowScalarNarrowing))
+        {
+            const auto routes = CollectCxxBaseRoutes(argType.TypeName, param.TypeName, false);
+            slicedNonVirtual = !routes.unknown && !routes.viaVirtual && routes.nonVirtual == 1;
+            argType.TypeName = param.TypeName;
+            // A moved derived value with no base move ctor copies its base (`const B&` binds it).
+            if (argType.IsMove && !CxxSliceKeepsMove(param.TypeName)) argType.IsMove = false;
+            slicedArg.TypeAndValue = argType;
+            slicedArg.TypeAndValue.VariableName = arg.TypeAndValue.VariableName;
+        }
         std::string why;
         // A scalar-reference overload set is clang's to rank: the copy-initializing probe
         // answers, never the listed pick.
@@ -2748,7 +2761,7 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
                                                        : CxxArgConversion::NotApplicable;
         }
         // The argument's provenance lets a moved class source prove it binds `T(U&&)`.
-        const std::vector<NamedVariable> argVars = { arg };
+        const std::vector<NamedVariable> argVars = { slicedArg };
         TryBindRefusedCxxMember(param.TypeName, "__ctor", 1);
         const CxxClassInfo::Structor* selectedCtor = SelectCxxConstructor(
             param.TypeName, { argType }, why, /*allowNumericConversions*/ true, &argVars,
@@ -2844,7 +2857,12 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
             = (param.IsRvalueRef || param.CxxConstRef())
                 && argType.TypeName.find('$') == std::string::npos
                 && param.TypeName.find('$') == std::string::npos;
-        if (info == nullptr || (!info->constructors.empty()
+        // A slice into a base whose only listed ctors take no argument (a bound `= default`
+        // init) still asks clang: the implicit copy / move is never listed.
+        const bool slicedWithoutUnaryCtor = info != nullptr && slicedNonVirtual
+            && std::none_of(info->constructors.begin(), info->constructors.end(),
+                            [](const CxxClassInfo::Structor& c) { return c.params.size() >= 2; });
+        if (info == nullptr || (!info->constructors.empty() && !slicedWithoutUnaryCtor
                                 && !(info->hasCtorTemplate
                                      && (!IsCxxRecord(argType.TypeName)
                                          || plainClassReferenceCtor))))
@@ -2866,6 +2884,42 @@ bool LLVMBackend::CanImplicitlyConstructCxxClass(const NamedVariable& arg,
         return ClassifyCxxImplicitArgument(arg, param, cxxByValueParam,
                                            allowTemplateClassConversion)
             == CxxArgConversion::Convertible;
+}
+
+/*
+ * The extracted ctor list omits templates, and a CFlat callee has no C++ call wrapper to convert
+ * in, so ask clang the copy-initialization question once per (source, target) shape.
+ */
+bool LLVMBackend::CflatClassParamCopyInitsByCtorTemplate(const NamedVariable& arg,
+                                                         const TypeAndValue& param)
+{
+        if (param.Pointer || param.ElemPointer || param.IsAlias || param.IsRvalueRef
+            || param.IsInterface || param.TypeName.empty() || !IsCxxRecord(param.TypeName))
+            return false;
+        TypeAndValue argType = InferImplicitCxxArgumentType(arg, *this);
+        if (argType.Pointer || argType.ElemPointer || argType.TypeName.empty()
+            || !IsCxxRecord(argType.TypeName)
+            || ResolveTypeAlias(argType.TypeName) == ResolveTypeAlias(param.TypeName))
+            return false;
+        const CxxClassInfo* info = GetCxxClassInfo(param.TypeName);
+        if (info == nullptr || !info->hasCtorTemplate) return false;
+        llvm::Type* objectType = GetType(TypeAndValue{ .TypeName = param.TypeName });
+        if (objectType == nullptr || !objectType->isSized()) return false;
+        NamedVariable probe = arg;
+        probe.TypeAndValue = argType;
+        probe.TypeAndValue.VariableName.clear();
+        const std::string key = argType.TypeName + "|" + param.TypeName + "|"
+            + std::to_string(argType.ConstMask) + (argType.IsConstObject() ? "c" : "")
+            + (arg.IsRvalue ? "r" : "l");
+        if (auto it = cflatParamCtorTemplateVerdicts_.find(key);
+            it != cflatParamCtorTemplateVerdicts_.end())
+            return it->second;
+        std::string wrapperName;
+        std::string wrapperError;
+        const bool accepted = RequestCxxVariadicConstructor(param.TypeName, { probe }, wrapperName,
+                                                            wrapperError, /*copyInit*/ true);
+        cflatParamCtorTemplateVerdicts_.emplace(key, accepted);
+        return accepted;
 }
 
 bool LLVMBackend::IsCxxConvertingTemporaryForRvalueRef(const NamedVariable& arg,
@@ -3337,6 +3391,66 @@ void LLVMBackend::ConstructThroughCxxCtorWrapper(NamedVariable& arg, const Named
         arg = std::move(built);
 }
 
+llvm::Value* LLVMBackend::LoadCxxBaseSubobject(const NamedVariable& source, llvm::Value* value,
+                                               const std::string& baseType)
+{
+        uint64_t offset = 0;
+        bool inaccessible = false;
+        if (!FindCxxValueBaseOffset(source.TypeAndValue.TypeName, baseType, offset, inaccessible,
+                                    &source)
+            || inaccessible)
+            return nullptr;
+        llvm::Type* objectType = GetType(TypeAndValue{ .TypeName = baseType });
+        if (objectType == nullptr || !objectType->isSized() || value == nullptr) return nullptr;
+        llvm::Value* address = source.Storage;
+        if (address == nullptr)
+        {
+            address = AllocaAtEntry(value->getType(), nullptr, "cxx.slice.src");
+            builder->CreateStore(value, address);
+        }
+        return CreateLoad(objectType, EmitCxxBaseAdjust(address, offset));
+}
+
+llvm::Value* LLVMBackend::LoadCxxTrivialBaseCopy(const NamedVariable& source, llvm::Value* value,
+                                                 const std::string& baseType, bool assignment)
+{
+        // clang refuses an ambiguous base subobject before any copy member is considered.
+        if (IsCxxAmbiguousBase(source.TypeAndValue.TypeName, baseType))
+        {
+            RejectCxxAmbiguousBaseConversion(source.TypeAndValue.TypeName, baseType);
+            return value;
+        }
+        // Only the implicit trivial, public, non-deleted copy member is a plain subobject copy;
+        // anything else keeps the refusal (clang: deleted / private / implicitly deleted).
+        const CxxClassInfo* info = GetCxxClassInfo(baseType);
+        if (info == nullptr) return nullptr;
+        const bool usable = assignment ? info->hasTrivialCopyAssign
+            : info->hasTrivialCopyCtor && !info->hasDeletedCopyCtor;
+        if (!usable) return nullptr;
+        return LoadCxxBaseSubobject(source, value, baseType);
+}
+
+bool LLVMBackend::CxxSliceKeepsMove(const std::string& baseType) const
+{
+        // A deleted `B(B&&)` still wins for an rvalue (clang: call to deleted constructor).
+        const CxxClassInfo* info = GetCxxClassInfo(baseType);
+        return FindCxxMoveCtor(baseType) != nullptr || (info != nullptr && info->hasDeletedMoveCtor);
+}
+
+bool LLVMBackend::SelectsCxxNonCopyCtorForDerived(const std::string& baseType,
+                                                  const NamedVariable& arg,
+                                                  const TypeAndValue& derivedType,
+                                                  bool allowScalarNarrowing)
+{
+        std::string why;
+        const std::vector<NamedVariable> argVars = { arg };
+        TryBindRefusedCxxMember(baseType, "__ctor", 1);
+        const auto* ctor = SelectCxxConstructor(baseType, { derivedType }, why,
+                                                /*allowNumericConversions*/ true, &argVars,
+                                                /*allowExplicit*/ false, allowScalarNarrowing);
+        return ctor != nullptr && !ctor->isCopyCtor && !ctor->isMoveCtor;
+}
+
 bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
                                                        const TypeAndValue& param,
                                                        llvm::Value* intoSlot,
@@ -3436,12 +3550,33 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
         }
         uint64_t baseOffset = 0;
         bool baseInaccessible = false;
-        const bool slicesToBase = IsCxxDerivedToBaseValue(argType, param, &arg)
+        bool slicesToBase = IsCxxDerivedToBaseValue(argType, param, &arg)
             && FindCxxValueBaseOffset(argType.TypeName, param.TypeName, baseOffset, baseInaccessible,
                                       &arg)
             && !baseInaccessible;
         cxxVirtualBaseRefusal_.clear();     // unproven: clang's copy wrapper takes the source
-        if (slicesToBase) argType.TypeName = param.TypeName;
+        // A base ctor taking the derived type (`B(const D&)`) outranks the slice through B's copy.
+        if (slicesToBase && SelectsCxxNonCopyCtorForDerived(param.TypeName, arg, argType,
+                                                            allowScalarNarrowing))
+            slicesToBase = false;
+        if (slicesToBase && RejectCxxAmbiguousBaseConversion(argType.TypeName, param.TypeName))
+        {
+            // Refused (logged): a placeholder of the parameter type keeps the call's IR well-typed.
+            TypeAndValue classType{ .TypeName = param.TypeName };
+            if (llvm::Type* objectType = GetType(classType); objectType != nullptr)
+            {
+                arg.Primary = llvm::PoisonValue::get(objectType);
+                arg.Storage = nullptr;
+                arg.BaseType = objectType;
+                arg.TypeAndValue.TypeName = param.TypeName;
+            }
+            return true;
+        }
+        if (slicesToBase)
+        {
+            argType.TypeName = param.TypeName;
+            if (argType.IsMove && !CxxSliceKeepsMove(param.TypeName)) argType.IsMove = false;
+        }
         std::string why;
         const std::vector<NamedVariable> argVars = { arg };
         TryBindRefusedCxxMember(param.TypeName, "__ctor", 1);

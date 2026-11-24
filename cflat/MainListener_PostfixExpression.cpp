@@ -4143,6 +4143,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                 structVar.FieldPathThroughPointer = namedVar.FieldPathThroughPointer;
                 structVar.MovePathKey = namedVar.MovePathKey;
                 structVar.MovePathHasDynamicIndex = namedVar.MovePathHasDynamicIndex;
+                structVar.MovePathDynamicPrefix = namedVar.MovePathDynamicPrefix;
+                structVar.MovePathDynamicSuffix = namedVar.MovePathDynamicSuffix;
+                structVar.MovePathDynamicExtent = namedVar.MovePathDynamicExtent;
                 structVar.FieldPathRoot = namedVar.FieldPathRoot;
                 if (structVar.FieldPathRoot.empty())
                     structVar.FieldPathRoot = !namedVar.CallerName.empty()
@@ -5998,6 +6001,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     PropagateCxxPrvalueSubobject(namedVar, structVar,
                                         fieldType, fieldIsPointer);
                                     namedVar.MovePathHasDynamicIndex = structVar.MovePathHasDynamicIndex;
+                                    namedVar.MovePathDynamicPrefix = structVar.MovePathDynamicPrefix;
+                                    namedVar.MovePathDynamicSuffix = structVar.MovePathHasDynamicIndex
+                                        ? structVar.MovePathDynamicSuffix + "." + primaryIdentifier
+                                        : std::string();
+                                    namedVar.MovePathDynamicExtent = structVar.MovePathDynamicExtent;
                                     namedVar.MovePathKey = structVar.MovePathHasDynamicIndex
                                         ? std::string()
                                         : structVar.MovePathKey.empty()
@@ -7125,6 +7133,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     namedVar.TypeAndValue.ConstMask = 1;
                                     namedVar.BaseType = Compiler(ctx)->builder->getInt8Ty();
                                 }
+                                // `L"ab"[i]` (and u / U / u8) indexes its code units the same way.
+                                else if (namedVar.BaseType == nullptr && next != nullptr
+                                    && next->getSymbol()->getType() == CFlatParser::LeftBracket
+                                    && Compiler(ctx)->IsStringLiteralGlobal(namedVar.Primary))
+                                    namedVar.BaseType = namedVar.Primary->getType();
                             }
                             // `default` takes the destination's type - publish it so a following
                             // suffix and the caller both see the right type, not an empty one.
@@ -7427,6 +7440,36 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 && namedVar.Storage != nullptr
                                 && namedVar.Storage == parenInnerNamed.Storage)
                                 namedVar.BaseType = parenInnerNamed.BaseType;
+                            // A parenthesized typed POINTER rvalue (`(c ? p : q)[i]`, `(p + 1)[i]`) is
+                            // indexed through its value, as the bare call result `f()[i]` is.
+                            auto* subscriptSuffix = childLimit > 1
+                                ? dynamic_cast<antlr4::tree::TerminalNode*>(ctx->children[1]) : nullptr;
+                            if (prevPrimary->expression() != nullptr
+                                && subscriptSuffix != nullptr
+                                && subscriptSuffix->getSymbol()->getType() == CFlatParser::LeftBracket
+                                && namedVar.BaseType == nullptr && namedVar.Storage == nullptr
+                                && namedVar.TypeAndValue.Pointer && !namedVar.TypeAndValue.TypeName.empty()
+                                && namedVar.Primary != nullptr && namedVar.Primary->getType()->isPointerTy()
+                                && !Compiler(ctx)->ValueContainsOwningPtrTemp(namedVar.Primary)
+                                && !Compiler(ctx)->IsOwnedNewTemp(namedVar.Primary)
+                                && !Compiler(ctx)->RawArrayResultMayOwn(namedVar.Primary))
+                                namedVar.BaseType = namedVar.Primary->getType();
+                            // A parenthesized string literal or a ?: / ?? join of them (`("xyz")[2]`)
+                            // indexes its characters, a `(const char)*`, as the bare `"xyz"[2]` does.
+                            if (prevPrimary->expression() != nullptr
+                                && subscriptSuffix != nullptr
+                                && subscriptSuffix->getSymbol()->getType() == CFlatParser::LeftBracket
+                                && namedVar.BaseType == nullptr && namedVar.Storage == nullptr
+                                && namedVar.TypeAndValue.TypeName.empty()
+                                && namedVar.Primary != nullptr && namedVar.Primary->getType()->isPointerTy()
+                                && (Compiler(ctx)->IsStringLiteralGlobal(namedVar.Primary)
+                                    || Compiler(ctx)->JoinIsCharPointer(namedVar.Primary, true)))
+                            {
+                                namedVar.TypeAndValue.TypeName = "char";
+                                namedVar.TypeAndValue.Pointer = true;
+                                namedVar.TypeAndValue.ConstMask = 1;
+                                namedVar.BaseType = Compiler(ctx)->builder->getInt8Ty();
+                            }
                         }
 
                         // If the primary was a lambda, propagate its function-pointer type.
@@ -7694,6 +7737,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         // Remember the BASE's view-ness before the element branches clear it; the
                         // element slot of a user `T[]` view is LIVE storage, unlike a container's.
                         bool baseWasArrayView = namedVar.TypeAndValue.IsArrayView;
+                        const int baseFixedExtent = baseWasArrayView ? 0
+                            : static_cast<int>(namedVar.TypeAndValue.ConstArraySize);
                         if (subscriptedFlexibleArrayMember && namedVar.BaseType != nullptr
                             && !namedVar.BaseType->isPointerTy() && !namedVar.BaseType->isArrayTy()
                             && !namedVar.TypeAndValue.IsSimd)
@@ -7752,8 +7797,18 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         // the compiler with no diagnostic instead of pointing at the source.
                         else if (namedVar.BaseType == nullptr)
                         {
-                            LogErrorContext(expressCtx,
-                                "cannot apply '[]' here - the type of the indexed expression is unknown.");
+                            // An unbound `new` result (scalar, array, via a join or arithmetic) indexed in
+                            // place is never freed: only `->` / `.` on a scalar member retires one (PFX-1b).
+                            if (namedVar.Primary != nullptr
+                                && (Compiler(ctx)->ValueContainsOwningPtrTemp(namedVar.Primary)
+                                    || Compiler(ctx)->IsOwnedNewTemp(namedVar.Primary)
+                                    || Compiler(ctx)->RawArrayResultMayOwn(namedVar.Primary)))
+                                LogErrorContext(expressCtx,
+                                    "cannot apply '[]' to an unbound owning pointer temporary (a 'new' result) - "
+                                    "nothing would free it. Bind it to a local first, then index the local.");
+                            else
+                                LogErrorContext(expressCtx,
+                                    "cannot apply '[]' here - the type of the indexed expression is unknown.");
                             namedVar = {};
                             structVar = {};
                             break;
@@ -7960,9 +8015,19 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         {
                             if (!namedVar.MovePathHasDynamicIndex)
                                 namedVar.MovePathKey += "[" + std::to_string(*foldedIndex) + "]";
+                            else
+                                namedVar.MovePathDynamicSuffix += "[" + std::to_string(*foldedIndex) + "]";
                         }
                         else
                         {
+                            if (!namedVar.MovePathHasDynamicIndex)
+                            {
+                                namedVar.MovePathDynamicPrefix = namedVar.MovePathKey;
+                                namedVar.MovePathDynamicSuffix.clear();
+                                namedVar.MovePathDynamicExtent = baseFixedExtent;
+                            }
+                            else
+                                namedVar.MovePathDynamicExtent = 0;
                             namedVar.MovePathKey.clear();
                             namedVar.MovePathHasDynamicIndex = true;
                         }
@@ -10204,6 +10269,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         // non-struct type is copyable; a struct is refused only by
                                         // the unique-owner rule (drives the copy-on-assign flip too).
                                         isCopyable = be->IsCopyableType(base);
+                                        // A trivially copyable C++ class whose lvalue copy-init clang
+                                        // refuses (deleted / private / explicit copy ctor) is not.
+                                        if (isCopyable && be->CxxTrivialCopyCtorRefusal(base, false, false)
+                                                != LLVMBackend::CxxCopyCtorFault::None)
+                                            isCopyable = false;
+                                        // Nor is a CFlat struct whose member-wise copy such a field deletes.
+                                        if (isCopyable && be->HasCxxRecords() && be->HasUncopyableCxxField(base))
+                                            isCopyable = false;
                                     }
                                 }
                             }
@@ -11905,6 +11978,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         argNV.CxxDirectConstructionArguments;
                                     argVar.IsDefaultArgument = argNV.IsDefaultArgument;
                                     argVar.CxxParamLastUse = argNV.CxxParamLastUse;
+                                    argVar.UncopyableStructLastUse = argNV.UncopyableStructLastUse;
                                     argVar.CxxLvalueKind =
                                         CxxArgumentLvalueKind(namedArgument->assignmentExpression());
                                     auto stringLiteral = StringLiteralExpressionValue(
@@ -14501,6 +14575,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.IsDefaultArgument = argNV.IsDefaultArgument;
                                     argVar.IsUnboundCxxTypeDefault = argNV.IsUnboundCxxTypeDefault;
                                     argVar.CxxParamLastUse = argNV.CxxParamLastUse;
+                                    argVar.UncopyableStructLastUse = argNV.UncopyableStructLastUse;
                                     argVar.CxxLvalueKind =
                                         CxxArgumentLvalueKind(namedArgument->assignmentExpression());
                                     auto stringLiteral = StringLiteralExpressionValue(

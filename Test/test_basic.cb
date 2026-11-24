@@ -9682,6 +9682,46 @@ bool testArrBoundAccept()
     return result;
 }
 
+// PTRSTORE: native struct pointee stores refuse an unrelated pointee (err_implicit_unrelated_pointer_store);
+// these neighbours stay legal - void*, null, explicit cast, same struct by alias, interfaces, generics.
+struct PsA { int v = 0; PsA* next = default; };
+struct PsB { int w = 0; };
+struct PsWrap<T> { T* p = default; };
+using PsAlias = PsA;
+typedef PsA PsTd;
+interface IPs { int get(); };
+class PsC : IPs { int v = 0; int get() { return v; } };
+class PsD : IPs { int w = 0; int get() { return w; } };
+T* psIdentity<T>(T* p) { return p; }
+void* psToVoid(PsA* a) { return a; }
+PsA* psFromVoid(void* v) { return v; }
+PsA* psPickSame(int c, PsA* a, PsA* b) { return c ? a : b; }
+PsA* psCoalesceSame(PsA* a, PsA* b) { return a ?? b; }
+PsB* psCastTernaryRet(int c, PsA* a) { return (PsB*)(c ? a : a); }
+PsB* psCastCoalesceRet(PsA* a) { return (PsB*)(a ?? a); }
+IPs psCoalesceIface(PsC* c, PsD* d) { return c ?? d; }
+// PRIMPTR: calls take the same rule (err_implicit_unrelated_pointer_store); these calls stay legal.
+int pcTake(PsA* p) { return p == nullptr ? -1 : p->v; }
+int pcTd(PsTd* p) { return p->v; }
+int pcVoid(void* p) { return *(int*)p; }
+int pcOv(PsA* p) { return 100 + p->v; }
+int pcOv(int* p) { return 200 + *p; }
+int pcOvVoid(PsA* p) { return 100; }
+int pcOvVoid(void* p) { return 300 + *(int*)p; }
+int pcIface(IPs i) { return i.get(); }
+int pcGen<T>(T* p) { return (int)*p; }
+// AUTOTERN: a `?:` / `??` join over one native struct pointee keeps it (auto, deref, `->`, methods).
+struct PsM { int v = 0; int twice() { return v * 2; } };
+T* psPickAuto<T>(int c, T* a, T* b) { auto q = c ? a : b; return q; }
+IPs psCoalesceArith(PsC* c) { return (c ?? c) + 0; }
+// JOINSUB: `[]` directly on a parenthesized pointer `?:` / `??` join (or pointer rvalue) indexes its value.
+int jsCondHits = 0;
+bool jsCond() { jsCondHits++; return true; }
+int* jsId(int* p) { return p; }
+// LITSUB: `[]` on a parenthesized string literal or a ?: / ?? join of literals reads a char, like C.
+int lsKind(char c) { return 1; }
+int lsKind(int c) { return 2; }
+
 extern int main()
 {
     MyStruct my = MyStruct();
@@ -10032,6 +10072,133 @@ bool testPointerArithmetic()
     result &= Test("t80 i8* into char* explicit cast accepted", *t80Char == 'A', true);
     int t80Int = 7;
     result &= Test("t80 explicit int* to double* cast accepted", (double*)&t80Int != nullptr, true);
+    PsA psa = default; psa.v = 7;
+    PsA psa2 = default; psa2.v = 11;
+    void* psVoid = &psa; PsA* psBack = psVoid;
+    result &= Test("ptrstore void* into PsA* accepted", psBack->v, 7);
+    result &= Test("ptrstore PsA* through void* return accepted", psFromVoid(psToVoid(&psa))->v, 7);
+    PsA* psNull = nullptr; PsA* psZero = 0; PsA* psDef = default;
+    result &= Test("ptrstore null pointer constants accepted",
+                   psNull == nullptr && psZero == nullptr && psDef == nullptr, true);
+    PsB* psCast = (PsB*)&psa; PsB* psCastAssign = default; psCastAssign = (PsB*)&psa;
+    result &= Test("ptrstore explicit PsA* to PsB* cast accepted", psCast->w + psCastAssign->w, 14);
+    PsAlias* psViaAlias = &psa; PsA* psFromAlias = psViaAlias; PsTd* psViaTd = psFromAlias;
+    result &= Test("ptrstore same struct through using / typedef accepted", psViaTd->v, 7);
+    psa.next = &psa2; PsA* psNext = psa.next;
+    result &= Test("ptrstore self-referential field accepted", psNext->v, 11);
+    PsC* psC = new PsC(); psC->v = 5; IPs psIface = psC;
+    result &= Test("ptrstore class pointer into interface accepted", psIface.get(), 5);
+    PsD* psD = new PsD(); psD->w = 6;
+    result &= Test("ptrstore interface ?? join of two classes accepted",
+                   psCoalesceIface(nullptr, psD).get(), 6);
+    PsWrap<PsA> psW = default; psW.p = &psa; PsA* psFromWrap = psW.p;
+    result &= Test("ptrstore generic T* field accepted", psFromWrap->v, 7);
+    PsA* psGen = psIdentity<PsA>(&psa);
+    result &= Test("ptrstore generic T* return accepted", psGen->v, 7);
+    PsA[2] psArr = default; psArr[1].v = 3; PsA* psDecay = psArr; PsA[] psView = psArr;
+    PsA* psFromView = psView;
+    result &= Test("ptrstore same-element array / view decay accepted", psDecay[1].v + psFromView[1].v, 6);
+    PsA* psTern = psPickSame(0, &psa, &psa2); PsA* psTernNull = 1 ? &psa : nullptr;
+    result &= Test("ptrstore same-struct ?: accepted", psTern->v + psTernNull->v, 18);
+    result &= Test("ptrstore same-struct ?? accepted", psCoalesceSame(nullptr, &psa2)->v, 11);
+    unique PsA* psU = new PsA(); psU->v = 9; PsA* psBorrow = psU;
+    result &= Test("ptrstore unique PsA* borrow accepted", psBorrow->v, 9);
+    // An explicit cast over a `?:` / `??` is a conversion, not a store: its operand is not checked.
+    PsA* psCa = &psa; PsA* psCb = &psa2; int psSel = 1;
+    PsB* psCastTern = (PsB*)(psSel ? psCa : psCb);
+    PsB* psCastCoal = (PsB*)(psCa ?? psCb);
+    PsB* psCastAssign2 = default; psCastAssign2 = (PsB*)(psSel ? psCb : psCa);
+    result &= Test("ptrstore explicit cast over ?: / ?? accepted",
+                   psCastTern->w + psCastCoal->w + psCastAssign2->w, 25);
+    result &= Test("ptrstore explicit cast over ?: / ?? in return accepted",
+                   psCastTernaryRet(1, &psa)->w + psCastCoalesceRet(&psa2)->w, 18);
+    int* psCastInt = (int*)(psSel ? psCa : psCb);
+    result &= Test("ptrstore explicit primitive cast over ?: accepted", *psCastInt, 7);
+    void* pcV = &psa; int pcI = 4; PsA[2] pcArr = default; pcArr[0].v = 5; PsA[] pcView = pcArr;
+    result &= Test("primptr void* into PsA* param accepted", pcTake(pcV), 7);
+    result &= Test("primptr PsA* / int* into void* param accepted", pcVoid(&psa) + pcVoid(&pcI), 11);
+    result &= Test("primptr nullptr / 0 into PsA* param accepted", pcTake(nullptr) + pcTake(0), -2);
+    result &= Test("primptr same struct via alias param accepted", pcTd(&psa) + pcTake(psViaAlias), 14);
+    result &= Test("primptr same-element array / view decay into param accepted",
+                   pcTake(pcArr) + pcTake(pcView), 10);
+    result &= Test("primptr overloads pick the matching pointee", pcOv(&psa) + pcOv(&pcI), 311);
+    result &= Test("primptr int* picks void* beside PsA*", pcOvVoid(&pcI), 304);
+    PsC pcCo = default; pcCo.v = 5;
+    result &= Test("primptr class pointer into interface param accepted", pcIface(&pcCo), 5);
+    result &= Test("primptr generic T* param accepted", pcGen(&pcI), 4);
+    result &= Test("primptr unique PsA* borrow into param accepted", pcTake(psU), 9);
+    result &= Test("primptr explicit cast into param accepted", pcTake((PsA*)&pcI), 4);
+    PsA* pcP = &psa; PsAlias* pcAl = &psa;
+    result &= Test("primptr same / alias / void* / null / decay compares accepted",
+                   (pcP == pcAl) && (pcP == pcV) && (pcP != nullptr) && (&pcArr[0] == pcArr), true);
+    auto psAutoT = psSel ? psCa : psCb; auto psAutoF = psSel == 0 ? psCa : psCb;
+    result &= Test("autotern auto of ?: keeps struct pointee", psAutoT->v * 100 + psAutoF->v, 711);
+    PsA** psPa = &psCa; PsA** psPb = &psCb;
+    PsA* psDerefJoin = *(psSel ? psPb : psPa); auto psAutoPp = psSel == 0 ? psPa : psPb;
+    result &= Test("autotern deref / auto of PsA** ?: join", psDerefJoin->v * 100 + (*psAutoPp)->v, 1111);
+    PsA psJoinCopy = *(psSel ? psCa : psCb);
+    result &= Test("autotern deref of ?: join copies the struct", psJoinCopy.v, 7);
+    PsA* psNoneP = nullptr; PsA** psNonePp = nullptr;
+    auto psCoalAuto = psNoneP ?? psCb; PsA* psCoalDeref = *(psNonePp ?? psPb);
+    result &= Test("autotern auto / deref of ?? join", psCoalAuto->v * 100 + psCoalDeref->v, 1111);
+    auto psNullArmJoin = psSel == 0 ? nullptr : psCb; auto psNestedJoin = psSel ? (psSel == 0 ? psCa : psCb) : psCa;
+    result &= Test("autotern null arm / nested ?: keep the pointee", psNullArmJoin->v * 100 + psNestedJoin->v, 1111);
+    unique PsA* psUJ = new PsA(); psUJ->v = 13;
+    auto psUJoin = psSel == 0 ? psCa : psUJ; auto psUCoal = psNoneP ?? psUJ;
+    result &= Test("autotern unique PsA* borrow arm keeps the pointee", psUJoin->v * 100 + psUCoal->v, 1313);
+    PsM psM1 = default; psM1.v = 4; PsM psM2 = default; psM2.v = 5;
+    auto psMJoin = psSel == 0 ? &psM1 : &psM2;
+    result &= Test("autotern method call through auto ?: join", psMJoin->twice(), 10);
+    result &= Test("autotern generic T* auto ?: join", psPickAuto<PsA>(0, psCa, psCb)->v, 11);
+    PsA psWr = default; PsA* psWrP = &psWr; auto psWrJoin = psSel ? psWrP : psCb; psWrJoin->v = 21;
+    result &= Test("autotern write through auto ?: join", psWr.v, 21);
+    PsC psCv = default; psCv.v = 23;
+    result &= Test("autotern (?? join) + 0 boxes into interface", psCoalesceArith(&psCv).get(), 23);
+    int[4] jsA = {1, 2, 3, 4}; int[4] jsB = {5, 6, 7, 8}; int* jsP0 = jsA; int* jsP1 = jsB; int* jsPn = nullptr;
+    result &= Test("joinsub [] on ?: / ?? int* join", (psSel ? jsP0 : jsP1)[2] * 10 + (jsPn ?? jsP1)[3], 38);
+    PsA[2] jsXs; jsXs[0].v = 7; jsXs[1].v = 7; PsA[2] jsYs; jsYs[1].v = 8; PsA* jsPs = jsXs; PsA* jsQs = jsYs; PsA* jsPsn = nullptr;
+    PsA** jsPp = &jsPs; PsA** jsPq = &jsQs;
+    result &= Test("joinsub [] on PsA* / PsA** joins then . / ->",
+                   (psSel == 0 ? jsPs : jsQs)[1].v * 100 + (jsPsn ?? jsPs)[1].v * 10 + (psSel ? jsPp : jsPq)[0]->v, 877);
+    (psSel == 0 ? jsP0 : jsP1)[2] = 9; (jsPn ?? jsP0)[1] += 10; (psSel ? jsPs : jsQs)[1].v = 6;
+    result &= Test("joinsub store / += through [] on a join", jsB[2] * 100 + jsA[1] * 10 + jsXs[1].v, 1026);
+    int[] jsVa = jsA; int[] jsVb = jsB;
+    result &= Test("joinsub [] on fixed-array / view arm joins", (psSel ? jsA : jsB)[3] * 10 + (psSel == 0 ? jsVa : jsVb)[0], 45);
+    int jsSide = (jsCond() ? jsP0 : jsP1)[0];
+    result &= Test("joinsub condition evaluated once", jsSide * 10 + jsCondHits, 11);
+    result &= Test("joinsub [] on nested / null-arm joins",
+                   (psSel == 0 ? jsP0 : (psSel ? jsP1 : jsP0))[0] * 10 + (psSel == 0 ? nullptr : jsP0)[3], 54);
+    PsM[2] jsMs; jsMs[1].v = 4;
+    PsM* jsMp = jsMs; int* jsAddr = &(psSel ? jsP0 : jsP1)[2];
+    result &= Test("joinsub method / address-of through [] on a join", (psSel ? jsMp : jsMp)[1].twice() * 10 + *jsAddr, 83);
+    result &= Test("joinsub [] on parenthesized pointer arithmetic / call", (jsP0 + 1)[1] * 10 + (jsId(jsP1))[3], 38);
+    // LITSUB: pre-fix each parenthesized / joined literal leg was refused ("the type of the indexed
+    // expression is unknown"), and a bare `"xyz"[0]` read the whole [4 x i8] literal.
+    result &= Test("litsub [] on parenthesized literal", (int)("xyz")[2] * 1000 + (int)(("xyz"))[0], 122120);
+    char* lsNone = nullptr;
+    result &= Test("litsub [] on ?: / ?? literal joins",
+                   (int)(psSel ? "ab" : "cd")[1] * 1000 + (int)(psSel == 0 ? "ab" : "cd")[1] + (int)(lsNone ?? "hi")[1] * 1000000, 105098100);
+    result &= Test("litsub literal [] is char, [0] reads the element",
+                   lsKind(("xyz")[1]) * 100 + lsKind("xyz"[0]) * 10 + (("xyz")[0] == (char)120 ? 1 : 0), 111);
+    auto lsAuto = "xyz"[0]; char lsCh = "xyz"[0];
+    result &= Test("litsub bare literal [0] through auto / char", (int)lsAuto * 1000 + (int)lsCh, 120120);
+    result &= Test("litsub wide literal []", (int)L"ab"[1] * 1000 + (int)(psSel ? L"ab" : L"cd")[0], 98097);
+    // LITPTR: pre-fix `*` on a literal was untyped ("indirection requires pointer operand") and
+    // `"xyz" + n` bound the string operator+ ("an integer ... is not an address").
+    result &= Test("litptr * on a literal / parenthesized literal", (int)*"xyz" * 1000 + (int)*("xyz"), 120120);
+    result &= Test("litptr literal +/- int is pointer arithmetic",
+                   (int)*("xyz" + 1) * 1000 + (int)("xyz" + 1)[1], 121122);
+    result &= Test("litptr int + literal, chained, - 0",
+                   (int)*(1 + "xyz") * 1000000 + (int)*("xyz" + 1 + 1) * 1000 + (int)*("xyz" - 0), 121122120);
+    int lpI = 2;
+    result &= Test("litptr runtime index and ?: / ?? literal joins",
+                   (int)*("xyz" + lpI) * 1000000 + (int)*((psSel ? "ab" : "cd") + 1) * 1000
+                   + (int)*(psSel ? "ab" : "cd"), 122098097);
+    result &= Test("litptr * on a ?? join and a false ?: arm",
+                   (int)*(lsNone ?? "hi") * 1000 + (int)*(psSel == 0 ? "ab" : "cd"), 104099);
+    result &= Test("litptr *literal is char", lsKind(*"xyz") * 10 + lsKind(*("xyz" + 1)), 11);
+    (const char)* lpP = "xyz" + 1; auto lpA = "xyz" + 2; string lpS = "xyz" + 1;
+    result &= Test("litptr literal + n is (const char)*", lpS.length() * 1000000 + (int)*lpP * 1000 + (int)*lpA, 2121122);
     // T36 round 5: a pointer never binds an integer `operator string` (round 4 picked i128).
     i8[4] t36Eu = default;
     t36Eu[0] = (i8)0x41; t36Eu[1] = (i8)0x42; t36Eu[2] = (i8)0x43; t36Eu[3] = (i8)0;

@@ -5882,6 +5882,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxDefaultInitHelpers_.clear();
     cxxVariadicCtorRequestsInProgress_.clear();
     cxxRvalueRefBindVerdicts_.clear();
+    cflatParamCtorTemplateVerdicts_.clear();
     cxxFunctionBindAttempts_.clear();
     cxxLazyStdFunctionMemberBinds_.clear();
     cxxNamespaceEntities_.clear();
@@ -5985,6 +5986,7 @@ void LLVMBackend::ResetForReanalysis()
     uniqueFieldBorrowResults_.clear();
     globalAssignBorrowOrigin_.clear();
     globalAssignBorrowedAddress_.clear();
+    globalAssignMayBorrowedAddress_.clear();
     rawArrayResults_.clear();
     nonLocalViewOwnershipStates_.clear();
     mayReachReturnInProgress_.clear();
@@ -6323,6 +6325,7 @@ void LLVMBackend::ResetForReanalysis()
     storedPointerJoinOwners_.clear();
     storedPointerJoinOwnerValues_.clear();
     borrowedAddressValues_.clear();
+    slotReadMayBorrowValues_.clear();
     movedBorrowedThroughFieldValues_.clear();
     nonOwningStructJoins_.clear();
     uniqueFieldReadValues_.clear();

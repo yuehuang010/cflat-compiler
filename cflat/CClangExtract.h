@@ -209,6 +209,12 @@ namespace cflat_cinterop
     // RawCxxRecord::assignRefusedMask bits: clang refuses `dst = src` for that source kind.
     enum CxxAssignRefused : uint8_t { CxxAssignRefusedLvalue = 1, CxxAssignRefusedConstLvalue = 2,
                                       CxxAssignRefusedRvalue = 4, CxxAssignRefusedConstRvalue = 8 };
+    // RawCxxRecord::copyCtorRefusedMask bits: clang refuses `T t = src;` (low 3 bits), the
+    // selected constructor is deleted (next 3 bits) or explicit (bits 7-9), per source kind;
+    // RvalueMovePick: the refused xvalue pick is a move constructor.
+    enum CxxCopyCtorRefused : uint16_t { CxxCopyCtorRefusedLvalue = 1, CxxCopyCtorRefusedConstLvalue = 2,
+                                         CxxCopyCtorRefusedRvalue = 4, CxxCopyCtorDeletedShift = 3,
+                                         CxxCopyCtorRvalueMovePick = 64, CxxCopyCtorExplicitShift = 7 };
     enum CxxRefQualifier { CxxRefQualifierNone = 0, CxxRefQualifierLValue = 1,
                            CxxRefQualifierRValue = 2 };
     enum class CtorPick : uint8_t { Unknown = 0, CopyOrMove = 1, Other = 2 };
@@ -583,6 +589,8 @@ namespace cflat_cinterop
         bool moveAssignConstSourceBindsConstRef = false;
         // CxxAssignRefused bits per source kind (same-class `dst = src`, non-member context).
         uint8_t assignRefusedMask = 0;
+        // CxxCopyCtorRefused bits (same-class copy-init, non-member context); trivially copyable only.
+        uint16_t copyCtorRefusedMask = 0;
         bool isAggregate = false;
         std::vector<RawCxxCtorTemplate> ctorTemplates;
         std::vector<RawCxxMember> members;

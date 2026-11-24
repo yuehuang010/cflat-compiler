@@ -153,8 +153,19 @@ class queue<T>
                 int i = 0;
                 while (i < _size)
                 {
-                    if const (!is_copyable(T)) compile_error("cannot copy this queue: its element type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the queue instead of copying it");
-                    else                       result.enqueue(_data[_front + i]);
+                    if const (!is_copyable(T)) compile_error("cannot copy this queue: its element type is not copyable; give the type a 'copy()' method, or 'move' the queue instead of copying it");
+                    else
+                    {
+                        // As list<T>.copy(): a CFlat value is constructed in the slot, never passed
+                        // by value (a struct whose C++ field deletes its copy cannot be).
+                        if const (is_cpp_class(T)) result.enqueue(_data[_front + i]);
+                        else
+                        {
+                            if (result._front + result._size >= result._capacity) result._grow();
+                            construct_at(&result._data[result._front + result._size], _data[_front + i]);
+                            result._size++;
+                        }
+                    }
                     i++;
                 }
                 return result;

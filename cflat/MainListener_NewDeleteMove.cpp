@@ -1231,7 +1231,7 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                 slotType.ConstMask = elementConstMask;
                 if (argVal != nullptr)
                 {
-                    compiler->RejectImplicitIntegerPointeePointerConversion(
+                    compiler->RejectImplicitPointeePointerStore(
                         argNV.TypeAndValue, slotType);
                     if (RejectImplicitPrimitiveToPointer(
                             namedArg, slotType, argNV, argVal, "initialize",
@@ -2788,6 +2788,17 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(
             && compiler->IsForeignNontrivialCxxReturnClass(argNV.TypeAndValue.TypeName))
         {
             argNV.TypeAndValue.IsMove = true;
+            argNV.IsExplicitMove = true;
+            argNV.IsRvalue = true;
+            return argNV;
+        }
+
+        // `b = move d`, d a [cpp] struct deriving C++ class b: keep d's storage for the base rebind.
+        if (ctx == cxxBaseAssignMoveSite_ && !argNV.TypeAndValue.Pointer && argNV.Storage != nullptr
+            && !argNV.IsTempSpillStorage && compiler->IsCppStructName(argNV.TypeAndValue.TypeName)
+            && compiler->IsCxxDerivedToBaseValue(argNV.TypeAndValue,
+                   LLVMBackend::TypeAndValue{ .TypeName = cxxBaseAssignMoveTarget_ }, &argNV))
+        {
             argNV.IsExplicitMove = true;
             argNV.IsRvalue = true;
             return argNV;

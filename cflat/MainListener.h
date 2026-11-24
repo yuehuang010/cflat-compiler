@@ -1469,6 +1469,15 @@ inline bool IsStatementIfConstArm(antlr4::tree::ParseTree* compound)
 bool IsLastUseOfForeignCxxParam(
     LLVMBackend* compiler, antlr4::ParserRuleContext* useCtx,
     const LLVMBackend::NamedVariable& source, bool allowMoveOnlyReturn = false);
+// The final bare use of `name` in `scope` (the function body when null): not in a loop or nested
+// lambda inside it, no later use; uses under a shadowing inner declaration are skipped.
+bool IsLastBareUseInScope(antlr4::ParserRuleContext* useCtx, const std::string& name,
+                          antlr4::tree::ParseTree* scope, bool returnEndsPath);
+// At its final bare use, a by-value parameter or local of a CFlat struct holding a class whose copy
+// clang refuses, or a by-value parameter of such a trivially copyable class: consumed, so moved.
+bool IsLastUseOfUncopyableStruct(
+    LLVMBackend* compiler, antlr4::ParserRuleContext* useCtx,
+    const LLVMBackend::NamedVariable& source);
 
 // Evaluated in the active generic instance; -1 leaves both branches visible.
 using IfConstEvaluator = std::function<int(CFlatParser::ExpressionContext*)>;
@@ -3933,20 +3942,25 @@ private:
 
     // Scopes declExpectedType to one destination position - a declarator, assignment target,
     // field, return type, or matched call parameter. Function signatures are opt-in at bind sites.
+    // `explicitCast`: the destination is an explicit cast target, a conversion and not a store, so
+    // the store-only pointee checks skip it; every nested scope resets it.
     struct DeclExpectedTypeScope {
+        static inline thread_local bool explicitCast = false;
         LLVMBackend::TypeAndValue* slot;
         LLVMBackend::TypeAndValue saved;
+        bool savedExplicitCast;
         DeclExpectedTypeScope(LLVMBackend::TypeAndValue* s, const LLVMBackend::TypeAndValue& dest,
-                             bool includeFunctionPointer = false)
-            : slot(s), saved(*s)
+                             bool includeFunctionPointer = false, bool isExplicitCast = false)
+            : slot(s), saved(*s), savedExplicitCast(explicitCast)
         {
+            explicitCast = isExplicitCast;
             *slot = {};
             const bool hasDestination = (!dest.TypeName.empty() && dest.TypeName != "auto")
                 || (dest.IsFunctionPointer && !dest.FuncPtrReturnTypeName.empty());
             if ((!dest.IsFunctionPointer || includeFunctionPointer) && hasDestination)
                 *slot = dest;
         }
-        ~DeclExpectedTypeScope() { *slot = saved; }
+        ~DeclExpectedTypeScope() { *slot = saved; explicitCast = savedExplicitCast; }
     };
 
 
@@ -4000,6 +4014,10 @@ private:
     CFlatParser::MoveExpressionContext* trivialCxxMoveSite_ = nullptr;
     // The `move` of a `_ = move x;` release: nothing downstream runs a pick, so it must zero.
     CFlatParser::MoveExpressionContext* discardMoveSite_ = nullptr;
+    // The `move d` of `b = move d` into an imported C++ class: a [cpp] struct d deriving it keeps
+    // its storage (the move assignment binds d's base subobject, d stays alive as in C++).
+    CFlatParser::MoveExpressionContext* cxxBaseAssignMoveSite_ = nullptr;
+    std::string cxxBaseAssignMoveTarget_;
     CFlatParser::MoveExpressionContext* loweredBraceMoveSite_ = nullptr;
     std::string loweredBraceMoveTypeName_;
     llvm::Value* loweredBraceMoveDestination_ = nullptr;
@@ -5231,6 +5249,10 @@ public:
                                         const LLVMBackend::TypeAndValue& elemOwnershipType);
 
     std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseDeclaration(CFlatParser::DeclarationSpecifiersContext* declSpec, CFlatParser::InitDeclaratorListContext* initDecl, const std::string& namespaceName = {});
+    // ParseDeclaration plus the brace-init slot borrow facts landed on the declared bindings.
+    std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseDeclarationLandingBraceBorrows(
+        CFlatParser::DeclarationSpecifiersContext* declSpec,
+        CFlatParser::InitDeclaratorListContext* initDecl, const std::string& namespaceName);
 
     /*
      * Name the `unique` field a NamedVariable reads, as "Struct.field", for diagnostics.
@@ -6356,6 +6378,16 @@ public:
     void RejectNewPointerSlotDepthMismatch(antlr4::ParserRuleContext* ctx,
         const LLVMBackend::NamedVariable& source, const LLVMBackend::TypeAndValue& target);
 
+    // A named field initializer or field default `source` copy-initializes field `fieldName` (a move
+    // for `move s` / a consumed last use): clang's usable copy / move constructor. True if refused.
+    bool RejectUnusableFieldCopy(antlr4::ParserRuleContext* ctx,
+        const LLVMBackend::NamedVariable& source, const LLVMBackend::TypeAndValue& field,
+        const std::string& fieldName);
+    // A brace element `source` copy-initializes element `index` of array `arrayName`: an lvalue of a
+    // C++ class (or CFlat struct holding one) needs clang's usable copy constructor. True if refused.
+    bool RejectUnusableElementCopy(antlr4::ParserRuleContext* ctx,
+        const LLVMBackend::NamedVariable& source, const LLVMBackend::TypeAndValue& element,
+        size_t index, const std::string& arrayName);
     // #5: an implicit pointer conversion of `value` to `target` that discards const.
     bool RejectConstDiscardingConversion(antlr4::ParserRuleContext* ctx,
         const LLVMBackend::NamedVariable& source, llvm::Value* value,
@@ -6423,7 +6455,8 @@ public:
                               size_t trueOccurrence, size_t falseOccurrence,
                               bool trueIsUnsigned = false, bool falseIsUnsigned = false,
                               const std::string& interfaceDestination = {},
-                              bool destinationPointer = false);
+                              bool destinationPointer = false,
+                              const LLVMBackend::TypeAndValue* storeDestination = nullptr);
     bool TernaryPointerJoinIsRejected(LLVMBackend* compiler,
         const LLVMBackend::TypeAndValue& trueType, const LLVMBackend::TypeAndValue& falseType,
         bool trueSimd, bool falseSimd, bool trueArrayView, bool falseArrayView,
@@ -8206,6 +8239,7 @@ public:
         const LLVMBackend::TypeAndValue& dest, bool directLoweredSret = false);
     LLVMBackend::TypeAndValue InferTernaryArmType(llvm::Value* value);
     LLVMBackend::TypeAndValue InferTernaryArmType(const LLVMBackend::TypedValue& value);
+    LLVMBackend::TypeAndValue CxxCompareOperandType(const LLVMBackend::TypedValue& value);
     // Pointee name of a `??` / `?:` pointer join, read from its arms (empty when unproven).
     LLVMBackend::TypeAndValue JoinedPointerArmType(llvm::Value* joined);
 
@@ -8523,6 +8557,10 @@ public:
     void LogErrorContext(antlr4::tree::TerminalNode* ctx, std::string errorMessage);
 
     void LogErrorContext(antlr4::ParserRuleContext* ctx, std::string errorMessage);
+    // A copy-init refusal inside a generic class / struct body instantiated for the refused type
+    // reports at the instantiation the user wrote, not at the template line.
+    void LogCopyInitRefusalContext(LLVMBackend* compiler, antlr4::ParserRuleContext* ctx,
+                                   const std::string& why);
     static void LogErrorContext(LLVMBackend* compiler, antlr4::ParserRuleContext* ctx,
                                 std::string errorMessage, const std::string& fileName = {});
     bool NativeTemplateNeedsTypeArgs(const std::string& spelledBase,

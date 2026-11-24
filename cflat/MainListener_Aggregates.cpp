@@ -370,6 +370,7 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
                 && fieldDestinations[fieldIndex] != nullptr)
             {
                 auto* fieldDestination = fieldDestinations[fieldIndex];
+                compiler->NoteBraceNestedSlot(fieldDestination, destination, field.VariableName);
                 EmitFieldInitializer(fieldDestination, field.TypeName, fi->initializerList(),
                                      false, nullptr, false,
                                      fieldDestination, &field.TypeName);
@@ -8413,6 +8414,19 @@ void MainListener::LogErrorContext(antlr4::ParserRuleContext* ctx, std::string e
         compilerLLVM->currentLine = static_cast<int>(ctx->getStart()->getLine());
         compilerLLVM->currentColumn = static_cast<int>(ctx->getStart()->getCharPositionInLine());
         compilerLLVM->LogError(std::move(errorMessage));
+    }
+
+void MainListener::LogCopyInitRefusalContext(LLVMBackend* compiler, antlr4::ParserRuleContext* ctx,
+                                             const std::string& why) {
+        const auto& origin = compiler->gts.activeInstantiationOrigin;
+        if (origin.valid && (compiler->gts.genericStructTemplates.count(origin.templateName) != 0
+                             || compiler->gts.genericClassTemplates.count(origin.templateName) != 0))
+        {
+            LLVMBackend::ReportingFileScope atOrigin(compiler, origin.file, origin.line, origin.column);
+            compiler->LogError(why);
+            return;
+        }
+        LogErrorContext(ctx, why);
     }
 
 void MainListener::LogErrorContext(LLVMBackend* compiler, antlr4::ParserRuleContext* ctx,

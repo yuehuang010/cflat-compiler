@@ -1904,14 +1904,16 @@ void LLVMBackend::RecordOwnFlagLoopBreakState()
         {
             const auto* live = FindVariableByStorage(sink.Storage);
             if (live != nullptr && (live->IsBorrowed || live->IsAliasBorrow
-                || live->TypeAndValue.IsAlias || live->BorrowsOwnedElement))
+                || live->TypeAndValue.IsAlias || live->BorrowsOwnedElement
+                || LoopSinkSourceMayBorrowAddress(*live)))
                 frame.borrowedExitSources.try_emplace(sink.Storage, BorrowedSourceDiagnosticName(*live));
         }
         for (const auto& sink : frame.moveOwnerSinks)
         {
             const auto* live = FindVariableByStorage(sink.Storage);
             if (live != nullptr && (live->IsBorrowed || live->IsAliasBorrow
-                || live->TypeAndValue.IsAlias || live->BorrowsOwnedElement))
+                || live->TypeAndValue.IsAlias || live->BorrowsOwnedElement
+                || LoopSinkSourceMayBorrowAddress(*live)))
                 frame.borrowedExitSources.try_emplace(sink.Storage, BorrowedSourceDiagnosticName(*live));
         }
         for (size_t i = 0; i + 1 < ownFlagLoopReownSnapshots_.size(); ++i)
@@ -1922,7 +1924,8 @@ void LLVMBackend::RecordOwnFlagLoopBreakState()
                 {
                     const auto* live = FindVariableByStorage(sink.Storage);
                     if (live != nullptr && (live->IsBorrowed || live->IsAliasBorrow
-                        || live->TypeAndValue.IsAlias || live->BorrowsOwnedElement))
+                        || live->TypeAndValue.IsAlias || live->BorrowsOwnedElement
+                        || LoopSinkSourceMayBorrowAddress(*live)))
                         frame.borrowedExitSources.try_emplace(sink.Storage, BorrowedSourceDiagnosticName(*live));
                 }
             };
@@ -1935,10 +1938,13 @@ void LLVMBackend::RecordOwnFlagLoopContinueState()
 {
         if (ownFlagLoopReownSnapshots_.empty()) return;
         auto& storages = ownFlagLoopReownSnapshots_.back().borrowedContinueStorages;
+        auto& mayBorrowSources = ownFlagLoopReownSnapshots_.back().mayBorrowContinueSources;
         auto recordBorrowed = [&](const auto& variables) {
             for (const auto& entry : variables)
             {
                 const auto& namedVar = entry.second;
+                if (namedVar.Storage != nullptr && LoopSinkSourceMayBorrowAddress(namedVar))
+                    mayBorrowSources.insert(namedVar.Storage);
                 if (namedVar.Storage != nullptr && namedVar.IsBorrowed
                     && namedVar.AssignBorrowBlock != nullptr)
                     storages.insert(namedVar.Storage);
@@ -1974,7 +1980,8 @@ LLVMBackend::OwnFlagJoinSnapshot LLVMBackend::SaveOwnFlagJoinState()
                     namedVar.BorrowsOwnedElement, namedVar.BorrowedThroughField,
                     namedVar.BorrowedUniqueFieldViaCall, namedVar.BorrowsOwningLocal,
                     namedVar.OwningLocalBorrowAfterRebind,
-                    namedVar.PointerRebound, namedVar.OwningLocalStorage, namedVar.BorrowedOrigin,
+                    namedVar.PointerRebound, namedVar.MayPointToBorrowedAddress,
+                    namedVar.OwningLocalStorage, namedVar.BorrowedOrigin,
                     namedVar.BorrowedUniqueField, namedVar.OwningLocalOrigin };
             if (namedVar.OwnFlagMayBeFalse)
                 state.mayBeFalsePaths[namedVar.Storage] = namedVar.OwnFlagMayBeFalseControlPath;
@@ -2031,6 +2038,7 @@ void LLVMBackend::RestoreOwnFlagJoinState(const OwnFlagJoinSnapshot& state)
                 namedVar.BorrowsOwningLocal = borrow->second.BorrowsOwningLocal;
                 namedVar.OwningLocalBorrowAfterRebind = borrow->second.OwningLocalBorrowAfterRebind;
                 namedVar.PointerRebound = borrow->second.PointerRebound;
+                namedVar.MayPointToBorrowedAddress = borrow->second.MayPointToBorrowedAddress;
                 namedVar.OwningLocalStorage = borrow->second.OwningLocalStorage;
                 namedVar.BorrowedOrigin = borrow->second.BorrowedOrigin;
                 namedVar.BorrowedUniqueField = borrow->second.BorrowedUniqueField;
@@ -2097,6 +2105,8 @@ LLVMBackend::OwnFlagJoinSnapshot LLVMBackend::MergeOwnFlagJoinStates(
             borrow.OwningLocalBorrowAfterRebind = a.OwningLocalBorrowAfterRebind
                 || b.OwningLocalBorrowAfterRebind;
             borrow.PointerRebound = a.PointerRebound || b.PointerRebound;
+            borrow.MayPointToBorrowedAddress = a.MayPointToBorrowedAddress
+                || b.MayPointToBorrowedAddress;
             if (a.OwningLocalStorage != b.OwningLocalStorage)
                 borrow.OwningLocalStorage = a.BorrowsOwningLocal
                     ? a.OwningLocalStorage : b.OwningLocalStorage;
@@ -7923,6 +7933,18 @@ void LLVMBackend::RegisterBorrowedAddressValue(llvm::Value* value)
         borrowedAddressValues_.insert(value);
     }
 
+void LLVMBackend::NoteSlotReadBorrowValue(const NamedVariable& read, llvm::Value* value)
+{
+        // Structural refusal of constants: a shared module-level value is never one slot's read.
+        if (value == nullptr || !value->getType()->isPointerTy() || llvm::isa<llvm::Constant>(value))
+            return;
+        const bool movedBorrow = read.IsExplicitMove
+            && (read.MayPointToBorrowedAddress || read.PointsToBorrowedAddress);
+        if (movedBorrow || (read.TypeAndValue.Pointer && !read.TypeAndValue.IsArrayView
+                && FieldHoldsBorrowedAddress(read)))
+            slotReadMayBorrowValues_.insert(value);
+    }
+
 bool LLVMBackend::IsBorrowedAddressValue(llvm::Value* value) const
 {
         if (value == nullptr) return false;
@@ -7946,10 +7968,11 @@ bool LLVMBackend::TernaryArmIsProvenBorrow(llvm::Value* armValue, llvm::Value* a
 
 bool LLVMBackend::FieldHoldsBorrowedAddress(const NamedVariable& field) const
 {
-        // `h.p = &x;` recorded the address-of store on the root binding, per field path.
-        if (field.FieldName.empty() || field.CallerName.empty() || field.MovePathHasDynamicIndex)
+        // `h.p = &x;` / `a[0] = &x;` recorded the address-of store on the root binding, per path.
+        if ((field.FieldName.empty() && !field.IsElementAccess) || field.CallerName.empty()
+            || field.MovePathHasDynamicIndex)
             return false;
-        const std::string fieldPath = FieldMoveKey(field);
+        const std::string fieldPath = BorrowSlotKey(field);
         if (fieldPath.empty()) return false;
         for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
@@ -7959,7 +7982,11 @@ bool LLVMBackend::FieldHoldsBorrowedAddress(const NamedVariable& field) const
             else if (auto it2 = frame.functionArgument.find(field.CallerName);
                 it2 != frame.functionArgument.end())
                 root = &it2->second;
-            if (root != nullptr) return root->BorrowedAddressFields.contains(fieldPath);
+            if (root == nullptr) continue;
+            if (!SlotPathTrackedOn(*root, fieldPath)) return false;
+            if (root->BorrowedAddressFields.contains(fieldPath)) return true;
+            // A dynamic-index store marked every element of an enclosing array (`arr[*`).
+            return SlotPathUnderDynamicMarker(*root, fieldPath);
         }
         return false;
     }
@@ -7983,6 +8010,10 @@ bool LLVMBackend::MoveSourceIsAddressBorrow(const NamedVariable& source) const
             return true;
         if (live != nullptr && live->FieldName.empty() && live->MayPointToBorrowedAddress)
             return true;
+        // `move (c ? u : &x)`: the join value itself, before any binding records the fact.
+        if (source.FieldName.empty() && !source.IsElementAccess
+            && JoinHasBorrowedAddressArm(source.Primary))
+            return true;
         if (FieldHoldsBorrowedAddress(source)) return true;
         if (source.IsOwning || source.IsNewAllocated || source.IsOwningStruct
             || source.IsOwningString)
@@ -7997,8 +8028,63 @@ bool LLVMBackend::MoveSourceIsAddressBorrow(const NamedVariable& source) const
                 && live->PointsToBorrowedAddress;
         }
         if (llvm::isa_and_nonnull<llvm::GlobalVariable>(storage))
-            return globalAssignBorrowedAddress_.count(storage) != 0;
+            return globalAssignBorrowedAddress_.count(storage) != 0
+                || globalAssignMayBorrowedAddress_.count(storage) != 0;
         return false;
+    }
+
+std::pair<bool, bool> LLVMBackend::CopyReadBorrowState(const NamedVariable& source) const
+{
+        // A field / element slot read (`T* q = h.p;`, `a[0]`) carries the slot's may-borrow fact.
+        if (source.TypeAndValue.Pointer && !source.TypeAndValue.IsArrayView
+            && FieldHoldsBorrowedAddress(source))
+            return {false, true};
+        // A `move g` read carries the global only as MoveSourceStorage.
+        const llvm::Value* storage = source.Storage != nullptr ? source.Storage
+            : source.MoveSourceStorage;
+        if (storage == nullptr || !llvm::isa<llvm::GlobalVariable>(storage)
+            || !source.FieldName.empty() || source.IsElementAccess
+            || !source.TypeAndValue.Pointer || source.TypeAndValue.IsArrayView)
+            return {false, false};
+        const bool proven = globalAssignBorrowedAddress_.count(storage) != 0;
+        return {proven, proven || globalAssignMayBorrowedAddress_.count(storage) != 0};
+    }
+
+bool LLVMBackend::JoinHasBorrowedAddressArm(const llvm::Value* joined) const
+{
+        if (joined == nullptr || !joined->getType()->isPointerTy()) return false;
+        for (llvm::Value* arm : JoinArmValues(joined))
+        {
+            if (arm == nullptr) continue;
+            if (const auto* constant = llvm::dyn_cast<llvm::Constant>(arm);
+                constant != nullptr && constant->isNullValue())
+                continue;
+            if (IsBorrowedAddressValue(arm) || IsProvableNonHeapAddress(arm)
+                || slotReadMayBorrowValues_.contains(arm))
+                return true;
+            const auto* load = llvm::dyn_cast<llvm::LoadInst>(arm);
+            if (load == nullptr) continue;
+            const llvm::Value* slot = load->getPointerOperand();
+            if (llvm::isa<llvm::GlobalVariable>(slot))
+            {
+                if (globalAssignBorrowedAddress_.count(slot) != 0
+                    || globalAssignMayBorrowedAddress_.count(slot) != 0)
+                    return true;
+                continue;
+            }
+            if (!llvm::isa<llvm::AllocaInst>(slot)) continue;
+            const NamedVariable* bound = FindVariableByStorage(slot);
+            if (bound != nullptr && bound->FieldName.empty() && bound->TypeAndValue.Pointer
+                && !bound->TypeAndValue.IsArrayView && bound->MayPointToBorrowedAddress)
+                return true;
+        }
+        return false;
+    }
+
+bool LLVMBackend::LoopSinkSourceMayBorrowAddress(const NamedVariable& live)
+{
+        return live.FieldName.empty() && !live.IsElementAccess && live.TypeAndValue.Pointer
+            && !live.TypeAndValue.IsArrayView && live.MayPointToBorrowedAddress;
     }
 
 void LLVMBackend::NullAliasedUniqueByValueArgs(const std::vector<TypeAndValue>& params,

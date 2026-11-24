@@ -1,0 +1,689 @@
+// An implicit T* -> U* between distinct native struct pointees (or a struct and a primitive
+// pointee) is refused at every store position, matching the call rule (`take(&y)` finds no
+// overload). doc/LANGUAGE.md: pointer -> pointer is an explicit cast. Pre-fix every block below
+// compiled and read NY bits through an NS* (`return p->a` gave 7).
+
+struct NS { int a = 0; int b = 0; };
+struct NY { long z = 0; };
+struct NH { NS* p = default; };
+struct NO { NH h = default; };
+struct NArr { NS*[2] p = default; };
+struct NWrap<T> { T v = default; };
+union NUa { int i; float f; };
+union NUb { int j; double d; };
+NY nyGlobal = default;
+
+// CPPRECPTR: C++ record pointees follow the same rule - a primitive, native struct or unrelated
+// C++ class pointee never converts implicitly to (or from) a C++ class pointer, nor compares with
+// one; base / derived pairs stay PTRSAFE's conversion. Pre-fix every C++ block below compiled.
+import cpp "../library/cpp_record_pointee.h";
+// JOINARG: a C++ class T** ?: / ?? join call argument keeps its own class (no relabel to the
+// parameter), and a whole multi-dimensional class array decays to a row pointer, never a class one.
+import cpp "../library/cpp_joinarg.h";
+int jaErrCfTakeB(JaB* p) { return p->b; }
+int jaErrCfTakeBpp(JaB** p) { return (*p)->b; }
+[cpp] struct UrpCpp { int z = 3; };
+int urpCfTake(UrpB* p) { return p->v; }
+interface IUrp { int m(); };
+class UrpImpl : IUrp { int k = 1; int m() { return k; } };
+
+expect_error("cannot convert 'NY*' to 'NS*' implicitly: the pointee types differ") {
+    NS* nsGlobalFromNy = &nyGlobal;
+}
+
+expect_error("cannot convert 'NY*' to 'NS*' implicitly: the pointee types differ") {
+    NS* nsReturnFromNy(NY* y) { return y; }
+}
+
+expect_error("cannot convert 'NY*' to 'NS*' implicitly: the pointee types differ") {
+    NS* nsTernaryReturn(int c, NY* y) { return c ? y : y; }
+}
+
+expect_error("cannot convert 'NY*' to 'NS*' implicitly: the pointee types differ") {
+    NS* nsCoalesceReturn(NY* y) { return y ?? y; }
+}
+
+expect_error("cannot convert 'int*' to 'NS*' implicitly: the pointee types differ") {
+    NS* nsReturnFromInt(int* x) { return x; }
+}
+
+// PRIMPTR: a call follows the same rule - an int* / char* / double* / bool* argument into a native
+// struct pointer parameter, or a fixed array into an unrelated element pointer, finds no overload.
+// Pre-fix every call block below compiled and read the argument's bytes as the struct.
+int nsTake(NS* p) { return p->a; }
+int nyTake(NY* p) { return (int)p->z; }
+int intTake(int* p) { return *p; }
+int nsGen<T>(T t, NS* p) { return p->a; }
+struct NCall { int k = 0; NCall(NS* p) { k = p->a; } int m(NS* p) { return p->a; } static int sm(NS* p) { return p->a; } };
+struct NGenCall<T> { T k = default; int m(NS* p) { return p->a; } };
+interface INCall { int m(NS* p); };
+class NCallImpl : INCall { int k = 0; int m(NS* p) { return p->a; } };
+extern int mblen(NS* s, u64 n);
+int nsVar(NS* p, ...) { return p->a; }
+
+// ARRDEPTH: a fixed array of class pointers decays to `T**` and a `?:` / `??` join of `T**`
+// keeps its depth, so the base / derived T** store and compare rules (clang: no conversion /
+// distinct pointer types) reach them. Pre-fix each block compiled; the native and unrelated
+// C++ arms already refused these shapes.
+struct UrpArrHold { UrpDer*[2] a = default; };
+struct UrpPpHold { UrpBase** q = default; };
+expect_error("cannot convert 'UrpDer**' to 'UrpBase**' for conditional expression: a multi-level pointer converts only to the same class") {
+    UrpBase** urpJoinReturn(int c, UrpDer** a, UrpDer** b) { return c ? a : b; }
+}
+expect_error("cannot convert 'UrpDer**' to 'UrpBase**' for the return value: a multi-level pointer converts only to the same class") {
+    UrpDer*[2] urpArrGlobal = default;
+    UrpBase** urpArrReturn() { return urpArrGlobal; }
+}
+expect_error("cannot convert 'UrpDer**' to 'UrpBase**' for variable 'urpArrGlobalPp': a multi-level pointer converts only to the same class") {
+    UrpDer*[2] urpArrGlobal2 = default;
+    UrpBase** urpArrGlobalPp = urpArrGlobal2;
+}
+
+extern int main()
+{
+    NY y = default;
+    NY* py = &y;
+    NS s = default;
+    int c = 1;
+
+    expect_error("cannot convert 'NY*' to 'NS*' implicitly: the pointee types differ") {
+        NS* p = &y;
+    }
+    expect_error("cannot convert 'NY*' to 'NS*' implicitly: the pointee types differ") {
+        NS* p = py;
+    }
+    expect_error("cannot convert 'NY*' to 'NS*' implicitly: the pointee types differ") {
+        NS* q = default;
+        q = &y;
+    }
+    expect_error("cannot convert 'NY*' to 'NS*' implicitly: the pointee types differ") {
+        NH h = default;
+        h.p = &y;
+    }
+    expect_error("cannot convert 'NY*' to 'NS*' implicitly: the pointee types differ") {
+        NO o = default;
+        o.h.p = &y;
+    }
+    expect_error("cannot convert 'NY*' to 'NS*' implicitly: the pointee types differ") {
+        NS*[2] arr = default;
+        arr[0] = &y;
+    }
+    expect_error("cannot convert 'NY*' to 'NS*' implicitly: the pointee types differ") {
+        NArr na = default;
+        na.p[1] = &y;
+    }
+    expect_error("cannot convert 'NY*' to 'NS*' implicitly: the pointee types differ") {
+        NS*[1] arr = { &y };
+    }
+    expect_error("cannot convert 'NY*' to 'NS*' implicitly: the pointee types differ") {
+        NH h = { p = &y };
+    }
+    expect_error("cannot convert 'NY*' to 'NS*' implicitly: the pointee types differ") {
+        NH h = { .p = &y };
+    }
+    expect_error("cannot convert 'NY*' to 'NS*' implicitly: the pointee types differ") {
+        NS* p = new NY();
+    }
+    expect_error("cannot convert 'NY*' to 'NS*' implicitly: the pointee types differ") {
+        Lambda<NS*()> f = () => { return py; };
+    }
+    expect_error("cannot convert 'NY*' to 'NS*' implicitly: the pointee types differ") {
+        NS* r = c ? &y : &y;
+    }
+    expect_error("cannot convert 'NY*' to 'NS*' implicitly: the pointee types differ") {
+        NS* r = default;
+        r = c ? py : py;
+    }
+    expect_error("cannot convert 'NY*' to 'NS*' implicitly: the pointee types differ") {
+        NS* r = py ?? py;
+    }
+    expect_error("cannot convert 'NY*' to 'NS*' implicitly: the pointee types differ") {
+        NS* r = default;
+        r = py ?? py;
+    }
+    expect_error("cannot convert 'NY**' to 'NS**' implicitly: the pointee types differ") {
+        NS** pp = &py;
+    }
+    expect_error("cannot convert 'NY**' to 'NS**' implicitly: the pointee types differ") {
+        NY*[2] ys = default;
+        NS** pp = ys;
+    }
+    expect_error("cannot convert 'NY*' to 'NS*' implicitly: the pointee types differ") {
+        NY[2] ys = default;
+        NS* p = ys;
+    }
+    expect_error("cannot convert 'NY*' to 'NS*' implicitly: the pointee types differ") {
+        NY[2] ys = default;
+        NY[] view = ys;
+        NS* p = view;
+    }
+    expect_error("cannot convert 'NS*' to 'int*' implicitly: the pointee types differ") {
+        int* ip = &s;
+    }
+    expect_error("cannot convert 'int*' to 'NS*' implicitly: the pointee types differ") {
+        int x = 7;
+        NS* p = &x;
+    }
+    expect_error("cannot convert 'NWrap<long>*' to 'NWrap<int>*' implicitly: the pointee types differ") {
+        NWrap<long> w = default;
+        NWrap<int>* p = &w;
+    }
+    expect_error("cannot convert 'NUa*' to 'NUb*' implicitly: the pointee types differ") {
+        NUa u = default;
+        NUb* p = &u;
+    }
+    expect_error("cannot convert 'int*' to 'NS*' implicitly: the pointee types differ") {
+        int v = 7;
+        int* ip = &v;
+        nsTake(ip);
+    }
+    expect_error("cannot convert 'int*' to 'NS*' implicitly: the pointee types differ") {
+        int v = 7;
+        nsTake(&v);
+    }
+    expect_error("cannot convert 'char*' to 'NS*' implicitly: the pointee types differ") {
+        char[8] cs = default;
+        nsTake(&cs[0]);
+    }
+    expect_error("cannot convert 'double*' to 'NS*' implicitly: the pointee types differ") {
+        double d = 7.0;
+        nsTake(&d);
+    }
+    expect_error("cannot convert 'bool*' to 'NS*' implicitly: the pointee types differ") {
+        bool bl = true;
+        nsTake(&bl);
+    }
+    expect_error("cannot convert 'NS*' to 'NY*' implicitly: the pointee types differ") {
+        NS[2] arr = default;
+        nyTake(arr);
+    }
+    expect_error("cannot convert 'NS*' to 'int*' implicitly: the pointee types differ") {
+        NS[2] arr = default;
+        intTake(arr);
+    }
+    expect_error("cannot convert 'int*' to 'NS*' implicitly: the pointee types differ") {
+        int[3] ia = default;
+        nsTake(ia);
+    }
+    expect_error("cannot convert 'int*' to 'NS*' implicitly: the pointee types differ") {
+        int v = 7;
+        nsTake(p: &v);
+    }
+    expect_error("cannot convert 'int*' to 'NS*' implicitly: the pointee types differ") {
+        int v = 7;
+        NCall nc = default;
+        nc.m(&v);
+    }
+    expect_error("cannot convert 'int*' to 'NS*' implicitly: the pointee types differ") {
+        int v = 7;
+        NCall.sm(&v);
+    }
+    expect_error("cannot convert 'int*' to 'NS*' implicitly: the pointee types differ") {
+        int v = 7;
+        NCall nc = NCall(&v);
+    }
+    expect_error("cannot convert 'int*' to 'NS*' implicitly: the pointee types differ") {
+        int v = 7;
+        nsGen(1, &v);
+    }
+    expect_error("cannot convert 'int*' to 'NS*' implicitly: the pointee types differ") {
+        int v = 7;
+        NGenCall<int> g = default;
+        g.m(&v);
+    }
+    expect_error("cannot convert 'int*' to 'NS*' implicitly: the pointee types differ") {
+        int v = 7;
+        NCallImpl impl = default;
+        INCall ic = &impl;
+        ic.m(&v);
+    }
+    expect_error("cannot convert 'int*' to 'NS*' implicitly: the pointee types differ") {
+        int v = 55;
+        mblen(&v, 1);
+    }
+    expect_error("cannot convert 'int*' to 'NS*' implicitly: the pointee types differ") {
+        int v = 7;
+        nsVar(&v, 1, 2);
+    }
+    expect_error("cannot convert 'NS*' to 'NY*' implicitly: the pointee types differ") {
+        NS* a = &s;
+        bool same = a == py;
+    }
+    expect_error("cannot convert 'NY*' to 'NS*' implicitly: the pointee types differ") {
+        NS* a = &s;
+        bool differ = py != a;
+    }
+    expect_error("cannot convert 'NS*' to 'int*' implicitly: the pointee types differ") {
+        int v = 7;
+        bool same = &s == &v;
+    }
+    expect_error("cannot convert 'int*' to 'UrpB*' implicitly: the pointee types differ") {
+        int v = 3;
+        UrpB* q = &v;
+    }
+    expect_error("cannot convert 'NS*' to 'UrpB*' implicitly: the pointee types differ") {
+        UrpB b = default;
+        UrpB* q = &b;
+        q = &s;
+    }
+    expect_error("cannot convert 'UrpU*' to 'UrpB*' implicitly: the pointee types differ") {
+        UrpU u = default;
+        UrpB* q = &u;
+    }
+    expect_error("cannot convert 'UrpB*' to 'int*' implicitly: the pointee types differ") {
+        UrpB b = default;
+        int* q = &b;
+    }
+    expect_error("cannot convert 'UrpU**' to 'UrpB**' implicitly: the pointee types differ") {
+        UrpU u = default;
+        UrpU* pu = &u;
+        UrpB** q = &pu;
+    }
+    expect_error("cannot convert 'int*' to 'UrpCpp*' implicitly: the pointee types differ") {
+        int v = 3;
+        UrpCpp* q = &v;
+    }
+    expect_error("cannot convert 'int*' to 'UrpB*' implicitly: the pointee types differ") {
+        int v = 3;
+        urp_take(&v);
+    }
+    expect_error("cannot convert 'int*' to 'UrpB*' implicitly: the pointee types differ") {
+        int v = 3;
+        urpCfTake(&v);
+    }
+    expect_error("cannot convert 'UrpB*' to 'UrpU*' implicitly: the pointee types differ") {
+        UrpB b = default;
+        UrpU u = default;
+        bool same = &b == &u;
+    }
+    expect_error("cannot convert 'NS*' to 'UrpB*' implicitly: the pointee types differ") {
+        UrpB b = default;
+        bool before = &s < &b;
+    }
+    expect_error("cannot convert 'UrpBase*' to 'UrpDer*' for variable 'q' implicitly") {
+        UrpDer d = default;
+        UrpBase* pb = &d;
+        UrpDer* q = pb;
+    }
+    // LITSUB: a multi-level pointer compare across a base / derived pair has no composite type
+    // ([conv.qual], like the store form); clang: comparison of distinct pointer types. Pre-fix
+    // each block compiled and compared the raw addresses.
+    expect_error("cannot compare 'UrpDer**' with 'UrpBase**': a multi-level pointer compares only with the same class") {
+        UrpDer d = default;
+        UrpBase b = default;
+        UrpDer* pd = &d;
+        UrpBase* pb = &b;
+        UrpDer** ppd = &pd;
+        UrpBase** ppb = &pb;
+        bool same = ppd == ppb;
+    }
+    expect_error("cannot compare 'UrpBase**' with 'UrpDer**': a multi-level pointer compares only with the same class") {
+        UrpDer d = default;
+        UrpBase b = default;
+        UrpDer* pd = &d;
+        UrpBase* pb = &b;
+        UrpDer** ppd = &pd;
+        UrpBase** ppb = &pb;
+        bool differ = ppb != ppd;
+    }
+    expect_error("cannot compare 'UrpDer**' with 'UrpBase**': a multi-level pointer compares only with the same class") {
+        UrpDer d = default;
+        UrpBase b = default;
+        UrpDer* pd = &d;
+        UrpBase* pb = &b;
+        UrpDer** ppd = &pd;
+        UrpBase** ppb = &pb;
+        bool before = ppd < ppb;
+    }
+    expect_error("cannot compare 'UrpDer***' with 'UrpBase***': a multi-level pointer compares only with the same class") {
+        UrpDer d = default;
+        UrpBase b = default;
+        UrpDer* pd = &d;
+        UrpBase* pb = &b;
+        UrpDer** ppd = &pd;
+        UrpBase** ppb = &pb;
+        UrpDer*** pppd = &ppd;
+        UrpBase*** pppb = &ppb;
+        bool after = pppd >= pppb;
+    }
+    expect_error("cannot compare interface 'IUrp' with 'int*': a primitive pointee is never an interface object") {
+        int v = 3;
+        UrpImpl impl = default;
+        IUrp i = &impl;
+        bool same = i == &v;
+    }
+    expect_error("cannot compare interface 'IUrp' with 'UrpImpl**': a multi-level pointer is never an interface object") {
+        UrpImpl impl = default;
+        IUrp i = &impl;
+        UrpImpl* p = &impl;
+        UrpImpl** pp = &p;
+        bool same = i == pp;
+    }
+    expect_error("cannot compare interface 'IUrp' with 'UrpB*': a C++ class pointee is never a CFlat interface object") {
+        UrpImpl impl = default;
+        UrpB b = default;
+        IUrp i = &impl;
+        bool differ = &b != i;
+    }
+    expect_error("operator '<' cannot compare an interface value: interface values compare only with '==' and '!='") {
+        UrpImpl impl = default;
+        IUrp i = &impl;
+        bool before = i < &impl;
+    }
+    expect_error("operator '>=' cannot compare an interface value: interface values compare only with '==' and '!='") {
+        UrpImpl impl = default;
+        IUrp i = &impl;
+        bool after = &impl >= i;
+    }
+    expect_error("operator '<=' cannot compare an interface value: interface values compare only with '==' and '!='") {
+        UrpImpl impl = default;
+        UrpImpl other = default;
+        IUrp i = &impl;
+        IUrp j = &other;
+        bool order = i <= j;
+    }
+    // ARRDEPTH: array / join operands of a base / derived T** store or compare.
+    expect_error("cannot convert 'UrpDer**' to 'UrpBase**' for variable 'q': a multi-level pointer converts only to the same class") {
+        UrpDer d = default;
+        UrpDer* pd = &d;
+        UrpDer** dpp = &pd;
+        int c = 1;
+        UrpDer*[2] arr = default;
+        UrpBase** q = arr;
+    }
+    expect_error("cannot convert 'UrpBase**' to 'UrpDer**' for variable 'q': a multi-level pointer converts only to the same class") {
+        UrpDer d = default;
+        UrpDer* pd = &d;
+        UrpDer** dpp = &pd;
+        int c = 1;
+        UrpBase*[2] arr = default;
+        UrpDer** q = arr;
+    }
+    expect_error("cannot convert 'UrpDer***' to 'UrpBase***' for variable 'q': a multi-level pointer converts only to the same class") {
+        UrpDer d = default;
+        UrpDer* pd = &d;
+        UrpDer** dpp = &pd;
+        int c = 1;
+        UrpDer**[2] arr = default;
+        UrpBase*** q = arr;
+    }
+    expect_error("cannot convert 'UrpDer**' to 'UrpBase**' for 'q': a multi-level pointer converts only to the same class") {
+        UrpDer d = default;
+        UrpDer* pd = &d;
+        UrpDer** dpp = &pd;
+        int c = 1;
+        UrpDer*[2] arr = default;
+        UrpBase** q = nullptr;
+        q = arr;
+    }
+    expect_error("cannot convert 'UrpDer**' to 'UrpBase**' for variable 'q': a multi-level pointer converts only to the same class") {
+        UrpDer d = default;
+        UrpDer* pd = &d;
+        UrpDer** dpp = &pd;
+        int c = 1;
+        UrpArrHold h = default;
+        UrpBase** q = h.a;
+    }
+    expect_error("cannot convert 'UrpDer**' to 'UrpBase**' for field 'UrpPpHold.q': a multi-level pointer converts only to the same class") {
+        UrpDer d = default;
+        UrpDer* pd = &d;
+        UrpDer** dpp = &pd;
+        int c = 1;
+        UrpDer*[2] arr = default;
+        UrpPpHold h = { q = arr };
+    }
+    expect_error("cannot convert 'UrpDer**' to 'UrpBase**' for variable 'q': a multi-level pointer converts only to the same class") {
+        UrpDer d = default;
+        UrpDer* pd = &d;
+        UrpDer** dpp = &pd;
+        int c = 1;
+        UrpDer*[2] arr = default;
+        (const UrpBase*)* q = arr;
+    }
+    expect_error("cannot convert 'UrpDer**' to 'UrpBase**' for conditional expression: a multi-level pointer converts only to the same class") {
+        UrpDer d = default;
+        UrpDer* pd = &d;
+        UrpDer** dpp = &pd;
+        int c = 1;
+        UrpBase** q = c ? dpp : dpp;
+    }
+    expect_error("cannot convert 'UrpDer**' to 'UrpBase**' for conditional expression: a multi-level pointer converts only to the same class") {
+        UrpDer d = default;
+        UrpDer* pd = &d;
+        UrpDer** dpp = &pd;
+        int c = 1;
+        UrpBase** q = dpp ?? dpp;
+    }
+    expect_error("cannot convert 'UrpDer**' to 'UrpBase**' for conditional expression: a multi-level pointer converts only to the same class") {
+        UrpDer d = default;
+        UrpDer* pd = &d;
+        UrpDer** dpp = &pd;
+        int c = 1;
+        UrpBase** q = nullptr;
+        q = c ? dpp : dpp;
+    }
+    expect_error("cannot convert 'UrpDer**' to 'UrpBase**' for conditional expression: a multi-level pointer converts only to the same class") {
+        UrpDer d = default;
+        UrpDer* pd = &d;
+        UrpDer** dpp = &pd;
+        int c = 1;
+        UrpBase** q = c ? dpp : nullptr;
+    }
+    expect_error("cannot convert 'UrpDer**' to 'UrpBase**' for conditional expression: a multi-level pointer converts only to the same class") {
+        UrpDer d = default;
+        UrpDer* pd = &d;
+        UrpDer** dpp = &pd;
+        int c = 1;
+        UrpDer*[2] arr = default;
+        UrpBase** q = c ? arr : dpp;
+    }
+    expect_error("cannot compare 'UrpDer**' with 'UrpBase**': a multi-level pointer compares only with the same class") {
+        UrpDer d = default;
+        UrpDer* pd = &d;
+        UrpDer** dpp = &pd;
+        UrpBase b = default;
+        UrpBase* pb = &b;
+        UrpBase** bq = &pb;
+        int c = 1;
+        UrpDer*[2] arr = default;
+        bool e = arr == bq;
+    }
+    expect_error("cannot compare 'UrpBase**' with 'UrpDer**': a multi-level pointer compares only with the same class") {
+        UrpDer d = default;
+        UrpDer* pd = &d;
+        UrpDer** dpp = &pd;
+        UrpBase b = default;
+        UrpBase* pb = &b;
+        UrpBase** bq = &pb;
+        int c = 1;
+        UrpDer*[2] arr = default;
+        bool e = bq != arr;
+    }
+    expect_error("cannot compare 'UrpDer**' with 'UrpBase**': a multi-level pointer compares only with the same class") {
+        UrpDer d = default;
+        UrpDer* pd = &d;
+        UrpDer** dpp = &pd;
+        UrpBase b = default;
+        UrpBase* pb = &b;
+        UrpBase** bq = &pb;
+        int c = 1;
+        UrpArrHold h = default;
+        bool e = h.a < bq;
+    }
+    expect_error("cannot compare 'UrpDer**' with 'UrpBase**': a multi-level pointer compares only with the same class") {
+        UrpDer d = default;
+        UrpDer* pd = &d;
+        UrpDer** dpp = &pd;
+        UrpBase b = default;
+        UrpBase* pb = &b;
+        UrpBase** bq = &pb;
+        int c = 1;
+        bool e = (c ? dpp : dpp) == bq;
+    }
+    expect_error("cannot compare 'UrpDer**' with 'UrpBase**': a multi-level pointer compares only with the same class") {
+        UrpDer d = default;
+        UrpDer* pd = &d;
+        UrpDer** dpp = &pd;
+        UrpBase b = default;
+        UrpBase* pb = &b;
+        UrpBase** bq = &pb;
+        int c = 1;
+        bool e = (c ? dpp : nullptr) >= bq;
+    }
+    expect_error("cannot compare 'UrpBase**' with 'UrpDer**': a multi-level pointer compares only with the same class") {
+        UrpDer d = default;
+        UrpDer* pd = &d;
+        UrpDer** dpp = &pd;
+        UrpBase b = default;
+        UrpBase* pb = &b;
+        UrpBase** bq = &pb;
+        int c = 1;
+        bool e = bq == (dpp ?? dpp);
+    }
+    // JOINARG: T** join call arguments (pre-fix each relabelled to the parameter and compiled).
+    expect_error("no overload of 'ja_take_bpp' matches the given arguments") {
+        JaD d1 = default;
+        JaD d2 = default;
+        JaD* p1 = &d1;
+        JaD* p2 = &d2;
+        JaD** dpp = &p1;
+        JaD** dpp2 = &p2;
+        JaD** dnull = nullptr;
+        int c = 1;
+        int r = ja_take_bpp(c ? dpp : dpp2);
+    }
+    expect_error("no overload of 'ja_take_b' matches the given arguments") {
+        JaD d1 = default;
+        JaD d2 = default;
+        JaD* p1 = &d1;
+        JaD* p2 = &d2;
+        JaD** dpp = &p1;
+        JaD** dpp2 = &p2;
+        JaD** dnull = nullptr;
+        int c = 1;
+        int r = ja_take_b(c ? dpp : dpp2);
+    }
+    expect_error("no overload of 'jaErrCfTakeBpp' matches the given arguments") {
+        JaD d1 = default;
+        JaD d2 = default;
+        JaD* p1 = &d1;
+        JaD* p2 = &d2;
+        JaD** dpp = &p1;
+        JaD** dpp2 = &p2;
+        JaD** dnull = nullptr;
+        int c = 1;
+        int r = jaErrCfTakeBpp(c ? dpp : dpp2);
+    }
+    expect_error("no overload of 'jaErrCfTakeB' matches the given arguments") {
+        JaD d1 = default;
+        JaD d2 = default;
+        JaD* p1 = &d1;
+        JaD* p2 = &d2;
+        JaD** dpp = &p1;
+        JaD** dpp2 = &p2;
+        JaD** dnull = nullptr;
+        int c = 1;
+        int r = jaErrCfTakeB(c ? dpp : dpp2);
+    }
+    expect_error("no overload of 'ja_take_bpp' matches the given arguments") {
+        JaD d1 = default;
+        JaD d2 = default;
+        JaD* p1 = &d1;
+        JaD* p2 = &d2;
+        JaD** dpp = &p1;
+        JaD** dpp2 = &p2;
+        JaD** dnull = nullptr;
+        int c = 1;
+        int r = ja_take_bpp(dnull ?? dpp);
+    }
+    expect_error("no overload of 'jaErrCfTakeBpp' matches the given arguments") {
+        JaD d1 = default;
+        JaD d2 = default;
+        JaD* p1 = &d1;
+        JaD* p2 = &d2;
+        JaD** dpp = &p1;
+        JaD** dpp2 = &p2;
+        JaD** dnull = nullptr;
+        int c = 1;
+        int r = jaErrCfTakeBpp(dnull ?? dpp);
+    }
+    expect_error("no overload of 'ja_take_b' matches the given arguments") {
+        JaD d1 = default;
+        JaD d2 = default;
+        JaD* p1 = &d1;
+        JaD* p2 = &d2;
+        JaD** dpp = &p1;
+        JaD** dpp2 = &p2;
+        JaD** dnull = nullptr;
+        int c = 1;
+        int r = ja_take_b(dnull ?? dpp);
+    }
+    expect_error("no overload of 'ja_ov3' matches the given arguments") {
+        JaD d1 = default;
+        JaD d2 = default;
+        JaD* p1 = &d1;
+        JaD* p2 = &d2;
+        JaD** dpp = &p1;
+        JaD** dpp2 = &p2;
+        JaD** dnull = nullptr;
+        int c = 1;
+        int r = ja_ov3(c ? dpp : dpp2);
+    }
+    // JOINARG: whole multi-dimensional class arrays and unrelated rows (pre-fix each compiled).
+    expect_error("cannot convert 'NY*' to 'NS*' implicitly: the pointee types differ") {
+        NY[2][2] rows = default;
+        NS* p = rows[1];
+    }
+    expect_error("cannot compare 'JaD[2][2]' with 'JaB*': a multi-dimensional array decays to a pointer to its first row, not to a class pointer") {
+        JaD[2][2] rows = default;
+        JaD d = default;
+        JaB* q = &d;
+        bool e = rows == q;
+    }
+    expect_error("cannot compare 'JaD[2][2]' with 'JaB*': a multi-dimensional array decays to a pointer to its first row, not to a class pointer") {
+        JaD[2][2] rows = default;
+        JaD d = default;
+        JaB* q = &d;
+        bool e = q != rows;
+    }
+    expect_error("cannot convert 'JaD[2][2]' to 'JaB*' for variable 'b': a multi-dimensional array decays to a pointer to its first row, not to a class pointer") {
+        JaD[2][2] rows = default;
+        JaB* b = rows;
+    }
+    expect_error("cannot convert 'JaD[2][2]' to 'JaB*' for 'b': a multi-dimensional array decays to a pointer to its first row, not to a class pointer") {
+        JaD[2][2] rows = default;
+        JaB* b = nullptr;
+        b = rows;
+    }
+    expect_error("cannot convert 'JaD[2][2]' to 'JaX*' for variable 'x': a multi-dimensional array decays to a pointer to its first row, not to a class pointer") {
+        JaD[2][2] rows = default;
+        JaX* x = rows;
+    }
+    expect_error("cannot convert 'JaD[2][2]' to 'JaB*' for variable 'b': a multi-dimensional array decays to a pointer to its first row, not to a class pointer") {
+        JaD[2][2] rows = default;
+        JaD[2][2][2] cube = default;
+        JaB* b = cube[1];
+    }
+    expect_error("no overload of 'ja_take_b' matches the given arguments") {
+        JaD[2][2] rows = default;
+        int r = ja_take_b(rows);
+    }
+    expect_error("no overload of 'jaErrCfTakeB' matches the given arguments") {
+        JaD[2][2] rows = default;
+        int r = jaErrCfTakeB(rows);
+    }
+    expect_error("no overload of 'ja_take_b' matches the given arguments") {
+        JaD[2][2] rows = default;
+        JaD[2][2][2] cube = default;
+        int r = ja_take_b(cube[1]);
+    }
+    expect_error("cannot convert 'JaD*' to 'JaX*' implicitly: the pointee types differ") {
+        JaD[2][2] rows = default;
+        JaX* x = rows[1];
+    }
+    expect_error("no overload of 'ja_take_x' matches the given arguments") {
+        JaD[2][2] rows = default;
+        int r = ja_take_x(rows[1]);
+    }
+    return 0;
+}

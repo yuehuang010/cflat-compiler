@@ -249,6 +249,7 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         s.movedOutSourceSlots = std::move(movedOutSourceSlots_);
         s.movedBorrowedPtrValues = std::move(movedBorrowedPtrValues_);
         s.borrowedAddressValues = std::move(borrowedAddressValues_);
+        s.slotReadMayBorrowValues = std::move(slotReadMayBorrowValues_);
         s.movedBorrowedThroughFieldValues = std::move(movedBorrowedThroughFieldValues_);
         s.nonOwningStructJoins = std::move(nonOwningStructJoins_);
         s.uniqueFieldReadValues = std::move(uniqueFieldReadValues_);
@@ -257,6 +258,9 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         s.aliasTransferResults = std::move(aliasTransferResults_);
         s.aliasReturnTempSlots = std::move(aliasReturnTempSlots_);
         s.tempFieldValues = std::move(tempFieldValues_);
+        s.globalAssignBorrowOrigin = globalAssignBorrowOrigin_;
+        s.globalAssignBorrowedAddress = globalAssignBorrowedAddress_;
+        s.globalAssignMayBorrowedAddress = globalAssignMayBorrowedAddress_;
         // Mark the function we are leaving mid-body INCOMPLETE for the escape analysis
         // (see FunctionBodyIsComplete); RestoreBuilderState pops it back off.
         if (currentFunction != nullptr) suspendedFunctions_.push_back(currentFunction);
@@ -288,6 +292,7 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         movedOutSourceSlots_.clear();
         movedBorrowedPtrValues_.clear();
         borrowedAddressValues_.clear();
+        slotReadMayBorrowValues_.clear();
         movedBorrowedThroughFieldValues_.clear();
         nonOwningStructJoins_.clear();
         uniqueFieldReadValues_.clear();
@@ -345,6 +350,7 @@ void LLVMBackend::RestoreBuilderState(const BuilderState& state)
         movedOutSourceSlots_     = state.movedOutSourceSlots;
         movedBorrowedPtrValues_  = state.movedBorrowedPtrValues;
         borrowedAddressValues_   = state.borrowedAddressValues;
+        slotReadMayBorrowValues_ = state.slotReadMayBorrowValues;
         movedBorrowedThroughFieldValues_ = state.movedBorrowedThroughFieldValues;
         nonOwningStructJoins_    = state.nonOwningStructJoins;
         uniqueFieldReadValues_   = state.uniqueFieldReadValues;
@@ -353,6 +359,9 @@ void LLVMBackend::RestoreBuilderState(const BuilderState& state)
         aliasTransferResults_    = state.aliasTransferResults;
         aliasReturnTempSlots_    = state.aliasReturnTempSlots;
         tempFieldValues_         = state.tempFieldValues;
+        globalAssignBorrowOrigin_       = state.globalAssignBorrowOrigin;
+        globalAssignBorrowedAddress_    = state.globalAssignBorrowedAddress;
+        globalAssignMayBorrowedAddress_ = state.globalAssignMayBorrowedAddress;
     }
 
 bool LLVMBackend::IsWinrtProjectedType(const std::string& name) const
@@ -3147,7 +3156,7 @@ llvm::FunctionType* LLVMBackend::GetFunctionType(const LLVMBackend::TypeAndValue
         // Last line of defence: an opaque aggregate is not a valid LLVM argument type.
         // Report it instead of letting llvm::FunctionType::get assert.
         llvm::StructType* incomplete = FindIncompleteByValueAggregate(returnType, arguments, externC);
-        if (incomplete != nullptr && !allowIncomplete)
+        if (incomplete != nullptr && !allowIncomplete && !RejectUnsizedCxxLayout(incomplete))
             LogError(std::format(
                 "type '{}' is incomplete here, so it cannot be passed by value or returned. "
                 "Define its body before this signature, or use a pointer.",
@@ -3504,6 +3513,7 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
         // Per-function by construction: see globalAssignBorrowOrigin_'s comment.
         globalAssignBorrowOrigin_.clear();
         globalAssignBorrowedAddress_.clear();
+        globalAssignMayBorrowedAddress_.clear();
 
         if (diBuilder && diFile && line > 0)
         {

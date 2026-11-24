@@ -790,6 +790,13 @@ bool LLVMBackend::EmitCxxImplicitArgumentConversions(
         };
         auto actualArgument = [&](const NamedVariable& arg, size_t parameterIndex)
             -> std::optional<ActualArgument> {
+            // A `D[2][2]` decays to `D(*)[2]`, not to the `D*` its flattened decay spells.
+            TypeAndValue multiDim = RowAsFixedArray(
+                arg.HasOriginalArgumentType ? arg.OriginalArgumentType : arg.TypeAndValue);
+            if (multiDim.TypeName.empty()) multiDim.TypeName = arg.InferSourceTypeName;
+            if (multiDim.ConstArraySize > 0 && !multiDim.ConstInnerDimensions.empty()
+                && !multiDim.Pointer && IsCxxRecord(multiDim.TypeName))
+                return std::nullopt;
             TypeAndValue type = argumentType(arg);
             if (type.TypeName.empty() && !type.Pointer && arg.Primary != nullptr
                 && arg.Primary->getType()->isPointerTy())
@@ -1293,6 +1300,331 @@ bool LLVMBackend::CxxSameClassAssignmentRefused(const std::string& typeName, uin
         auto record = cxxRecordEntries_.find(typeName);
         return record != cxxRecordEntries_.end()
             && (record->second.assignRefusedMask & kinds) == kinds;
+}
+
+LLVMBackend::CxxCopyCtorFault LLVMBackend::CxxTrivialCopyCtorRefusal(const std::string& typeName,
+                                                                     bool constSource,
+                                                                     bool rvalue) const
+{
+        // Nontrivial classes go through EmitCxxCopyOrMoveConstruct; a [cpp] struct keeps cflat's rules.
+        const std::string resolved = ResolveTypeAlias(typeName);
+        if (resolved.empty() || IsCppStructName(resolved) || !IsCxxTriviallyCopyableRecord(resolved))
+            return CxxCopyCtorFault::None;
+        auto record = cxxRecordEntries_.find(resolved);
+        if (record == cxxRecordEntries_.end()) return CxxCopyCtorFault::None;
+        const uint16_t bit = rvalue ? cflat_cinterop::CxxCopyCtorRefusedRvalue
+            : constSource ? cflat_cinterop::CxxCopyCtorRefusedConstLvalue
+                          : cflat_cinterop::CxxCopyCtorRefusedLvalue;
+        const uint16_t mask = record->second.copyCtorRefusedMask;
+        if ((mask & bit) == 0) return CxxCopyCtorFault::None;
+        const bool movePick = rvalue && (mask & cflat_cinterop::CxxCopyCtorRvalueMovePick) != 0;
+        const bool deleted = (mask & (bit << cflat_cinterop::CxxCopyCtorDeletedShift)) != 0;
+        const bool isExplicit = (mask & (bit << cflat_cinterop::CxxCopyCtorExplicitShift)) != 0;
+        if (movePick)
+            return isExplicit ? CxxCopyCtorFault::MoveExplicit
+                : deleted ? CxxCopyCtorFault::MoveDeleted : CxxCopyCtorFault::MoveInaccessible;
+        return isExplicit ? CxxCopyCtorFault::CopyExplicit
+            : deleted ? CxxCopyCtorFault::CopyDeleted : CxxCopyCtorFault::CopyInaccessible;
+}
+
+std::string LLVMBackend::CxxCopyInitRefusal(const std::string& typeName, bool constSource,
+                                            bool rvalue, CxxCopyInitSite site,
+                                            const std::string& name, const std::string& owner) const
+{
+        using Fault = CxxCopyCtorFault;
+        using Site = CxxCopyInitSite;
+        const Fault fault = CxxTrivialCopyCtorRefusal(typeName, constSource, rvalue);
+        // A selected deleted move constructor is refused by the move lowering itself.
+        if (fault == Fault::MoveDeleted
+            && (site == Site::Parameter || site == Site::Element || site == Site::Field))
+            return {};
+        if (fault != Fault::None)
+        {
+            const std::string shown = DisplayCxxClassName(typeName);
+            const bool deleted = fault == Fault::CopyDeleted;
+            const bool isExplicit = fault == Fault::CopyExplicit;
+            // A by-value parameter names the remedy when the class still move-constructs.
+            const bool moveRemedy = site == Site::Parameter
+                && CxxTrivialCopyCtorRefusal(typeName, false, true) == Fault::None;
+            switch (site)
+            {
+            case Site::Local:
+                if (isExplicit)
+                    return LocalizeMessage("cannot copy C++ class '{}' into local '{}': its copy "
+                        "constructor is explicit - construct the copy with '{}(x)' instead",
+                        { shown, name, shown });
+                break;
+            case Site::Parameter:
+                // `f(move x)` / a consumed last use: the caller's lvalue diagnostics never see it.
+                if (fault == Fault::MoveInaccessible)
+                    return LocalizeMessage("cannot move C++ class '{}' into parameter '{}' of '{}': its "
+                        "move constructor is not accessible", { shown, name, owner });
+                if (fault == Fault::MoveExplicit)
+                    return LocalizeMessage("cannot move C++ class '{}' into parameter '{}' of '{}': its "
+                        "move constructor is explicit", { shown, name, owner });
+                if (rvalue && deleted)
+                    return LocalizeMessage("cannot move C++ class '{}' into parameter '{}' of '{}': it has "
+                        "no usable move constructor and its copy constructor is deleted", { shown, name, owner });
+                if (rvalue && !isExplicit)
+                    return LocalizeMessage("cannot move C++ class '{}' into parameter '{}' of '{}': it has "
+                        "no usable move constructor and its copy constructor is not accessible",
+                        { shown, name, owner });
+                if (isExplicit && moveRemedy)
+                    return LocalizeMessage("cannot copy C++ class '{}' into parameter '{}' of '{}': its "
+                        "copy constructor is explicit - pass 'move x' or a temporary",
+                        { shown, name, owner });
+                if (isExplicit)
+                    return LocalizeMessage("cannot copy C++ class '{}' into parameter '{}' of '{}': its "
+                        "copy constructor is explicit - pass a temporary", { shown, name, owner });
+                break;
+            case Site::ReturnSlot:
+                if (isExplicit)
+                    return LocalizeMessage("cannot copy C++ class '{}' into the return slot: its copy "
+                        "constructor is explicit", { shown });
+                if (fault == Fault::MoveExplicit)
+                    return LocalizeMessage("cannot copy C++ class '{}' into the return slot: its move "
+                        "constructor is explicit", { shown });
+                break;
+            case Site::Element:
+                if (fault == Fault::MoveInaccessible)
+                    return LocalizeMessage("cannot move C++ class '{}' into element {} of '{}': its move "
+                        "constructor is not accessible", { shown, name, owner });
+                if (fault == Fault::MoveExplicit)
+                    return LocalizeMessage("cannot move C++ class '{}' into element {} of '{}': its move "
+                        "constructor is explicit", { shown, name, owner });
+                if (rvalue && deleted)
+                    return LocalizeMessage("cannot move C++ class '{}' into element {} of '{}': it has no "
+                        "usable move constructor and its copy constructor is deleted", { shown, name, owner });
+                if (rvalue && !isExplicit)
+                    return LocalizeMessage("cannot move C++ class '{}' into element {} of '{}': it has no "
+                        "usable move constructor and its copy constructor is not accessible", { shown, name, owner });
+                if (deleted)
+                    return LocalizeMessage("cannot copy C++ class '{}' into element {} of '{}': its copy "
+                        "constructor is deleted", { shown, name, owner });
+                if (isExplicit)
+                    return LocalizeMessage("cannot copy C++ class '{}' into element {} of '{}': its copy "
+                        "constructor is explicit", { shown, name, owner });
+                return LocalizeMessage("cannot copy C++ class '{}' into element {} of '{}': its copy "
+                    "constructor is not accessible", { shown, name, owner });
+            case Site::Field:
+                if (fault == Fault::MoveInaccessible)
+                    return LocalizeMessage("cannot move C++ class '{}' into field '{}': its move "
+                        "constructor is not accessible", { shown, name });
+                if (fault == Fault::MoveExplicit)
+                    return LocalizeMessage("cannot move C++ class '{}' into field '{}': its move "
+                        "constructor is explicit", { shown, name });
+                if (rvalue && deleted)
+                    return LocalizeMessage("cannot move C++ class '{}' into field '{}': it has no usable move "
+                        "constructor and its copy constructor is deleted", { shown, name });
+                if (rvalue && !isExplicit)
+                    return LocalizeMessage("cannot move C++ class '{}' into field '{}': it has no usable move "
+                        "constructor and its copy constructor is not accessible", { shown, name });
+                if (deleted)
+                    return LocalizeMessage("cannot copy C++ class '{}' into field '{}': its copy "
+                        "constructor is deleted", { shown, name });
+                if (isExplicit)
+                    return LocalizeMessage("cannot copy C++ class '{}' into field '{}': its copy "
+                        "constructor is explicit", { shown, name });
+                return LocalizeMessage("cannot copy C++ class '{}' into field '{}': its copy "
+                    "constructor is not accessible", { shown, name });
+            }
+            return {};
+        }
+        // A CFlat struct copies member-wise; a move (`move x`, `return local;`) moves its fields.
+        std::string fieldPath, fieldType;
+        Fault fieldFault = Fault::None;
+        if (rvalue ? !FindUnmovableCxxStruct(typeName, fieldPath, fieldType, fieldFault)
+                   : !FindUncopyableCxxField(typeName, constSource, fieldPath, fieldType, fieldFault))
+            return {};
+        const std::string shown = SpellDiagnosticType(*this, TypeAndValue{ .TypeName = typeName });
+        const std::string fieldShown = DisplayCxxClassName(fieldType);
+        const bool deleted = fieldFault == Fault::CopyDeleted;
+        if (rvalue)
+            switch (site)
+            {
+            case Site::Local:
+                return deleted
+                    ? LocalizeMessage("cannot move struct '{}' into local '{}': it has no usable move "
+                          "constructor, and field '{}' of C++ class '{}' has a deleted copy constructor",
+                          { shown, name, fieldPath, fieldShown })
+                    : LocalizeMessage("cannot move struct '{}' into local '{}': it has no usable move "
+                          "constructor, and field '{}' of C++ class '{}' has an inaccessible copy "
+                          "constructor", { shown, name, fieldPath, fieldShown });
+            case Site::Parameter:
+                return deleted
+                    ? LocalizeMessage("cannot move struct '{}' into parameter '{}' of '{}': it has no "
+                          "usable move constructor, and field '{}' of C++ class '{}' has a deleted copy "
+                          "constructor", { shown, name, owner, fieldPath, fieldShown })
+                    : LocalizeMessage("cannot move struct '{}' into parameter '{}' of '{}': it has no "
+                          "usable move constructor, and field '{}' of C++ class '{}' has an inaccessible "
+                          "copy constructor", { shown, name, owner, fieldPath, fieldShown });
+            case Site::ReturnSlot:
+                return deleted
+                    ? LocalizeMessage("cannot move struct '{}' into the return slot: it has no usable "
+                          "move constructor, and field '{}' of C++ class '{}' has a deleted copy "
+                          "constructor", { shown, fieldPath, fieldShown })
+                    : LocalizeMessage("cannot move struct '{}' into the return slot: it has no usable "
+                          "move constructor, and field '{}' of C++ class '{}' has an inaccessible copy "
+                          "constructor", { shown, fieldPath, fieldShown });
+            case Site::Element:
+                return deleted
+                    ? LocalizeMessage("cannot move struct '{}' into element {} of '{}': it has no usable "
+                          "move constructor, and field '{}' of C++ class '{}' has a deleted copy "
+                          "constructor", { shown, name, owner, fieldPath, fieldShown })
+                    : LocalizeMessage("cannot move struct '{}' into element {} of '{}': it has no usable "
+                          "move constructor, and field '{}' of C++ class '{}' has an inaccessible copy "
+                          "constructor", { shown, name, owner, fieldPath, fieldShown });
+            case Site::Field:
+                return deleted
+                    ? LocalizeMessage("cannot move struct '{}' into field '{}': it has no usable move "
+                          "constructor, and field '{}' of C++ class '{}' has a deleted copy constructor",
+                          { shown, name, fieldPath, fieldShown })
+                    : LocalizeMessage("cannot move struct '{}' into field '{}': it has no usable move "
+                          "constructor, and field '{}' of C++ class '{}' has an inaccessible copy "
+                          "constructor", { shown, name, fieldPath, fieldShown });
+            }
+        switch (site)
+        {
+        case Site::Local:
+            return deleted
+                ? LocalizeMessage("cannot copy struct '{}' into local '{}': field '{}' of C++ class '{}' "
+                      "has a deleted copy constructor", { shown, name, fieldPath, fieldShown })
+                : LocalizeMessage("cannot copy struct '{}' into local '{}': field '{}' of C++ class '{}' "
+                      "has an inaccessible copy constructor", { shown, name, fieldPath, fieldShown });
+        case Site::Parameter:
+            return deleted
+                ? LocalizeMessage("cannot copy struct '{}' into parameter '{}' of '{}': field '{}' of C++ "
+                      "class '{}' has a deleted copy constructor",
+                      { shown, name, owner, fieldPath, fieldShown })
+                : LocalizeMessage("cannot copy struct '{}' into parameter '{}' of '{}': field '{}' of C++ "
+                      "class '{}' has an inaccessible copy constructor",
+                      { shown, name, owner, fieldPath, fieldShown });
+        case Site::ReturnSlot:
+            return deleted
+                ? LocalizeMessage("cannot copy struct '{}' into the return slot: field '{}' of C++ class "
+                      "'{}' has a deleted copy constructor", { shown, fieldPath, fieldShown })
+                : LocalizeMessage("cannot copy struct '{}' into the return slot: field '{}' of C++ class "
+                      "'{}' has an inaccessible copy constructor", { shown, fieldPath, fieldShown });
+        case Site::Element:
+            return deleted
+                ? LocalizeMessage("cannot copy struct '{}' into element {} of '{}': field '{}' of C++ "
+                      "class '{}' has a deleted copy constructor",
+                      { shown, name, owner, fieldPath, fieldShown })
+                : LocalizeMessage("cannot copy struct '{}' into element {} of '{}': field '{}' of C++ "
+                      "class '{}' has an inaccessible copy constructor",
+                      { shown, name, owner, fieldPath, fieldShown });
+        case Site::Field:
+            return deleted
+                ? LocalizeMessage("cannot copy struct '{}' into field '{}': field '{}' of C++ class '{}' "
+                      "has a deleted copy constructor", { shown, name, fieldPath, fieldShown })
+                : LocalizeMessage("cannot copy struct '{}' into field '{}': field '{}' of C++ class '{}' "
+                      "has an inaccessible copy constructor", { shown, name, fieldPath, fieldShown });
+        }
+        return {};
+}
+
+bool LLVMBackend::FindUncopyableCxxField(const std::string& typeName, bool constSource,
+                                         std::string& fieldPath, std::string& fieldType,
+                                         CxxCopyCtorFault& fault) const
+{
+        if (cxxRecordEntries_.empty()) return false;
+        std::unordered_set<std::string> seen;
+        std::function<bool(const std::string&, const std::string&)> walk =
+            [&](const std::string& name, const std::string& prefix) {
+            if (!seen.insert(name).second || IsCxxRecord(name) || IsCppStructName(name)) return false;
+            auto it = dataStructures.find(name);
+            if (it == dataStructures.end()) return false;
+            // A user `copy` replaces the member-wise copy (the synthesized one is member-wise).
+            if (auto copies = functionTable.find("copy"); copies != functionTable.end())
+                for (const auto& sym : copies->second)
+                    if (!sym.Parameters.empty() && sym.Parameters[0].TypeName == name
+                        && sym.UniqueName != name + ".copy.synth")
+                        return false;
+            for (const auto& field : it->second.StructFields)
+            {
+                if (field.Pointer || field.ElemPointer || field.IsArrayView || field.IsAlias
+                    || field.IsSimd || field.IsBitfield || field.IsPadding)
+                    continue;
+                const std::string fieldName = ResolveTypeAlias(field.TypeName);
+                const std::string path = prefix + field.VariableName;
+                if (IsCxxRecord(fieldName))
+                {
+                    // The member copy is a direct-init: an explicit copy constructor serves it.
+                    const CxxCopyCtorFault found = CxxTrivialCopyCtorRefusal(fieldName, constSource, false);
+                    if (found == CxxCopyCtorFault::None || found == CxxCopyCtorFault::CopyExplicit)
+                        continue;
+                    fieldPath = path;
+                    fieldType = fieldName;
+                    fault = found;
+                    return true;
+                }
+                if (walk(fieldName, path + ".")) return true;
+            }
+            return false;
+        };
+        return walk(ResolveTypeAlias(typeName), "");
+}
+
+bool LLVMBackend::FindUnmovableCxxStruct(const std::string& typeName, std::string& fieldPath,
+                                         std::string& fieldType, CxxCopyCtorFault& fault) const
+{
+        if (cxxRecordEntries_.empty()) return false;
+        // The member-wise move is a direct-init per field: an explicit constructor serves it.
+        std::unordered_set<std::string> seen;
+        std::function<bool(const std::string&)> moveRefused = [&](const std::string& name) {
+            if (!seen.insert(name).second || IsCxxRecord(name) || IsCppStructName(name)) return false;
+            auto it = dataStructures.find(name);
+            if (it == dataStructures.end()) return false;
+            for (const auto& field : it->second.StructFields)
+            {
+                if (field.Pointer || field.ElemPointer || field.IsArrayView || field.IsAlias
+                    || field.IsSimd || field.IsBitfield || field.IsPadding)
+                    continue;
+                const std::string fieldName = ResolveTypeAlias(field.TypeName);
+                if (!IsCxxRecord(fieldName))
+                {
+                    std::string innerPath, innerType;
+                    CxxCopyCtorFault innerFault = CxxCopyCtorFault::None;
+                    if (dataStructures.contains(fieldName)
+                        && FindUncopyableCxxField(fieldName, true, innerPath, innerType, innerFault)
+                        && moveRefused(fieldName))
+                        return true;
+                    continue;
+                }
+                const CxxCopyCtorFault found = CxxTrivialCopyCtorRefusal(fieldName, false, true);
+                if (found != CxxCopyCtorFault::None && found != CxxCopyCtorFault::CopyExplicit
+                    && found != CxxCopyCtorFault::MoveExplicit)
+                    return true;
+            }
+            return false;
+        };
+        const std::string resolved = ResolveTypeAlias(typeName);
+        return FindUncopyableCxxField(resolved, true, fieldPath, fieldType, fault) && moveRefused(resolved);
+}
+
+bool LLVMBackend::HasUncopyableCxxField(const std::string& typeName) const
+{
+        std::unordered_set<std::string> seen;
+        std::function<bool(const std::string&)> walk = [&](const std::string& name) {
+            if (!seen.insert(name).second || IsCxxRecord(name) || IsCppStructName(name)) return false;
+            auto it = dataStructures.find(name);
+            if (it == dataStructures.end() || HasRealCopyOverloadFor(name)) return false;
+            for (const auto& field : it->second.StructFields)
+            {
+                if (field.Pointer || field.ElemPointer || field.IsArrayView || field.IsAlias
+                    || field.IsSimd || field.IsBitfield || field.IsPadding)
+                    continue;
+                const std::string fieldName = ResolveTypeAlias(field.TypeName);
+                if (IsForeignNontrivialCxxClass(fieldName))
+                {
+                    if (!IsCopyableType(fieldName)) return true;
+                    continue;
+                }
+                if (walk(fieldName)) return true;
+            }
+            return false;
+        };
+        return walk(ResolveTypeAlias(typeName));
 }
 
 bool LLVMBackend::FindUnassignableCxxField(const std::string& typeName, uint8_t kinds,

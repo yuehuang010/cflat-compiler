@@ -62,6 +62,27 @@ llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, 
         if (!typeValue.Pointer)
             RecordInterfaceMaterialization(typeValue.TypeName, "the type of a global variable");
         llvm::Type* destinationType = GetType(typeValue);
+        // A defined global of an unsized shell (or a fixed array of one) has no layout to store; a
+        // refused C++ class names its own reason, anything else gets the local path's message.
+        if (!externalDecl && !typeValue.Pointer && destinationType != nullptr && !destinationType->isSized())
+        {
+            // A generic instance's shell is still filled in later (its body is instantiated after
+            // the global is declared), so only a non-generic shell is final here.
+            const std::string resolvedName = ResolveTypeAlias(typeValue.TypeName);
+            bool refused = RejectUnsizedCxxLayout(destinationType);
+            if (!refused && MangledBase(resolvedName) == resolvedName)
+            {
+                LogError(std::format(
+                    "type '{}' is incomplete here (its layout is not available at this point); "
+                    "it can only be used through a pointer", SpellType(*this, typeValue)));
+                refused = true;
+            }
+            if (refused)
+            {
+                destinationType = builder->getInt8Ty();  // sized placeholder; the error aborts the compile
+                initValue = nullptr;
+            }
+        }
         if (initValue)
         {
             // A zero constant on an array view (`float[] g = 0.0;`) is the null view, as for a
@@ -463,10 +484,15 @@ llvm::Value* LLVMBackend::CreateLocalVariable(const TypeAndValue& typeValue, llv
         // An unsized opaque shell has no by-value layout. The shell may come from C interop,
         // a forward declaration, or a declaration whose body was abandoned after an expected
         // error, so this site must describe the mechanism rather than guess at its provenance.
-        if (!typeValue.Pointer && type != nullptr && type->isStructTy() && !type->isSized())
+        // A fixed array of the shell (`T[2]`, `T[2][2]`) is just as unsized as the shell itself.
+        llvm::Type* storageElement = type;
+        while (auto* arrayTy = llvm::dyn_cast_or_null<llvm::ArrayType>(storageElement))
+            storageElement = arrayTy->getElementType();
+        if (!typeValue.Pointer && storageElement != nullptr && storageElement->isStructTy()
+            && !storageElement->isSized())
         {
             // A C++ class left as a shell on purpose names its own reason first.
-            if (!RejectUnsupportedCxxLayout(typeValue.TypeName))
+            if (!RejectUnsizedCxxLayout(type) && !RejectUnsupportedCxxLayout(typeValue.TypeName))
                 LogError(std::format(
                     "type '{}' is incomplete here (its layout is not available at this point); "
                     "it can only be used through a pointer", SpellType(*this, typeValue)));
@@ -2093,7 +2119,12 @@ llvm::StructType* LLVMBackend::CreateStructType(const std::string& name,
                 bool genericShell = genericBase != "unique"
                     && gts.coreGenericTemplates.count(genericBase) == 0
                     && IsGenericTemplateKey(genericBase);
-                if (!typeValue.Pointer && fieldType != nullptr && fieldType->isStructTy()
+                // A field (or fixed-array field) of a refused C++ class names the class's reason.
+                // An instance with no user origin (a tuple) is left to its declaring site.
+                if (!typeValue.Pointer && (gts.activeInstantiationOrigin.valid || MangledBase(name) == name)
+                    && RejectUnsizedCxxLayout(fieldType))
+                    fieldType = builder->getInt8Ty();
+                else if (!typeValue.Pointer && fieldType != nullptr && fieldType->isStructTy()
                     && !fieldType->isSized() && genericShell && !gts.activeInstantiationOrigin.valid)
                 {
                     LogError(std::format(

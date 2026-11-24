@@ -3262,6 +3262,7 @@ uint64_t LLVMBackend::CxxGroupHeaderHash(const CxxRequestGroup& group) const
         raw.moveAssignBindsConstRef = cached.moveAssignBindsConstRef;
         raw.moveAssignConstSourceBindsConstRef = cached.moveAssignConstSourceBindsConstRef;
         raw.assignRefusedMask = cached.assignRefusedMask;
+        raw.copyCtorRefusedMask = cached.copyCtorRefusedMask;
         raw.isAggregate = cached.isAggregate;
         raw.members = cached.members;
         raw.ctorTemplates = cached.ctorTemplates;

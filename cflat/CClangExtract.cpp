@@ -2973,6 +2973,86 @@ namespace cflat_cinterop
             return result;
         }
 
+        /*
+         * The constructor clang selects for a same-class copy-init `T t = src;` of a trivially
+         * copyable record from a non-member context, per source kind (CxxCopyCtorRefused bits):
+         * refused when it is absent, deleted, non-public or explicit (copy-init never considers an
+         * explicit constructor). Read from the declared constructors
+         * and clang's implicit-member flags only - a Sema lookup would declare implicit members
+         * the member export then picks up. A constructor template keeps the old acceptance.
+         */
+        uint16_t ResolveSameClassCopyCtorMask(const CXXRecordDecl* cxx)
+        {
+            if (cxx == nullptr || !cxx->hasDefinition() || cxx->isDependentContext()
+                || cxx->isInvalidDecl() || !cxx->isTriviallyCopyable())
+                return 0;
+            struct Pick { bool exists = false; bool deleted = false; bool isPublic = true;
+                          bool isExplicit = false; };
+            auto declared = [](const CXXConstructorDecl* ctor) {
+                return Pick{ true, ctor->isDeleted(), ctor->getAccess() == AS_public, ctor->isExplicit() };
+            };
+            Pick mutableCopy, constCopy, move;
+            for (const Decl* d : cxx->decls())
+                if (const auto* tmpl = llvm::dyn_cast<FunctionTemplateDecl>(d);
+                    tmpl != nullptr && llvm::isa<CXXConstructorDecl>(tmpl->getTemplatedDecl()))
+                    return 0;
+            for (const CXXConstructorDecl* ctor : cxx->ctors())
+            {
+                unsigned quals = 0;
+                if (ctor->isCopyConstructor(quals))
+                {
+                    if ((quals & Qualifiers::Volatile) != 0) continue;
+                    ((quals & Qualifiers::Const) != 0 ? constCopy : mutableCopy) = declared(ctor);
+                }
+                // A defaulted move ctor defined as deleted is ignored by overload resolution
+                // ([class.copy.ctor]p10): the xvalue falls back to the copy constructor.
+                else if (ctor->isMoveConstructor(quals) && quals == 0
+                         && !(ctor->isDefaulted() && ctor->isDeleted()))
+                    move = declared(ctor);
+            }
+            if (cxx->needsImplicitCopyConstructor())
+            {
+                // Clang declares the copy ctor eagerly when its deletion needs overload resolution.
+                if (cxx->needsOverloadResolutionForCopyConstructor()) return 0;
+                const Pick implicitCopy{ true, cxx->defaultedCopyConstructorIsDeleted(), true, false };
+                (cxx->implicitCopyConstructorHasConstParam() ? constCopy : mutableCopy) = implicitCopy;
+            }
+            bool rvalueKnown = true;
+            if (!move.exists && cxx->needsImplicitMoveConstructor())
+            {
+                // A defaulted move ctor defined as deleted is ignored by overload resolution.
+                if (cxx->needsOverloadResolutionForMoveConstructor()) rvalueKnown = false;
+                else if (!cxx->defaultedMoveConstructorIsDeleted()) move = Pick{ true, false, true, false };
+            }
+            auto refused = [](const Pick& pick) {
+                return !pick.exists || pick.deleted || !pick.isPublic || pick.isExplicit;
+            };
+            // An explicit constructor is no copy-init candidate: the next one binds; all explicit -> refused.
+            auto candidate = [](const Pick& p) { return p.exists && !p.isExplicit; };
+            const Pick& lvaluePick = candidate(mutableCopy) ? mutableCopy : candidate(constCopy)
+                ? constCopy : mutableCopy.exists ? mutableCopy : constCopy;
+            const Pick& rvaluePick = candidate(move) ? move : candidate(constCopy)
+                ? constCopy : move.exists ? move : constCopy;
+            struct Kind { const Pick* pick; uint16_t bit; };
+            const Kind kinds[] = {
+                { &lvaluePick, cflat_cinterop::CxxCopyCtorRefusedLvalue },
+                { &constCopy, cflat_cinterop::CxxCopyCtorRefusedConstLvalue },
+                { rvalueKnown ? &rvaluePick : nullptr, cflat_cinterop::CxxCopyCtorRefusedRvalue } };
+            uint16_t mask = 0;
+            for (const Kind& kind : kinds)
+            {
+                if (kind.pick == nullptr || !refused(*kind.pick)) continue;
+                mask |= kind.bit;
+                if (kind.pick->isExplicit)
+                    mask |= static_cast<uint16_t>(kind.bit << cflat_cinterop::CxxCopyCtorExplicitShift);
+                else if (kind.pick->deleted)
+                    mask |= static_cast<uint16_t>(kind.bit << cflat_cinterop::CxxCopyCtorDeletedShift);
+                if (kind.bit == cflat_cinterop::CxxCopyCtorRefusedRvalue && kind.pick == &move)
+                    mask |= cflat_cinterop::CxxCopyCtorRvalueMovePick;
+            }
+            return mask;
+        }
+
         struct DeclVisitor : public RecursiveASTVisitor<DeclVisitor>
         {
             ASTContext& ctx;
@@ -4481,6 +4561,7 @@ namespace cflat_cinterop
                         | (constRvalue.refused ? cflat_cinterop::CxxAssignRefusedConstRvalue : 0));
                 }
                 rec.paramDestroyedInCallee = cxx->isParamDestroyedInCallee();
+                rec.copyCtorRefusedMask = ResolveSameClassCopyCtorMask(cxx);
                 rec.hasDefaultCtor = cxx->hasDefaultConstructor();
                 rec.hasCopyCtor = cxx->hasCopyConstructorWithConstParam()
                                || cxx->needsImplicitCopyConstructor()

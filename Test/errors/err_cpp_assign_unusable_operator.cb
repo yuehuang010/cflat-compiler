@@ -1,4 +1,5 @@
 import cpp "cpp_interop_assign.h";
+import "list.cb";
 
 // CPPOPEQ: a same-class assignment of a C++ class is refused exactly where clang refuses it,
 // with clang's reason, whether cflat would byte-copy the class or call a member.
@@ -6,6 +7,57 @@ struct CppopeqDelHost { cppopeq.Del f = cppopeq.Del(); int z = 0; };
 struct CppopeqProtHost { cppopeq.Prot f = cppopeq.Prot(); int z = 0; };
 cppopeq.Del CppopeqMakeDel() { cppopeq.Del t = cppopeq.Del(); t.v = 9; return t; }
 cppopeq.TrivDelMove CppopeqMakeTrivDelMove() { cppopeq.TrivDelMove t = cppopeq.TrivDelMove(); return t; }
+
+int SliceTakeDelMove(cppslice.BDelMove b) { return b.v; }
+int CppcopyTakeDelCopy(cppslice.BDelCopy b) { return b.v; }
+int CppcopyTakeGeneric<T>(T b) { return b.v; }
+struct CppcopyHost { cppslice.BDelCopy f = default; int z = 0; };
+// CPPCOPY: returning a named local with a private copy ctor and no move ctor copies (clang).
+expect_error("cannot copy C++ class 'cppcopy.PrivCopy' into the return slot: its copy constructor is not accessible") {
+    cppcopy.PrivCopy CppcopyReturnPriv() { cppcopy.PrivCopy local = default; return local; }
+}
+// A user-deleted (not defaulted) move ctor is selected for `return local;` and refuses it.
+expect_error("cannot copy C++ class 'cppcopy.UserDelMove' into the return slot: its move constructor is deleted") {
+    cppcopy.UserDelMove CppcopyReturnDelMove() { cppcopy.UserDelMove local = default; return local; }
+}
+// CPPCOPY2: copy-init never uses an explicit copy ctor; a CFlat struct holding a by-value class
+// whose copy is deleted / private has a deleted member-wise copy (clang), named by its field.
+int Cppcopy2TakeHost(CppcopyHost h) { return h.z; }
+int Cppcopy2TakeGeneric<T>(T b) { return 0; }
+int Cppcopy2TakeExplMove(cppcopy.ExplCopyMove b) { return b.v; }
+struct Cppcopy2Outer { CppcopyHost inner = default; int q = 2; };
+struct Cppcopy2PrivHost { cppcopy.PrivCopy f = default; int z = 0; };
+struct Cppcopy2ExplHost { cppcopy.ExplCopy f = default; int z = 0; };
+expect_error("cannot copy C++ class 'cppcopy.ExplCopy' into the return slot: its copy constructor is explicit") {
+    cppcopy.ExplCopy Cppcopy2ReturnExpl() { cppcopy.ExplCopy local = default; return local; }
+}
+expect_error("cannot copy struct 'CppcopyHost' into the return slot: field 'f' of C++ class 'cppslice.BDelCopy' has a deleted copy constructor") {
+    CppcopyHost Cppcopy2ReturnField(Cppcopy2Outer* outer) { return outer->inner; }
+}
+// CPPCOPY3: a move of a CFlat struct whose field class has no usable move falls back to the
+// struct's copy, which that field deletes (clang); field defaults copy-init the field.
+struct Cppcopy3DnmHost { cppcopy3.DelNoMove f = default; int z = 0; };
+struct Cppcopy3Outer { Cppcopy2PrivHost inner = default; int q = 2; };
+struct Cppcopy3Mixed { cppslice.BDelCopy f = default; cppcopy.UserDelMove g = default; int z = 0; };
+int Cppcopy3TakePriv(Cppcopy2PrivHost h) { return h.z; }
+int Cppcopy3TakeDnm(cppcopy3.DelNoMove b) { return b.v; }
+int Cppcopy3TakePrivMove(cppcopy3.PrivMove b) { return b.v; }
+cppslice.BDelCopy Cppcopy3Global = default;
+expect_error("cannot move struct 'Cppcopy2PrivHost' into the return slot: it has no usable move constructor, and field 'f' of C++ class 'cppcopy.PrivCopy' has an inaccessible copy constructor") {
+    Cppcopy2PrivHost Cppcopy3ReturnLocal() { Cppcopy2PrivHost local = default; return local; }
+}
+expect_error("cannot move struct 'Cppcopy3DnmHost' into the return slot: it has no usable move constructor, and field 'f' of C++ class 'cppcopy3.DelNoMove' has a deleted copy constructor") {
+    Cppcopy3DnmHost Cppcopy3ReturnMove() { Cppcopy3DnmHost local = default; return move local; }
+}
+expect_error("cannot copy C++ class 'cppcopy.PrivCopy' into the return slot: its copy constructor is not accessible") {
+    cppcopy.PrivCopy Cppcopy3ReturnMovePriv() { cppcopy.PrivCopy local = default; return move local; }
+}
+expect_error("cannot copy C++ class 'cppcopy.PrivCopy' into the return slot: its copy constructor is not accessible") {
+    cppcopy.PrivCopy Cppcopy3ReturnParam(cppcopy.PrivCopy p) { return p; }
+}
+expect_error("cannot copy C++ class 'cppslice.BDelCopy' into field 'd': its copy constructor is deleted") {
+    struct Cppcopy3FieldDefault { cppslice.BDelCopy d = Cppcopy3Global; int k = 2; };
+}
 
 extern int main()
 {
@@ -90,6 +142,216 @@ extern int main()
         CppopeqDelHost a = CppopeqDelHost();
         CppopeqDelHost b = CppopeqDelHost();
         a = move b;
+    }
+    // SLICEPICK: a derived source into a trivially copyable base is refused like the same-class
+    // copy (deleted / private / implicitly deleted copy member, deleted move ctor).
+    expect_error("unrelated struct type 'cppslice.LDel'") {
+        cppopeq.Del target = cppopeq.Del();
+        cppslice.LDel source = default;
+        target = source;
+    }
+    expect_error("unrelated struct type 'cppslice.LPrivTriv'") {
+        cppslice.BPrivTriv target = default;
+        cppslice.LPrivTriv source = default;
+        target = source;
+    }
+    expect_error("unrelated struct type 'cppslice.LMoveOnly'") {
+        cppslice.BMoveOnly target = default;
+        cppslice.LMoveOnly source = default;
+        target = source;
+    }
+    expect_error("unrelated struct type 'cppslice.LMoveOnly'") {
+        cppslice.LMoveOnly source = default;
+        cppslice.BMoveOnly target = source;
+    }
+    expect_error("unrelated struct type 'cppslice.LDelCopy'") {
+        cppslice.LDelCopy source = default;
+        cppslice.BDelCopy target = source;
+    }
+    expect_error("no overload of 'SliceTakeDelMove' matches") {
+        cppslice.LDelMove source = default;
+        int r = SliceTakeDelMove(move source);
+    }
+    // CPPCOPY: the same-class copy of a trivially copyable class with an unusable copy ctor is
+    // refused like clang at a local, a deref, a field, a CFlat / generic / C++ by-value parameter.
+    expect_error("cannot copy C++ class 'cppslice.BDelCopy' into local 'target': its copy constructor is deleted") {
+        cppslice.BDelCopy source = default;
+        cppslice.BDelCopy target = source;
+    }
+    expect_error("cannot copy C++ class 'cppslice.BDelCopy' into local 'target': its copy constructor is deleted") {
+        cppslice.BDelCopy source = default;
+        cppslice.BDelCopy* sourcePtr = &source;
+        cppslice.BDelCopy target = *sourcePtr;
+    }
+    expect_error("cannot copy C++ class 'cppslice.BDelCopy' into local 'target': its copy constructor is deleted") {
+        CppcopyHost host = default;
+        cppslice.BDelCopy target = host.f;
+    }
+    expect_error("into parameter 'b' of 'CppcopyTakeDelCopy': its copy constructor is deleted - pass 'move x'") {
+        cppslice.BDelCopy source = default;
+        int r = CppcopyTakeDelCopy(source);
+    }
+    expect_error("into parameter 'b' of 'CppcopyTakeGeneric<cppslice.BDelCopy>': its copy constructor is deleted") {
+        cppslice.BDelCopy source = default;
+        int r = CppcopyTakeGeneric(source);
+    }
+    expect_error("into parameter 'b' of 'cppcopy.TakeDelCopy': its copy constructor is deleted") {
+        cppslice.BDelCopy source = default;
+        int r = cppcopy.TakeDelCopy(source);
+    }
+    expect_error("cannot copy C++ class 'cppslice.BMoveOnly' into local 'target': its copy constructor is deleted") {
+        cppslice.BMoveOnly source = default;
+        cppslice.BMoveOnly target = source;
+    }
+    expect_error("cannot copy C++ class 'cppcopy.PrivCopy' into local 'target': its copy constructor is not accessible") {
+        cppcopy.PrivCopy source = default;
+        cppcopy.PrivCopy target = source;
+    }
+    expect_error("cannot copy C++ class 'cppcopy.HoldDelCopy' into local 'target': its copy constructor is deleted") {
+        cppcopy.HoldDelCopy source = default;
+        cppcopy.HoldDelCopy target = source;
+    }
+    // CPPCOPY2: explicit copy ctor at a local, a C++ / CFlat parameter and an array element.
+    expect_error("cannot copy C++ class 'cppcopy.ExplCopy' into local 'target': its copy constructor is explicit") {
+        cppcopy.ExplCopy source = default;
+        cppcopy.ExplCopy target = source;
+    }
+    expect_error("cannot copy C++ class 'cppcopy.ExplCopyMove' into local 'target': its copy constructor is explicit") {
+        cppcopy.ExplCopyMove source = default;
+        cppcopy.ExplCopyMove target = source;
+    }
+    expect_error("into parameter 'b' of 'cppcopy.TakeExplCopy': its copy constructor is explicit - pass a temporary") {
+        cppcopy.ExplCopy source = default;
+        int r = cppcopy.TakeExplCopy(source);
+    }
+    expect_error("into parameter 'b' of 'Cppcopy2TakeExplMove': its copy constructor is explicit - pass 'move x'") {
+        cppcopy.ExplCopyMove source = default;
+        int r = Cppcopy2TakeExplMove(source);
+    }
+    expect_error("cannot copy C++ class 'cppcopy.ExplCopy' into element 0 of 'arr': its copy constructor is explicit") {
+        cppcopy.ExplCopy source = default;
+        cppcopy.ExplCopy[1] arr = { source };
+    }
+    // A CFlat struct whose member-wise copy is deleted: local, nested, private field, parameters.
+    expect_error("cannot copy struct 'CppcopyHost' into local 'target': field 'f' of C++ class 'cppslice.BDelCopy' has a deleted copy constructor") {
+        CppcopyHost source = default;
+        CppcopyHost target = source;
+        int keep = source.z;
+    }
+    expect_error("cannot copy struct 'Cppcopy2Outer' into local 'target': field 'inner.f' of C++ class 'cppslice.BDelCopy' has a deleted copy constructor") {
+        Cppcopy2Outer source = default;
+        Cppcopy2Outer target = source;
+        int keep = source.q;
+    }
+    expect_error("cannot copy struct 'Cppcopy2PrivHost' into local 'target': field 'f' of C++ class 'cppcopy.PrivCopy' has an inaccessible copy constructor") {
+        Cppcopy2PrivHost source = default;
+        Cppcopy2PrivHost target = source;
+        int keep = source.z;
+    }
+    expect_error("cannot copy struct 'CppcopyHost' into parameter 'h' of 'Cppcopy2TakeHost': field 'f' of C++ class 'cppslice.BDelCopy' has a deleted copy constructor") {
+        CppcopyHost source = default;
+        int r = Cppcopy2TakeHost(source);
+        int keep = source.z;
+    }
+    expect_error("cannot copy struct 'CppcopyHost' into parameter 'b' of 'Cppcopy2TakeGeneric<CppcopyHost>'") {
+        CppcopyHost source = default;
+        int r = Cppcopy2TakeGeneric(source);
+        int keep = source.z;
+    }
+    // Each brace element / named field initializer is a copy-init.
+    expect_error("cannot copy C++ class 'cppslice.BDelCopy' into element 0 of 'arr': its copy constructor is deleted") {
+        cppslice.BDelCopy source = default;
+        cppslice.BDelCopy[1] arr = { source };
+    }
+    expect_error("cannot copy C++ class 'cppslice.BDelCopy' into element 1 of 'arr': its copy constructor is deleted") {
+        cppslice.BDelCopy source = default;
+        cppslice.BDelCopy[2] arr = { cppslice.BDelCopy(), source };
+    }
+    expect_error("cannot copy C++ class 'cppcopy.PrivCopy' into element 0 of 'arr': its copy constructor is not accessible") {
+        cppcopy.PrivCopy source = default;
+        cppcopy.PrivCopy[1] arr = { source };
+    }
+    expect_error("cannot copy C++ class 'cppslice.BDelCopy' into element 0 of 'arr': its copy constructor is deleted") {
+        cppslice.BDelCopy source = default;
+        cppslice.BDelCopy[1][1] arr = { { source } };
+    }
+    expect_error("cannot copy C++ class 'cppslice.BDelCopy' into element 0 of 'view': its copy constructor is deleted") {
+        cppslice.BDelCopy source = default;
+        cppslice.BDelCopy[] view = { source };
+    }
+    expect_error("cannot copy struct 'CppcopyHost' into element 0 of 'arr': field 'f' of C++ class 'cppslice.BDelCopy' has a deleted copy constructor") {
+        CppcopyHost source = default;
+        CppcopyHost[1] arr = { source };
+        int keep = source.z;
+    }
+    expect_error("cannot copy C++ class 'cppslice.BDelCopy' into field 'f': its copy constructor is deleted") {
+        cppslice.BDelCopy source = default;
+        CppcopyHost host = { f = source, z = 1 };
+    }
+    expect_error("cannot copy C++ class 'cppcopy.ExplCopy' into field 'f': its copy constructor is explicit") {
+        cppcopy.ExplCopy source = default;
+        Cppcopy2ExplHost host = { f = source, z = 1 };
+    }
+    expect_error("cannot copy struct 'CppcopyHost' into field 'inner': field 'f' of C++ class 'cppslice.BDelCopy' has a deleted copy constructor") {
+        CppcopyHost source = default;
+        Cppcopy2Outer outer = { inner = source, q = 1 };
+        int keep = source.z;
+    }
+    // CPPCOPY3: `move s` / a consumed last use at a local, parameter, element and field.
+    expect_error("cannot move struct 'Cppcopy2PrivHost' into local 'target': it has no usable move constructor, and field 'f' of C++ class 'cppcopy.PrivCopy' has an inaccessible copy constructor") {
+        Cppcopy2PrivHost source = default;
+        Cppcopy2PrivHost target = move source;
+    }
+    expect_error("cannot move struct 'Cppcopy3DnmHost' into local 'target': it has no usable move constructor, and field 'f' of C++ class 'cppcopy3.DelNoMove' has a deleted copy constructor") {
+        Cppcopy3DnmHost source = default;
+        Cppcopy3DnmHost target = source;
+    }
+    expect_error("cannot move struct 'Cppcopy3Outer' into local 'target': it has no usable move constructor, and field 'inner.f' of C++ class 'cppcopy.PrivCopy' has an inaccessible copy constructor") {
+        Cppcopy3Outer source = default;
+        Cppcopy3Outer target = move source;
+    }
+    expect_error("cannot move struct 'Cppcopy3Mixed' into local 'target': it has no usable move constructor, and field 'f' of C++ class 'cppslice.BDelCopy' has a deleted copy constructor") {
+        Cppcopy3Mixed source = default;
+        Cppcopy3Mixed target = move source;
+    }
+    expect_error("cannot move struct 'Cppcopy2PrivHost' into parameter 'h' of 'Cppcopy3TakePriv': it has no usable move constructor") {
+        Cppcopy2PrivHost source = default;
+        int r = Cppcopy3TakePriv(move source);
+    }
+    expect_error("cannot move struct 'Cppcopy2PrivHost' into parameter 'h' of 'Cppcopy3TakePriv': it has no usable move constructor") {
+        Cppcopy2PrivHost source = default;
+        int r = Cppcopy3TakePriv(source);
+    }
+    expect_error("cannot move C++ class 'cppcopy3.DelNoMove' into parameter 'b' of 'Cppcopy3TakeDnm': it has no usable move constructor and its copy constructor is deleted") {
+        cppcopy3.DelNoMove source = default;
+        int r = Cppcopy3TakeDnm(move source);
+    }
+    expect_error("cannot move C++ class 'cppcopy3.PrivMove' into parameter 'b' of 'Cppcopy3TakePrivMove': its move constructor is not accessible") {
+        cppcopy3.PrivMove source = default;
+        int r = Cppcopy3TakePrivMove(move source);
+    }
+    expect_error("cannot move C++ class 'cppcopy.PrivCopy' into element 0 of 'arr': it has no usable move constructor and its copy constructor is not accessible") {
+        cppcopy.PrivCopy source = default;
+        cppcopy.PrivCopy[1] arr = { move source };
+    }
+    expect_error("cannot move struct 'Cppcopy3DnmHost' into element 0 of 'arr': it has no usable move constructor") {
+        Cppcopy3DnmHost source = default;
+        Cppcopy3DnmHost[1] arr = { move source };
+    }
+    expect_error("cannot move C++ class 'cppcopy3.DelNoMove' into field 'f': it has no usable move constructor and its copy constructor is deleted") {
+        cppcopy3.DelNoMove source = default;
+        Cppcopy3DnmHost host = { f = move source, z = 1 };
+    }
+    expect_error("cannot move struct 'Cppcopy2PrivHost' into field 'inner': it has no usable move constructor") {
+        Cppcopy2PrivHost source = default;
+        Cppcopy3Outer outer = { inner = move source, q = 1 };
+    }
+    // CPPCOPY4: the refused move inside list<T>'s body is reported at this instantiation (the
+    // location is not visible to expect_error; the text pins the refusal).
+    expect_error("cannot move struct 'Cppcopy2PrivHost' into local 'v': it has no usable move constructor") {
+        list<Cppcopy2PrivHost> hosts = default;
+        Cppcopy2PrivHost source = default;
+        hosts.add(move source);
     }
     return 0;
 }

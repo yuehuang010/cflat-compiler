@@ -2495,6 +2495,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             && (compiler->IsCxxRecord(returnNV.TypeAndValue.TypeName)
                 || compiler->IsForeignNontrivialCxxClass(returnNV.TypeAndValue.TypeName))
             && !compiler->IsCopyableType(returnNV.TypeAndValue.TypeName);
+        bool borrowedReturnRefused = false;
         if (!defaultValue && assignExpr != nullptr
             && returnNV.Storage != nullptr
             && !compiler->currentFunctionReturnTV.IsAlias
@@ -2519,6 +2520,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 && TopLevelMoveExpression(assignExpr) != nullptr)
             && ReturnSourceIsIndirectOwningLvalue(returnNV, returnNV.Primary))
         {
+            borrowedReturnRefused = true;
             const bool cxxPointee = compiler->IsCxxRecord(returnNV.TypeAndValue.TypeName)
                 || compiler->IsForeignNontrivialCxxClass(returnNV.TypeAndValue.TypeName);
             LogErrorContext(errCtx, cxxPointee
@@ -2531,6 +2533,50 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     "cannot return owning struct '{}' through pointer; use 'return move {};' "
                     "to transfer it, or copy the value before returning",
                     SpellType(*compiler, returnNV.TypeAndValue), retText));
+        }
+        // `return src;` of a trivially copyable C++ class: a local or by-value parameter is an xvalue
+        // first (C++20 implicit move), anything else copies; clang requires a usable constructor.
+        if (!borrowedReturnRefused && !defaultValue && assignExpr != nullptr
+            && ((returnNV.Storage != nullptr && !returnNV.IsRvalue) || returnNV.IsExplicitMove)
+            && !compiler->currentFunctionReturnTV.IsAlias
+            && !compiler->currentFunctionReturnTV.Pointer
+            && !returnNV.TypeAndValue.Pointer && (!returnNV.TypeAndValue.IsMove || returnNV.IsExplicitMove)
+            && compiler->ResolveTypeAlias(returnNV.TypeAndValue.TypeName)
+                == compiler->ResolveTypeAlias(compiler->currentFunctionReturnTypeName))
+        {
+            // `return move x;` and a consumed last use move-construct the slot, as an implicit move does.
+            const bool implicitMove = returnNV.IsExplicitMove || returnNV.UncopyableStructLastUse
+                || (llvm::isa<llvm::AllocaInst>(returnNV.Storage)
+                    && returnNV.FieldName.empty() && !returnNV.IsElementAccess);
+            using Fault = LLVMBackend::CxxCopyCtorFault;
+            const Fault fault = compiler->CxxTrivialCopyCtorRefusal(
+                returnNV.TypeAndValue.TypeName,
+                !implicitMove && compiler->CxxConstReceiverKind(returnNV) != 0, implicitMove);
+            const std::string shown = compiler->DisplayCxxClassName(returnNV.TypeAndValue.TypeName);
+            if (fault == Fault::CopyDeleted)
+                LogErrorContext(errCtx, compiler->LocalizeMessage(
+                    "cannot copy C++ class '{}' into the return slot: its copy constructor is deleted",
+                    { shown }));
+            else if (fault == Fault::CopyInaccessible)
+                LogErrorContext(errCtx, compiler->LocalizeMessage(
+                    "cannot copy C++ class '{}' into the return slot: its copy constructor is not "
+                    "accessible",
+                    { shown }));
+            else if (fault == Fault::MoveDeleted)
+                LogErrorContext(errCtx, compiler->LocalizeMessage(
+                    "cannot copy C++ class '{}' into the return slot: its move constructor is deleted",
+                    { shown }));
+            else if (fault == Fault::MoveInaccessible)
+                LogErrorContext(errCtx, compiler->LocalizeMessage(
+                    "cannot copy C++ class '{}' into the return slot: its move constructor is not "
+                    "accessible",
+                    { shown }));
+            // An explicit constructor, or a CFlat struct whose member-wise copy is deleted.
+            else if (std::string why = compiler->CxxCopyInitRefusal(returnNV.TypeAndValue.TypeName,
+                         !implicitMove && compiler->CxxConstReceiverKind(returnNV) != 0, implicitMove,
+                         LLVMBackend::CxxCopyInitSite::ReturnSlot);
+                     !why.empty())
+                LogCopyInitRefusalContext(compiler, errCtx, why);
         }
         if (!defaultValue
             && (compiler->currentFunctionReturnTV.TypeName == "string"
@@ -2914,6 +2960,24 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 && compiler->IsForeignNontrivialCxxClass(returnNV.TypeAndValue.TypeName)
                 && IsLastUseOfForeignCxxParam(compiler, assignExpr, returnNV,
                                               /*allowMoveOnlyReturn=*/true))
+            {
+                source = compiler->GetScopedLocalOrArgument(retText);
+                sourceName = retText;
+                useMove = true;
+            }
+            // `return p;` of a by-value trivially copyable class parameter is an xvalue too
+            // ([class.copy.elision]p3): a deleted copy leaves its move usable.
+            else if (!explicitMove && IsBareIdentifierText(retText)
+                && compiler->IsFunctionParameter(retText)
+                && !returnNV.TypeAndValue.Pointer && !returnNV.TypeAndValue.IsAlias
+                && returnNV.FieldName.empty() && !returnNV.IsElementAccess
+                && compiler->IsCxxRecord(returnNV.TypeAndValue.TypeName)
+                && !compiler->IsForeignNontrivialCxxClass(returnNV.TypeAndValue.TypeName)
+                && compiler->GetFunctionArgument(retText).Storage == returnNV.Storage
+                && compiler->CxxTrivialCopyCtorRefusal(returnNV.TypeAndValue.TypeName, false, false)
+                    != LLVMBackend::CxxCopyCtorFault::None
+                && compiler->CxxTrivialCopyCtorRefusal(returnNV.TypeAndValue.TypeName, false, true)
+                    == LLVMBackend::CxxCopyCtorFault::None)
             {
                 source = compiler->GetScopedLocalOrArgument(retText);
                 sourceName = retText;
@@ -3681,7 +3745,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         // M6 - `Base* f() { return derivedPtr; }` shifts to the base subobject, the RETURN twin of
         // the declaration-initializer and `=` legs (a no-op for a primary base).
         if (right != nullptr && cxxRefReturnAddr == nullptr && !aliasRefReturn
-            && compiler->currentFunctionReturnTV.Pointer && returnNV.TypeAndValue.Pointer)
+            && compiler->currentFunctionReturnTV.Pointer
+            && LLVMBackend::ArrayDecayedPointer(returnNV.TypeAndValue).Pointer)
             right = compiler->AdjustCxxPointerForStore(
                 compiler->currentFunctionReturnTV, returnNV.TypeAndValue, right,
                 "the return value");
@@ -4982,7 +5047,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             compiler->FlushOwnedTempsSince(ptrMark, right, nullptr, preserveReturned);
             compiler->FlushConditionalPtrTempsSince(returnOwnedTempMark.Ptrs, preserveReturned, right);
         }
-        compiler->RejectImplicitIntegerPointeePointerConversion(
+        compiler->RejectImplicitPointeePointerStore(
             returnNV.TypeAndValue, compiler->currentFunctionReturnTV);
         // `return move x` of a whole native value local: copy out, zero-fill x, and let x's
         // destructor run on the zero state like clang's moved-from object (ruling 2026-10-31).

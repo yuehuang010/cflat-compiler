@@ -1450,8 +1450,7 @@ void LLVMBackend::MergeMovedStateInto(const MovedStateSnapshot& state)
                     nv.MovedFields, it->second.movedFields);
                 nv.MayPointToBorrowedAddress = nv.MayPointToBorrowedAddress
                     || it->second.mayPointToBorrowedAddress;
-                nv.BorrowedAddressFields.insert(it->second.borrowedAddressFields.begin(),
-                    it->second.borrowedAddressFields.end());
+                MergeBorrowedAddressFields(nv.BorrowedAddressFields, it->second.borrowedAddressFields);
                 if (it->second.stackCharBufferBorrow.borrowed)
                 {
                     const MovedStateSnapshot::StackCharBufferBorrowState current{
@@ -1538,8 +1537,7 @@ void LLVMBackend::MergeMovedStates(const MovedStateSnapshot& thenState,
                 nv.MayPointToBorrowedAddress = tf->second.mayPointToBorrowedAddress
                     || ef->second.mayPointToBorrowedAddress;
                 nv.BorrowedAddressFields = tf->second.borrowedAddressFields;
-                nv.BorrowedAddressFields.insert(ef->second.borrowedAddressFields.begin(),
-                    ef->second.borrowedAddressFields.end());
+                MergeBorrowedAddressFields(nv.BorrowedAddressFields, ef->second.borrowedAddressFields);
                 if (tf->second.stackCharBufferBorrow.borrowed
                     || ef->second.stackCharBufferBorrow.borrowed)
                     MergeStackCharBufferBorrowState(

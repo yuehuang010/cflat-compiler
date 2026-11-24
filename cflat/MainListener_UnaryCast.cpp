@@ -276,7 +276,8 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpressionImpl(CFlatParser::Ca
             auto destTypeName = ParseCastTypeName(typeName, false, ctx);
             // The explicit cast target is the operand's conversion context. Do not let the
             // outer initializer/return destination leak through the cast into its operand.
-            DeclExpectedTypeScope castExpectedScope(&declExpectedType, destTypeName);
+            DeclExpectedTypeScope castExpectedScope(&declExpectedType, destTypeName,
+                /*includeFunctionPointer*/ false, /*isExplicitCast*/ true);
             // A cast to 'void' DISCARDS its operand, so a value-less call is legal under it -
             // read the destination off the spelling (alias-resolved) before parsing the operand.
             bool destIsVoid = compiler->ResolveTypeAlias(destTypeName.TypeName) == "void"
@@ -1325,8 +1326,9 @@ LLVMBackend::NamedVariable MainListener::SizeOrAlignOfType(const LLVMBackend::Ty
         compiler->TouchWaitingLayout(llvmType);
         if (llvmType == nullptr || !llvmType->isSized())
         {
-            compiler->LogError(std::format("sizeof/alignof: type '{}' is incomplete",
-                typeValue.TypeName.empty() ? "<unknown>" : typeValue.TypeName));
+            if (!compiler->RejectUnsizedCxxLayout(llvmType))
+                compiler->LogError(std::format("sizeof/alignof: type '{}' is incomplete",
+                    typeValue.TypeName.empty() ? "<unknown>" : typeValue.TypeName));
             return {};
         }
         uint64_t effAlign = typeValue.Pointer
@@ -1656,8 +1658,9 @@ LLVMBackend::NamedVariable MainListener::TrySizeofPostfixAsType(CFlatParser::Una
             }
             else if (llvmType != nullptr && !llvmType->isSized())
             {
-                compiler->LogError(std::format("sizeof/alignof: type '{}' is incomplete",
-                    typeValue.TypeName.empty() ? "<unknown>" : typeValue.TypeName));
+                if (!compiler->RejectUnsizedCxxLayout(llvmType))
+                    compiler->LogError(std::format("sizeof/alignof: type '{}' is incomplete",
+                        typeValue.TypeName.empty() ? "<unknown>" : typeValue.TypeName));
             }
         }
         return {};
@@ -1702,6 +1705,7 @@ MainListener::UnevaluatedOperandType MainListener::EvaluateOperandTypeOnly(
         auto ownSlotLeavingLoads = compiler->ownSlotLeavingLoads_;
         auto globalAssignBorrowOrigin = compiler->globalAssignBorrowOrigin_;
         auto globalAssignBorrowedAddress = compiler->globalAssignBorrowedAddress_;
+        auto globalAssignMayBorrowedAddress = compiler->globalAssignMayBorrowedAddress_;
         auto ownOriginSlots = compiler->ownOriginSlots_;
         auto uniqueFieldBorrowResults = compiler->uniqueFieldBorrowResults_;
         auto pendingAliasReturns = compiler->pendingAliasReturnInference;
@@ -1818,6 +1822,7 @@ MainListener::UnevaluatedOperandType MainListener::EvaluateOperandTypeOnly(
             compiler->ownSlotLeavingLoads_ = std::move(ownSlotLeavingLoads);
             compiler->globalAssignBorrowOrigin_ = std::move(globalAssignBorrowOrigin);
             compiler->globalAssignBorrowedAddress_ = std::move(globalAssignBorrowedAddress);
+            compiler->globalAssignMayBorrowedAddress_ = std::move(globalAssignMayBorrowedAddress);
             compiler->ownOriginSlots_ = std::move(ownOriginSlots);
             compiler->uniqueFieldBorrowResults_ = std::move(uniqueFieldBorrowResults);
             compiler->pendingAliasReturnInference = std::move(pendingAliasReturns);
@@ -2319,6 +2324,19 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
             {
                 namedVar.TypeAndValue.IsFlexibleArrayMember = false;
                 namedVar.TypeAndValue.IsZeroLengthArrayMember = false;
+            }
+            // `*"xyz"` / `*(c ? "ab" : "cd")`: an untyped narrow literal (or a join of them) is a
+            // `(const char)*`, as `"xyz"[0]` already reads it.
+            if (opText == "*" && namedVar.TypeAndValue.TypeName.empty()
+                && namedVar.Storage == nullptr && namedVar.Primary != nullptr
+                && namedVar.Primary->getType()->isPointerTy()
+                && (compiler->IsStringLiteralGlobal(namedVar.Primary)
+                    || compiler->JoinIsCharPointer(namedVar.Primary, true)))
+            {
+                namedVar.TypeAndValue.TypeName = "char";
+                namedVar.TypeAndValue.Pointer = true;
+                namedVar.TypeAndValue.ConstMask = 1;
+                namedVar.BaseType = nullptr;
             }
             const bool addressOfPointerObject = opText == "&"
                 && namedVar.TypeAndValue.IsProvenSinglePointerDepth();
@@ -3679,8 +3697,9 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                 }
                 if (!llvmType->isSized())
                 {
-                    LogErrorContext(ctx, std::format("sizeof/alignof: type '{}' is incomplete",
-                        typeValue.TypeName.empty() ? "<unknown>" : typeValue.TypeName));
+                    if (!compiler->RejectUnsizedCxxLayout(llvmType))
+                        LogErrorContext(ctx, std::format("sizeof/alignof: type '{}' is incomplete",
+                            typeValue.TypeName.empty() ? "<unknown>" : typeValue.TypeName));
                     return {};
                 }
 

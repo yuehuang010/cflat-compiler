@@ -1,0 +1,26 @@
+// JOINSUB: '[]' on an unbound `new` result in parentheses would never free it (only a scalar
+// `->` / `.` member read retires one at end of statement), so the subscript is refused.
+int jsnCount = 0;
+struct JsnS { int k = 3; ~JsnS() { jsnCount++; } };
+
+expect_error("cannot apply '[]' to an unbound owning pointer temporary") {
+    int jsnDirect() { return (new JsnS())[0].k; }
+}
+
+expect_error("cannot apply '[]' to an unbound owning pointer temporary") {
+    int jsnCoalesce(JsnS* pn) { return (pn ?? new JsnS())[0].k; }
+}
+
+expect_error("cannot apply '[]' to an unbound owning pointer temporary") {
+    int jsnArith() { return (new JsnS() + 0)[0].k; }
+}
+
+expect_error("cannot apply '[]' to an unbound owning pointer temporary") {
+    int jsnScalar() { return (new int(7))[0]; }
+}
+
+expect_error("cannot apply '[]' to an unbound owning pointer temporary") {
+    int jsnArray() { return (new int[3])[0]; }
+}
+
+extern int main() { return 0; }

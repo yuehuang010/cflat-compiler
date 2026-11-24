@@ -247,7 +247,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
                 int i = 0;
                 while (i < _size)
                 {
-                    if const (!is_copyable(T)) compile_error("cannot copy this list: its element type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the list instead of copying it");
+                    if const (!is_copyable(T)) compile_error("cannot copy this list: its element type is not copyable; give the type a 'copy()' method, or 'move' the list instead of copying it");
                     else
                     {
                         if const (is_cpp_class(T)) result.add(_data[i]);
@@ -293,7 +293,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
                 while (i < _size)
                 {
                     // Total copy policy per element (identity for borrows, deep for copyable owners).
-                    if const (!is_copyable(T)) compile_error("cannot copy this list: its element type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the list instead of copying it");
+                    if const (!is_copyable(T)) compile_error("cannot copy this list: its element type is not copyable; give the type a 'copy()' method, or 'move' the list instead of copying it");
                     else
                     {
                         if const (is_cpp_class(T)) result.add(_data[i]);

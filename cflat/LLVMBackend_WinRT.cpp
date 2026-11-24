@@ -3178,7 +3178,9 @@ void LLVMBackend::CheckOwnFlagLoopBackEdge()
             }
             const bool localMayBeBorrowed = live->IsBorrowed || live->IsAliasBorrow
                 || live->TypeAndValue.IsAlias || live->BorrowsOwnedElement
-                || (live->BorrowsOwningLocal && !owningLocalCopyWasRebound);
+                || (live->BorrowsOwningLocal && !owningLocalCopyWasRebound)
+                || LoopSinkSourceMayBorrowAddress(*live)
+                || frame.mayBorrowContinueSources.contains(sink.Storage);
             if (!localMayBeBorrowed) continue;
             ReportingFileScope report(this, sink.File, sink.Line, sink.Column);
             const std::string sourceName = BorrowedSourceDiagnosticName(*live);
@@ -3220,7 +3222,9 @@ void LLVMBackend::CheckOwnFlagLoopBackEdge()
             }
             const bool localMayBeBorrowed = live->IsBorrowed || live->IsAliasBorrow
                 || live->TypeAndValue.IsAlias || live->BorrowsOwnedElement
-                || (live->BorrowsOwningLocal && !owningLocalCopyWasRebound);
+                || (live->BorrowsOwningLocal && !owningLocalCopyWasRebound)
+                || LoopSinkSourceMayBorrowAddress(*live)
+                || frame.mayBorrowContinueSources.contains(sink.Storage);
             if (!localMayBeBorrowed) continue;
             ReportingFileScope report(this, sink.File, sink.Line, sink.Column);
             const std::string sourceName = FindVariableNameByStorage(sink.Storage);
@@ -5464,13 +5468,24 @@ std::string LLVMBackend::FuncPtrArgDepthMismatch(const NamedVariable& arg,
 
 bool LLVMBackend::DiagnoseProvableInterfaceArgMismatch(const std::string& ifaceName,
         const std::string& methodName, const std::vector<NamedVariable>& args,
-        const std::vector<TypeAndValue>& params)
+        const std::vector<TypeAndValue>& params, bool reportPointee)
 {
         const std::string displayIface = SpellType(*this, TypeAndValue{ .TypeName = ifaceName });
+        FunctionSymbol slotShape;
+        slotShape.Parameters = params;
         for (size_t i = 0; i < args.size() && i < params.size(); i++)
         {
             if (IsAddressedUniqueSlotToRawSlot(args[i], args[i].TypeAndValue, params[i]))
                 continue;
+            // The call rule's pointee arm (UnrelatedPointeePair): the overload failure keeps its
+            // name, the cast hint rides on it (the direct-call wording).
+            if (TypeAndValue from, to;
+                reportPointee && UnrelatedPointeePair(args[i], slotShape, i, from, to))
+            {
+                LogError(std::format("no overload of '{}' matches the given arguments.\n  {}",
+                                     methodName, ImplicitIntegerPointeeConversionText(from, to)));
+                return true;
+            }
             if (ArgumentProvablyMismatchesParameter(args[i], params[i]))
             {
                 std::string why = DescribeFuncPtrSignatureMismatch(args[i].TypeAndValue, params[i]);
@@ -5715,8 +5730,10 @@ int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const 
                     auto matched = MatchFunction(args, methods[idx].Parameters);
                     if (!matched.empty()) matchedArgs = matched;
                 }
+                // The pointee hint names one slot only when it is the lone arity match.
                 if (DiagnoseProvableInterfaceArgMismatch(ifaceName, methodName, matchedArgs,
-                                                          methods[idx].Parameters))
+                                                          methods[idx].Parameters,
+                                                          exactSlots.size() == 1))
                     return -1;
                 LogError(std::format("no overload of '{}' matches the given arguments.", methodName));
                 return -1;
@@ -5843,7 +5860,8 @@ int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const 
                         }
                     }
                     if (DiagnoseProvableInterfaceArgMismatch(ifaceName, methodName, diagnosticArgs,
-                                                              firstMethod.Parameters))
+                                                              firstMethod.Parameters,
+                                                              exactSlots.size() == 1))
                         return -1;
                     for (size_t i = 0; i < diagnosticArgs.size()
                          && i < firstMethod.Parameters.size(); ++i)
@@ -6313,10 +6331,56 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
                 return nullptr;
             }
             const size_t firstCallArg = callArgs.size();
-
             const size_t recipeIndex = i + 1; // slot zero is the interface receiver
-            if (recipeIndex < cxxSretRecipe.paramSlots.size()
-                && cxxSretRecipe.paramSlots[recipeIndex].kind == AbiSlot::ByVal)
+            const bool byValSlot = recipeIndex < cxxSretRecipe.paramSlots.size()
+                && cxxSretRecipe.paramSlots[recipeIndex].kind == AbiSlot::ByVal;
+            // A derived value whose base subobject is ambiguous has no slice (clang refuses it).
+            if (!nv.TypeAndValue.Pointer && !param.Pointer && !param.IsAlias && !param.IsRvalueRef
+                && IsCxxAmbiguousBase(nv.TypeAndValue.TypeName, param.TypeName)
+                && !CflatClassParamCopyInitsByCtorTemplate(nv, param)
+                && !SelectsCxxNonCopyCtorForDerived(param.TypeName, nv, nv.TypeAndValue, false)
+                && RejectCxxAmbiguousBaseConversion(nv.TypeAndValue.TypeName, param.TypeName))
+                return nullptr;
+            // A different C++ class value copy-initializes a by-value C++ class parameter through
+            // its converting ctor (template or listed), as `T v = arg;` and a direct call do.
+            if (!nv.TypeAndValue.Pointer && !param.Pointer && !param.IsAlias && !param.IsRvalueRef
+                && IsCxxRecord(param.TypeName) && IsCxxRecord(nv.TypeAndValue.TypeName)
+                && ResolveTypeAlias(nv.TypeAndValue.TypeName) != ResolveTypeAlias(param.TypeName)
+                && (IsCxxBaseOf(param.TypeName, nv.TypeAndValue.TypeName)
+                        // A derived value slices unless a base ctor (template or `B(const D&)`) wins.
+                        ? (CflatClassParamCopyInitsByCtorTemplate(nv, param)
+                           || SelectsCxxNonCopyCtorForDerived(param.TypeName, nv, nv.TypeAndValue,
+                                                              false))
+                        : (CanImplicitlyConstructCxxClass(nv, param)
+                           || CflatClassParamCopyInitsByCtorTemplate(nv, param))))
+            {
+                // A ByVal slot is the parameter object itself: construct there, no extra copy.
+                llvm::Value* slot = byValSlot
+                    ? AllocaAtEntry(cxxSretRecipe.paramSlots[recipeIndex].structTy, nullptr,
+                                    "cxx.interface.argconv",
+                                    cxxSretRecipe.paramSlots[recipeIndex].align)
+                    : nullptr;
+                std::string refusal;
+                if (ConvertThroughCxxConvertingCtor(nv, param.TypeName, slot, refusal)
+                    != CxxConvertingCtorResult::Converted)
+                {
+                    LogError(std::format(
+                        "cannot materialize implicit C++ class argument '{}' for interface method '{}.{}'",
+                        argumentType, ifaceName, methodName));
+                    return nullptr;
+                }
+                if (slot != nullptr)
+                {
+                    if (IsForeignNontrivialCxxClass(param.TypeName)
+                        && !IsCxxParamDestroyedInCallee(param.TypeName))
+                        RegisterOwnedStructTemp(slot, param.TypeName);
+                    callArgs.push_back(slot);
+                    paramCallArgIndexes.push_back(firstCallArg);
+                    continue;
+                }
+            }
+
+            if (byValSlot)
             {
                 if (nv.Storage == nullptr)
                 {
@@ -6479,7 +6543,16 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
             {
                 // Keep pointer arguments on the direct-call borrowing path: addressable values
                 // pass their storage, while pointer values pass the pointer they already hold.
-                callArgs.push_back(LowerPointerParamArg(nv));
+                llvm::Value* pointerArg = LowerPointerParamArg(nv);
+                // A derived C++ class pointer (named, `&d`, a join, a fixed array or a row) moves
+                // to the base subobject, as a direct call's argument does.
+                const TypeAndValue source = CxxArrayArgumentPointer(nv, pointerArg);
+                if (pointerArg != nullptr && source.Pointer && !param.IsAlias
+                    && !param.IsCxxRefToPointer && IsCxxRecord(param.TypeName)
+                    && IsCxxRecord(source.TypeName))
+                    pointerArg = AdjustCxxPointerForStore(param, source, pointerArg,
+                        std::format("parameter '{}' of '{}'", param.VariableName, displayMethod));
+                callArgs.push_back(pointerArg);
             }
             else
             {

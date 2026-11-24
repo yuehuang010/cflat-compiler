@@ -435,7 +435,7 @@ struct dictionary<K, V>
             }
             else if const (!is_copyable(K))
             {
-                compile_error("cannot list the keys of this dictionary: its key type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or walk the table with slotCount()/slotOccupied(i)/keyAt(i) instead");
+                compile_error("cannot list the keys of this dictionary: its key type is not copyable; give the type a 'copy()' method, or walk the table with slotCount()/slotOccupied(i)/keyAt(i) instead");
                 return move result;
             }
             else
@@ -520,7 +520,7 @@ struct dictionary<K, V>
                         if const (is_unique(K)) compile_error("dictionary keys cannot be 'unique'");
                         else                    construct_at(&result._keys[i], _keys[i].copy());
                         if const (!is_copyable(V))
-                            compile_error("cannot copy this dictionary: its value type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the dictionary instead of copying it");
+                            compile_error("cannot copy this dictionary: its value type is not copyable; give the type a 'copy()' method, or 'move' the dictionary instead of copying it");
                         else
                         {
                             if const (is_cpp_class(V)) construct_at(&result._values[i], _values[i]);

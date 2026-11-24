@@ -120,7 +120,7 @@ struct hashset<T>
         else if const (is_unique(T)) compile_error("hashset elements cannot be 'unique'; set elements are key-like and a lookup reads the element for hashing/equality, which would move it out. Use 'hashset<T*>' to hold borrowed elements and manage their lifetime separately.");
         // Poison the copying overload for a non-copyable T so the class still instantiates and
         // `add(move x)` stays usable; the dead arm emits no call to the poisoned _placeAt.
-        else if const (!is_copyable(T)) compile_error("this hashset element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (s.add(move x)) to transfer ownership instead, or give the type a 'copy()' method");
+        else if const (!is_copyable(T)) compile_error("this hashset element type is not copyable; write 'move' at the call site (s.add(move x)) to transfer ownership instead, or give the type a 'copy()' method");
         else
         {
             if (_capacity == 0) _init(8);
@@ -196,7 +196,7 @@ struct hashset<T>
             // An owning element is policy-rejected on the hash path; keep its .copy() out of the
             // instantiation so that tailored diagnostic is the one reported.
             else if const (is_unique(T))    compile_error("hashset elements cannot be 'unique'; set elements are key-like and a lookup reads the element for hashing/equality, which would move it out. Use 'hashset<T*>' to hold borrowed elements and manage their lifetime separately.");
-            else if const (!is_copyable(T)) compile_error("this hashset element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (s.add(move x)) to transfer ownership instead, or give the type a 'copy()' method");
+            else if const (!is_copyable(T)) compile_error("this hashset element type is not copyable; write 'move' at the call site (s.add(move x)) to transfer ownership instead, or give the type a 'copy()' method");
             else                            construct_at(&_keys[index], value.copy());
         }
     }
@@ -279,7 +279,7 @@ struct hashset<T>
         }
         else if const (!is_copyable(T))
         {
-            compile_error("cannot list the items of this hashset: its element type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or walk the table with slotCount()/slotOccupied(i)/elementAt(i) instead");
+            compile_error("cannot list the items of this hashset: its element type is not copyable; give the type a 'copy()' method, or walk the table with slotCount()/slotOccupied(i)/elementAt(i) instead");
             return move result;
         }
         else

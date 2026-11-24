@@ -20583,10 +20583,479 @@ int testMoveViewAssignmentOwnership()
     return passed;
 }
 
+// TRAPJOIN accept-set: a '?:' / '??' join with a borrowed-address arm stays readable, passable,
+// and rebindable; only a `move` of it (or of a binding copied from it) is refused.
+struct TrapjoinNode { int k = 7; };
+int trapjoinHelperRead(TrapjoinNode* p) { return p->k; }
+int trapjoinRead(bool c)
+{
+    unique TrapjoinNode* u = new TrapjoinNode(); TrapjoinNode x = default; x.k = 9;
+    TrapjoinNode* px = &x;
+    TrapjoinNode* q = c ? u : px;
+    return q->k + trapjoinHelperRead(q);
+}
+int trapjoinCoalesceRead(bool c)
+{
+    unique TrapjoinNode* u = new TrapjoinNode(); TrapjoinNode x = default; x.k = 4;
+    TrapjoinNode* n = nullptr;
+    if (!c) n = &x;
+    TrapjoinNode* q = n ?? u;
+    return q->k;
+}
+int trapjoinRebindThenMove(bool c)
+{
+    unique TrapjoinNode* u = new TrapjoinNode(); TrapjoinNode x = default; x.k = 9;
+    TrapjoinNode* q = c ? u : &x;
+    q = new TrapjoinNode();
+    q->k = 3;
+    unique TrapjoinNode* t = move q;
+    return t->k + u->k;
+}
+int trapjoinFreshArms(bool c)
+{
+    TrapjoinNode* q = c ? new TrapjoinNode() : new TrapjoinNode();
+    unique TrapjoinNode* t = move q;
+    return t->k;
+}
+int trapjoinMoveOwnerArm(bool c)
+{
+    unique TrapjoinNode* u = new TrapjoinNode(); u->k = 5;
+    unique TrapjoinNode* t = c ? move u : new TrapjoinNode();
+    return t->k;
+}
+int trapjoinLoopRebindNew(bool c)
+{
+    unique TrapjoinNode* u = new TrapjoinNode(); TrapjoinNode x = default; x.k = 9;
+    TrapjoinNode* px = &x;
+    TrapjoinNode* q = new TrapjoinNode();
+    int s = 0;
+    for (int i = 0; i < 2; i++)
+    {
+        unique TrapjoinNode* t = move q;
+        s = s + t->k;
+        q = c ? u : px;
+        s = s + q->k;
+        if (c) q = new TrapjoinNode(); else q = new TrapjoinNode();
+    }
+    return s;
+}
+int trapjoinContinueRebindNew(bool c)
+{
+    unique TrapjoinNode* u = new TrapjoinNode(); TrapjoinNode x = default; x.k = 9;
+    TrapjoinNode* px = &x;
+    TrapjoinNode* q = new TrapjoinNode();
+    int s = 0;
+    for (int i = 0; i < 2; i++)
+    {
+        unique TrapjoinNode* t = move q;
+        s = s + t->k;
+        q = new TrapjoinNode();
+        if (i == 0)
+        {
+            q = c ? u : px;
+            s = s + q->k;
+            q = new TrapjoinNode();
+            continue;
+        }
+    }
+    return s;
+}
+TrapjoinNode* trapjoinGlobal = nullptr;
+int trapjoinGlobalRebindNew(bool c)
+{
+    unique TrapjoinNode* u = new TrapjoinNode(); TrapjoinNode x = default; x.k = 9;
+    trapjoinGlobal = c ? u : &x;
+    int s = trapjoinGlobal->k;
+    trapjoinGlobal = new TrapjoinNode();
+    unique TrapjoinNode* t = move trapjoinGlobal;
+    return s + t->k;
+}
+int testTrapjoinAcceptSet()
+{
+    int passed = 0;
+    passed += Test("trapjoin_read_unique_arm", trapjoinRead(true), 14);
+    passed += Test("trapjoin_read_borrow_arm", trapjoinRead(false), 18);
+    passed += Test("trapjoin_coalesce_read_unique", trapjoinCoalesceRead(true), 7);
+    passed += Test("trapjoin_coalesce_read_borrow", trapjoinCoalesceRead(false), 4);
+    passed += Test("trapjoin_rebind_move_a", trapjoinRebindThenMove(true), 10);
+    passed += Test("trapjoin_rebind_move_b", trapjoinRebindThenMove(false), 10);
+    passed += Test("trapjoin_fresh_arms_a", trapjoinFreshArms(true), 7);
+    passed += Test("trapjoin_fresh_arms_b", trapjoinFreshArms(false), 7);
+    passed += Test("trapjoin_move_owner_arm_a", trapjoinMoveOwnerArm(true), 5);
+    passed += Test("trapjoin_move_owner_arm_b", trapjoinMoveOwnerArm(false), 7);
+    passed += Test("trapjoin_loop_rebind_new_a", trapjoinLoopRebindNew(true), 28);
+    passed += Test("trapjoin_loop_rebind_new_b", trapjoinLoopRebindNew(false), 32);
+    passed += Test("trapjoin_global_rebind_new_a", trapjoinGlobalRebindNew(true), 14);
+    passed += Test("trapjoin_global_rebind_new_b", trapjoinGlobalRebindNew(false), 16);
+    passed += Test("trapjoin_continue_rebind_new_a", trapjoinContinueRebindNew(true), 21);
+    passed += Test("trapjoin_continue_rebind_new_b", trapjoinContinueRebindNew(false), 23);
+    return passed;
+}
+
+// GLOBCOPY accept-set: a copy of a global inherits the global's borrow ledger; a global bound to
+// fresh memory (or rebound to it) stays movable through its copies, readable and passable.
+struct GlobcopyNode { int k = 7; };
+struct GlobcopyHolder { GlobcopyNode* p = default; };
+GlobcopyNode* globcopyG = nullptr;
+GlobcopyNode* globcopyG2 = nullptr;
+int globcopyHelperRead(GlobcopyNode* p) { return p->k; }
+int globcopyOwnedCopyMove()
+{
+    globcopyG = new GlobcopyNode(); globcopyG->k = 5;
+    GlobcopyNode* q = globcopyG;
+    globcopyG = nullptr;
+    unique GlobcopyNode* t = move q;
+    return t->k;
+}
+int globcopyBorrowedCopyRead()
+{
+    GlobcopyNode x = default; x.k = 9;
+    globcopyG = &x;
+    GlobcopyNode* q = globcopyG;
+    int s = q->k + globcopyHelperRead(q);
+    globcopyG = nullptr;
+    return s;
+}
+int globcopyCopyRebindNew()
+{
+    GlobcopyNode x = default;
+    globcopyG = &x;
+    GlobcopyNode* q = globcopyG;
+    q = new GlobcopyNode(); q->k = 3;
+    unique GlobcopyNode* t = move q;
+    globcopyG = nullptr;
+    return t->k;
+}
+int globcopyGlobalRebindThenCopy()
+{
+    GlobcopyNode x = default;
+    globcopyG = &x;
+    globcopyG = new GlobcopyNode(); globcopyG->k = 4;
+    GlobcopyNode* q = globcopyG;
+    globcopyG = nullptr;
+    unique GlobcopyNode* t = move q;
+    return t->k;
+}
+int globcopyOwnedGlobalToGlobal()
+{
+    globcopyG = new GlobcopyNode(); globcopyG->k = 6;
+    globcopyG2 = globcopyG;
+    globcopyG = nullptr;
+    unique GlobcopyNode* t = move globcopyG2;
+    return t->k;
+}
+int globcopyOwnedFieldCopy()
+{
+    globcopyG = new GlobcopyNode(); globcopyG->k = 8;
+    GlobcopyHolder h = default;
+    h.p = globcopyG;
+    globcopyG = nullptr;
+    unique GlobcopyNode* t = move h.p;
+    return t->k;
+}
+int testGlobcopyAcceptSet()
+{
+    int passed = 0;
+    passed += Test("globcopy_owned_copy_move", globcopyOwnedCopyMove(), 5);
+    passed += Test("globcopy_borrowed_copy_read", globcopyBorrowedCopyRead(), 18);
+    passed += Test("globcopy_copy_rebind_new", globcopyCopyRebindNew(), 3);
+    passed += Test("globcopy_global_rebind_then_copy", globcopyGlobalRebindThenCopy(), 4);
+    passed += Test("globcopy_owned_global_to_global", globcopyOwnedGlobalToGlobal(), 6);
+    passed += Test("globcopy_owned_field_copy", globcopyOwnedFieldCopy(), 8);
+    return passed;
+}
+
+// FLDCOPY accept-set: field / element slot borrow facts follow the LAST store to the slot; owning
+// slots stay movable, borrowed ones readable, and a slot written through an alias is not judged.
+struct FldcopyNode { int k = 7; };
+struct FldcopyHolder { FldcopyNode* p = default; FldcopyNode* r = default; };
+struct FldcopyOuter { FldcopyHolder h = default; };
+int fldcopyRead(FldcopyNode* p) { return p->k; }
+void fldcopyFillOwned(FldcopyNode** s) { s[0] = new FldcopyNode(); s[0]->k = 9; }
+void fldcopyResetHolder(FldcopyHolder* h) { h->p = new FldcopyNode(); h->p->k = 4; }
+int fldcopyOwnedFieldCopy()
+{
+    FldcopyHolder h = default; h.p = new FldcopyNode(); h.p->k = 5;
+    FldcopyNode* q = h.p; h.p = nullptr;
+    unique FldcopyNode* t = move q;
+    return t->k;
+}
+int fldcopyOwnedElemMove()
+{
+    FldcopyNode*[2] a = default; a[0] = new FldcopyNode(); a[0]->k = 4;
+    unique FldcopyNode* t = move a[0];
+    return t->k;
+}
+int fldcopyBorrowedRead()
+{
+    FldcopyNode x = default; x.k = 9; FldcopyNode* px = &x;
+    FldcopyHolder h = { .p = px }; FldcopyNode*[2] a = { px, px };
+    FldcopyNode* q = h.p;
+    return q->k + fldcopyRead(h.p) + fldcopyRead(a[1]);
+}
+int fldcopyFieldRebindNew()
+{
+    FldcopyNode x = default; FldcopyNode* px = &x;
+    FldcopyHolder h = default; h.p = px; h.p = new FldcopyNode(); h.p->k = 2;
+    FldcopyNode* q = h.p; h.p = nullptr;
+    unique FldcopyNode* t = move q;
+    return t->k;
+}
+int fldcopyElemRebindNew()
+{
+    FldcopyNode x = default; FldcopyNode* px = &x;
+    FldcopyNode*[2] a = default; a[0] = px; a[0] = new FldcopyNode(); a[0]->k = 8;
+    unique FldcopyNode* t = move a[0];
+    return t->k;
+}
+int fldcopyOtherSlotOwned()
+{
+    FldcopyNode x = default; FldcopyNode* px = &x;
+    FldcopyHolder h = { .p = px, .r = new FldcopyNode() }; h.r->k = 3;
+    FldcopyNode*[2] a = { px, new FldcopyNode() }; a[1]->k = 6;
+    unique FldcopyNode* t = move h.r;
+    unique FldcopyNode* t2 = move a[1];
+    return t->k + t2->k + h.p->k;
+}
+int fldcopyNestedBraceOwned()
+{
+    FldcopyOuter o = { .h = { .p = new FldcopyNode() } }; o.h.p->k = 5;
+    unique FldcopyNode* t = move o.h.p;
+    return t->k;
+}
+int fldcopyStructArrayOwned()
+{
+    FldcopyNode x = default; FldcopyNode* px = &x;
+    FldcopyHolder[2] a = { { .p = px }, { .p = new FldcopyNode() } }; a[1].p->k = 2;
+    unique FldcopyNode* t = move a[1].p;
+    return t->k + a[0].p->k;
+}
+int fldcopyDecayCallFill()
+{
+    FldcopyNode x = default; FldcopyNode* px = &x;
+    FldcopyNode*[2] a = default; a[0] = px;
+    fldcopyFillOwned(a);
+    unique FldcopyNode* t = move a[0];
+    return t->k;
+}
+int fldcopyDecayLocalAlias()
+{
+    FldcopyNode x = default; FldcopyNode* px = &x;
+    FldcopyNode*[2] a = default; a[0] = px;
+    FldcopyNode** pa = a; pa[0] = new FldcopyNode(); pa[0]->k = 2;
+    unique FldcopyNode* t = move a[0];
+    return t->k;
+}
+int fldcopyAddressEscape()
+{
+    FldcopyNode x = default; FldcopyNode* px = &x;
+    FldcopyHolder h = default; h.p = px;
+    fldcopyResetHolder(&h);
+    unique FldcopyNode* t = move h.p;
+    return t->k;
+}
+int fldcopyDynamicIndexRetire()
+{
+    // FLDCOPY2: a runtime-index store never retires a fact, so `a[0] = px;` before it is now
+    // refused (fldcopy2ErrDynNewKeepsBorrow); with nothing borrowed stored the move stays legal.
+    FldcopyNode*[2] a = default;
+    int i = 0; a[i] = new FldcopyNode(); a[i]->k = 3;
+    unique FldcopyNode* t = move a[0];
+    return t->k;
+}
+int fldcopyWholeReassignOwned()
+{
+    FldcopyNode x = default; FldcopyNode* px = &x;
+    FldcopyHolder h = { .p = px };
+    FldcopyHolder fresh = default; fresh.p = new FldcopyNode(); fresh.p->k = 8;
+    h = fresh; fresh.p = nullptr;
+    unique FldcopyNode* t = move h.p;
+    return t->k;
+}
+int fldcopyPointerRootFill()
+{
+    FldcopyNode x = default; FldcopyNode*[2] buf = default; FldcopyNode** pp = buf;
+    pp[0] = &x;
+    fldcopyFillOwned(pp);
+    unique FldcopyNode* t = move pp[0];
+    return t->k;
+}
+int fldcopyHeapPointerRootFill()
+{
+    FldcopyNode x = default; FldcopyNode** pp = new FldcopyNode*[2];
+    pp[0] = &x;
+    fldcopyFillOwned(pp);
+    unique FldcopyNode* t = move pp[0];
+    delete[] pp;
+    return t->k + 1;
+}
+int testFldcopyAcceptSet()
+{
+    int passed = 0;
+    passed += Test("fldcopy_owned_field_copy", fldcopyOwnedFieldCopy(), 5);
+    passed += Test("fldcopy_owned_elem_move", fldcopyOwnedElemMove(), 4);
+    passed += Test("fldcopy_borrowed_read", fldcopyBorrowedRead(), 27);
+    passed += Test("fldcopy_field_rebind_new", fldcopyFieldRebindNew(), 2);
+    passed += Test("fldcopy_elem_rebind_new", fldcopyElemRebindNew(), 8);
+    passed += Test("fldcopy_other_slot_owned", fldcopyOtherSlotOwned(), 16);
+    passed += Test("fldcopy_nested_brace_owned", fldcopyNestedBraceOwned(), 5);
+    passed += Test("fldcopy_struct_array_owned", fldcopyStructArrayOwned(), 9);
+    passed += Test("fldcopy_decay_call_fill", fldcopyDecayCallFill(), 9);
+    passed += Test("fldcopy_decay_local_alias", fldcopyDecayLocalAlias(), 2);
+    passed += Test("fldcopy_address_escape", fldcopyAddressEscape(), 4);
+    passed += Test("fldcopy_dynamic_index_retire", fldcopyDynamicIndexRetire(), 3);
+    passed += Test("fldcopy_whole_reassign_owned", fldcopyWholeReassignOwned(), 8);
+    passed += Test("fldcopy_pointer_root_fill", fldcopyPointerRootFill(), 9);
+    passed += Test("fldcopy_heap_pointer_root_fill", fldcopyHeapPointerRootFill(), 10);
+    return passed;
+}
+
+// FLDCOPY2 accept-set: joins over owned slots, dynamic-index stores that store nothing borrowed
+// or are overwritten by a static store, and member-array elements that are rebound or escape.
+struct Fc2N { int k = 7; };
+struct Fc2H { Fc2N* p = default; Fc2N*[2] arr = default; };
+void fc2Fill(Fc2N** s) { s[0] = new Fc2N(); s[0]->k = 9; }
+int fc2LoopFillMove(int n)
+{
+    Fc2N*[2] a = default;
+    for (int j = 0; j < n; j++) { a[j] = new Fc2N(); a[j]->k = j + 3; }
+    unique Fc2N* t = move a[0]; unique Fc2N* t2 = move a[1];
+    return t->k * 10 + t2->k;
+}
+int fc2MemberLoopFillMove(int n)
+{
+    Fc2H h = default; int s = 0;
+    for (int j = 0; j < n; j++) h.arr[j] = new Fc2N();
+    for (int j = 0; j < n; j++) { unique Fc2N* t = move h.arr[j]; s += t->k + j; }
+    return s;
+}
+int fc2JoinOwnedField(bool c)
+{
+    Fc2H h = default; h.p = new Fc2N(); h.p->k = 5;
+    unique Fc2N* t = move (c ? h.p : new Fc2N());
+    return t->k;
+}
+int fc2CoalesceOwnedField()
+{
+    Fc2H h = default; h.p = new Fc2N(); h.p->k = 2; Fc2N* n = nullptr;
+    unique Fc2N* t = move (h.p ?? n);
+    return t->k;
+}
+int fc2JoinBorrowedRead(bool c)
+{
+    Fc2N x = default; x.k = 6; Fc2H h = default; h.p = &x;
+    Fc2N* q = c ? h.p : &x;
+    return q->k + 1;
+}
+int fc2DynNullThenStaticNew(int i)
+{
+    Fc2N x = default; Fc2N*[2] a = default; a[0] = &x;
+    a[i % 2] = nullptr; a[0] = new Fc2N(); a[0]->k = 8;
+    unique Fc2N* t = move a[0];
+    return t->k;
+}
+int fc2DynBorrowThenStaticNew(int i)
+{
+    Fc2N x = default; Fc2N*[2] a = default; a[i % 2] = &x;
+    a[0] = new Fc2N(); a[1] = new Fc2N(); a[0]->k = 4;
+    unique Fc2N* t = move a[0]; delete a[1];
+    return t->k;
+}
+int fc2StructDynThenStaticNew(int i)
+{
+    Fc2N x = default; Fc2H[2] sa = default; sa[i % 2].p = &x;
+    sa[0].p = new Fc2N(); sa[0].p->k = 11;
+    unique Fc2N* t = move sa[0].p;
+    return t->k;
+}
+int fc2StructCopyDynThenStatic(int i)
+{
+    Fc2N x = default; Fc2H g = default; g.p = &x; Fc2H[2] sa = default; sa[i % 2] = g;
+    sa[0].p = new Fc2N(); sa[0].p->k = 13;
+    unique Fc2N* t = move sa[0].p;
+    return t->k;
+}
+int fc2MemberElemRebind()
+{
+    Fc2N x = default; Fc2H h = default; h.arr[0] = &x;
+    h.arr[0] = new Fc2N(); h.arr[0]->k = 3;
+    unique Fc2N* t = move h.arr[0];
+    return t->k;
+}
+int fc2MemberElemOtherSlot()
+{
+    Fc2N x = default; x.k = 7; Fc2H h = default; h.arr[0] = &x;
+    h.arr[1] = new Fc2N(); h.arr[1]->k = 5;
+    unique Fc2N* t = move h.arr[1];
+    return t->k + h.arr[0]->k;
+}
+int fc2MemberDecayCall()
+{
+    Fc2N x = default; Fc2H h = default; h.arr[0] = &x;
+    fc2Fill(h.arr);
+    unique Fc2N* t = move h.arr[0];
+    return t->k;
+}
+int fc2MemberDecayAlias()
+{
+    Fc2N x = default; Fc2H h = default; h.arr[0] = &x;
+    Fc2N** pp = h.arr; pp[0] = new Fc2N(); pp[0]->k = 16;
+    unique Fc2N* t = move h.arr[0];
+    return t->k;
+}
+int fc2MemberElemCopyRead()
+{
+    Fc2N x = default; x.k = 3; Fc2H h = default; h.arr[0] = &x;
+    Fc2H g = h; Fc2N* q = g.arr[0];
+    return q->k + h.arr[0]->k + 1;
+}
+int fc2SentinelSlotDrain(int n)
+{
+    Fc2N x = default; Fc2N*[3] a = default; a[0] = &x; int s = 0;
+    for (int j = 1; j < n; j++) { a[j] = new Fc2N(); unique Fc2N* t = move a[j]; s += t->k; }
+    return s + a[0]->k;
+}
+int fc2WideDynThenStaticNew(int i)
+{
+    Fc2N x = default; Fc2N*[100] a = default; a[i] = &x;
+    a[0] = new Fc2N(); a[0]->k = 17;
+    unique Fc2N* t = move a[0];
+    return t->k;
+}
+int testFldcopy2AcceptSet(int one)
+{
+    int passed = 0;
+    passed += Test("fldcopy2_loop_fill_move", fc2LoopFillMove(2 * one), 34);
+    passed += Test("fldcopy2_member_loop_fill_move", fc2MemberLoopFillMove(2 * one), 15);
+    passed += Test("fldcopy2_join_owned_field", fc2JoinOwnedField(one == 1), 5);
+    passed += Test("fldcopy2_coalesce_owned_field", fc2CoalesceOwnedField(), 2);
+    passed += Test("fldcopy2_join_borrowed_read", fc2JoinBorrowedRead(one == 1), 7);
+    passed += Test("fldcopy2_dyn_null_then_static_new", fc2DynNullThenStaticNew(one), 8);
+    passed += Test("fldcopy2_dyn_borrow_then_static_new", fc2DynBorrowThenStaticNew(one), 4);
+    passed += Test("fldcopy2_struct_dyn_then_static_new", fc2StructDynThenStaticNew(one), 11);
+    passed += Test("fldcopy2_struct_copy_dyn_then_static", fc2StructCopyDynThenStatic(one), 13);
+    passed += Test("fldcopy2_member_elem_rebind", fc2MemberElemRebind(), 3);
+    passed += Test("fldcopy2_member_elem_other_slot", fc2MemberElemOtherSlot(), 12);
+    passed += Test("fldcopy2_member_decay_call", fc2MemberDecayCall(), 9);
+    passed += Test("fldcopy2_member_decay_alias", fc2MemberDecayAlias(), 16);
+    passed += Test("fldcopy2_member_elem_copy_read", fc2MemberElemCopyRead(), 7);
+    passed += Test("fldcopy2_sentinel_slot_drain", fc2SentinelSlotDrain(3 * one), 21);
+    passed += Test("fldcopy2_wide_dyn_then_static_new", fc2WideDynThenStaticNew(one), 17);
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
     int total  = 0;
+    total += 16;
+    passed += testTrapjoinAcceptSet();
+    total += 6;
+    passed += testGlobcopyAcceptSet();
+    total += 15;
+    passed += testFldcopyAcceptSet();
+    total += 16;
+    passed += testFldcopy2AcceptSet(total > 0 ? 1 : 0);
     total += 12;
     passed += testT488MemberDestructionOrder();
     total += 8;

@@ -7679,7 +7679,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseForDec
         auto initDecl = ctx->initDeclaratorList();
         if (initDecl == nullptr)
             LogErrorContext(ctx, "for-init declaration must declare a variable");
-        return ParseDeclaration(declSpec, initDecl);
+        return ParseDeclarationLandingBraceBorrows(declSpec, initDecl, {});
     }
 
 std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclaration(CFlatParser::DeclarationContext* ctx, const std::string& namespaceName) {
@@ -7718,7 +7718,22 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     LogErrorContext(id, std::format("'{}' names a type, not a value.", name));
                 }
             }
-        return ParseDeclaration(declSpec, initDecl, namespaceName);
+        return ParseDeclarationLandingBraceBorrows(declSpec, initDecl, namespaceName);
+    }
+
+std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclarationLandingBraceBorrows(
+        CFlatParser::DeclarationSpecifiersContext* declSpec,
+        CFlatParser::InitDeclaratorListContext* initDecl, const std::string& namespaceName) {
+        // Brace-init slot borrows (NoteBraceSlotBorrow) live for this one declaration only.
+        if (declSpec == nullptr) return ParseDeclaration(declSpec, initDecl, namespaceName);
+        auto* compiler = Compiler(declSpec);
+        compiler->ClearBraceSlotBorrows();
+        auto allocList = ParseDeclaration(declSpec, initDecl, namespaceName);
+        if (compiler->currentFunction != nullptr)
+            for (const auto& declared : allocList)
+                compiler->ApplyBraceSlotBorrows(declared.first);
+        compiler->ClearBraceSlotBorrows();
+        return allocList;
     }
 
 void MainListener::ParseEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx, const std::string& namespaceName) {
@@ -13834,7 +13849,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 initializerSourceNV = rightNV;
                                 haveInitializerSourceNV = true;
                                 if (global_scope)
-                                    compiler->RejectImplicitIntegerPointeePointerConversion(
+                                    compiler->RejectImplicitPointeePointerStore(
                                         rightNV.TypeAndValue, typeAndValue);
                                 // `auto x = <C++ class lvalue>` copy-constructs like `T x = ...`.
                                 if (!global_scope && typeAndValue.TypeName == "auto"
@@ -16868,9 +16883,63 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             {
                                 RejectNewPointerSlotDepthMismatch(
                                     direct, initializerSourceNV, typeAndValue);
-                                compiler->RejectImplicitIntegerPointeePointerConversion(
+                                compiler->RejectImplicitPointeePointerStore(
                                     initializerSourceNV.TypeAndValue, typeAndValue);
                             }
+                            // `T t = src;` of a trivially copyable C++ class from an lvalue still needs
+                            // a usable copy constructor (clang: deleted / private / implicitly deleted).
+                            if (haveInitializerSourceNV && !typeAndValue.Pointer && !typeAndValue.IsAlias
+                                && !initializerSourceNV.TypeAndValue.Pointer
+                                && !initializerSourceNV.IsRvalue && !initializerSourceNV.IsExplicitMove
+                                && !initializerSourceNV.UncopyableStructLastUse
+                                && compiler->ResolveTypeAlias(initializerSourceNV.TypeAndValue.TypeName)
+                                    == compiler->ResolveTypeAlias(typeAndValue.TypeName))
+                            {
+                                const auto fault = compiler->CxxTrivialCopyCtorRefusal(
+                                    typeAndValue.TypeName,
+                                    compiler->CxxConstReceiverKind(initializerSourceNV) != 0, false);
+                                const std::string shown = compiler->DisplayCxxClassName(typeAndValue.TypeName);
+                                if (fault == LLVMBackend::CxxCopyCtorFault::CopyDeleted)
+                                    LogErrorContext(direct, compiler->LocalizeMessage(
+                                        "cannot copy C++ class '{}' into local '{}': its copy "
+                                        "constructor is deleted - pass or hold it by pointer instead",
+                                        { shown, name }));
+                                else if (fault != LLVMBackend::CxxCopyCtorFault::None
+                                         && fault != LLVMBackend::CxxCopyCtorFault::CopyExplicit)
+                                    LogErrorContext(direct, compiler->LocalizeMessage(
+                                        "cannot copy C++ class '{}' into local '{}': its copy "
+                                        "constructor is not accessible - pass or hold it by pointer instead",
+                                        { shown, name }));
+                                // An explicit copy ctor, or a CFlat struct whose member-wise copy is deleted.
+                                else if (std::string why = compiler->CxxCopyInitRefusal(typeAndValue.TypeName,
+                                             compiler->CxxConstReceiverKind(initializerSourceNV) != 0, false,
+                                             LLVMBackend::CxxCopyInitSite::Local, name);
+                                         !why.empty())
+                                    LogCopyInitRefusalContext(compiler, direct, why);
+                            }
+                            // `S t = move s;` / a consumed last use of a CFlat struct: clang move-constructs.
+                            else if (haveInitializerSourceNV && !typeAndValue.Pointer && !typeAndValue.IsAlias
+                                && !initializerSourceNV.TypeAndValue.Pointer
+                                && (initializerSourceNV.IsExplicitMove
+                                    || (initializerSourceNV.UncopyableStructLastUse && !initializerSourceNV.IsRvalue))
+                                && compiler->ResolveTypeAlias(initializerSourceNV.TypeAndValue.TypeName)
+                                    == compiler->ResolveTypeAlias(typeAndValue.TypeName))
+                                if (std::string why = compiler->CxxCopyInitRefusal(typeAndValue.TypeName,
+                                        false, true, LLVMBackend::CxxCopyInitSite::Local, name);
+                                    !why.empty())
+                                    LogCopyInitRefusalContext(compiler, direct, why);
+                            // `B b = d;` of a trivially copyable C++ base: copy d's base subobject.
+                            if (haveInitializerSourceNV && !typeAndValue.Pointer
+                                && right != nullptr && right->getType()->isStructTy()
+                                && !initializerSourceNV.TypeAndValue.Pointer
+                                && compiler->IsCxxTriviallyCopyableRecord(typeAndValue.TypeName)
+                                && compiler->IsCxxDerivedToBaseValue(initializerSourceNV.TypeAndValue,
+                                       LLVMBackend::TypeAndValue{ .TypeName = typeAndValue.TypeName },
+                                       &initializerSourceNV))
+                                if (auto* sliced = compiler->LoadCxxTrivialBaseCopy(
+                                        initializerSourceNV, right, typeAndValue.TypeName,
+                                        /*assignment*/ false))
+                                    right = sliced;
                             auto* initStore = (movedCxxReturn || loweredCopyInitInPlace)
                                 ? nullptr : compiler->CreateAssignment(right, alloc, srcIsUnsigned,
                                     nrvoLocal ? compiler->GetType(typeAndValue) : nullptr,
@@ -17244,8 +17313,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             && TopLevelMoveExpression(initAssignExprOwn) != nullptr;
                         const bool moveSourceIsProvenBorrow = haveInitializerSourceNV
                             && compiler->MoveSourceIsAddressBorrow(initializerSourceNV);
+                        // An element slot recorded as holding `&x` (`a[0] = px;`) is no owning slot.
+                        const bool slotHoldsBorrow = srcMovedFromSlot && haveInitializerSourceNV
+                            && initializerSourceNV.IsExplicitMove
+                            && initializerSourceNV.MayPointToBorrowedAddress;
                         const bool borrowedMoveSlotRefused = (typeAndValue.Pointer || destUniqueLoc)
-                            && !typeAndValue.IsArrayView && !srcMovedFromSlot
+                            && !typeAndValue.IsArrayView && (!srcMovedFromSlot || slotHoldsBorrow)
                             && haveInitializerSourceNV && explicitMove
                             && moveSourceIsProvenBorrow;
                         if (borrowedMoveSlotRefused)
@@ -17302,16 +17375,22 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // '?:' arm can be PROVEN a borrow instead of merely unproven.
                         // A plain COPY of a binding that already proved an address-of origin
                         // carries the proof; a `move` source sets IsOwning above and does not.
+                        // A copy of a GLOBAL (`T* q = g;`) or a field / element slot carries its ledger state.
+                        const auto [srcGlobalProven, srcGlobalMay] = haveInitializerSourceNV
+                            ? compiler->CopyReadBorrowState(initializerSourceNV)
+                            : std::pair<bool, bool>{false, false};
                         if (typeAndValue.Pointer && haveInitializerSourceNV
                             && (compiler->IsBorrowedAddressValue(initializerSourceNV.Primary)
                                 || (!typeAndValue.IsArrayView
                                     && LLVMBackend::IsProvableNonHeapAddressSource(initializerSourceNV))
-                                || initializerSourceNV.PointsToBorrowedAddress))
+                                || initializerSourceNV.PointsToBorrowedAddress || srcGlobalProven))
                         {
                             auto& boundNV = compiler->GetOrCreateStackVariable(name);
                             boundNV.PointsToBorrowedAddress = true;
                             boundNV.MayPointToBorrowedAddress = true;
                         }
+                        if (haveInitializerSourceNV && typeAndValue.ConstArraySize == 0)
+                            compiler->NoteWholeArrayAliasRead(initializerSourceNV);
                         // `H g = h;` of a whole named struct inherits h's field facts.
                         if (!typeAndValue.Pointer && haveInitializerSourceNV
                             && initializerSourceNV.FieldName.empty()
@@ -17319,10 +17398,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             && !initializerSourceNV.CallerName.empty()
                             && !initializerSourceNV.TypeAndValue.Pointer)
                             compiler->CopyFieldBorrowedAddresses(name, initializerSourceNV.CallerName);
-                        // A copy of a binding borrowed on SOME path is itself maybe-borrowed.
+                        // A copy of a binding borrowed on SOME path (or of a join with a borrowed
+                        // arm) is itself maybe-borrowed.
                         if (typeAndValue.Pointer && haveInitializerSourceNV
                             && !typeAndValue.IsArrayView
-                            && initializerSourceNV.MayPointToBorrowedAddress)
+                            && (initializerSourceNV.MayPointToBorrowedAddress || srcGlobalMay
+                                || compiler->JoinHasBorrowedAddressArm(initializerSourceNV.Primary)))
                             compiler->GetOrCreateStackVariable(name).MayPointToBorrowedAddress = true;
                         if (haveInitializerSourceNV
                             && (typeAndValue.Pointer || (!typeAndValue.Pointer
@@ -19211,7 +19292,9 @@ bool MainListener::EmitLoweredValueIntoSlot(LLVMBackend* compiler, const std::st
         antlr4::ParserRuleContext* ctx, const char* context)
 {
         auto* valueType = sourceValue->getType();
-        bool useMove = sourceNV.IsRvalue || sourceNV.IsExplicitMove || sourceNV.TypeAndValue.IsMove;
+        // The last use of a by-value parameter whose member-wise copy is deleted moves its fields.
+        bool useMove = sourceNV.IsRvalue || sourceNV.IsExplicitMove || sourceNV.TypeAndValue.IsMove
+            || (sourceNV.CxxParamLastUse && compiler->HasUncopyableCxxField(typeName));
         bool fromTemp = false;
         bool movedDetached = false;
         llvm::Value* source = sourceNV.Storage;

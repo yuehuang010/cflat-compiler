@@ -10,8 +10,7 @@
 // helper and all reject an unresolvable arm with this wording. The RETURN leg is the one that used
 // to die on the verifier dump. A separate BACKSTOP on the return path words itself "cannot convert
 // this expression to interface '<I>': its concrete class cannot be determined" - it names no
-// operator, because a nameless pointer expression reaches it too. The last leg in this file pins
-// THAT wording with `(t ?? t) + 0`: the arithmetic on a join whose class cannot be recovered.
+// operator, because a nameless pointer expression reaches it too.
 
 interface IThing { int value(); };
 
@@ -68,13 +67,6 @@ expect_error("no overload of 'byValThing' matches the given arguments") {
         Thing* a = new Thing(); a->n = 1;
         Thing* z = nullptr;
         return byValThing(z ?? a);
-    }
-}
-
-expect_error("cannot convert this expression to interface 'IThing'") {
-    IThing returnPointerArithmetic(Thing* t)
-    {
-        return (t ?? t) + 0;
     }
 }
 

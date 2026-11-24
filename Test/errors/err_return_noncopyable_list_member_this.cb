@@ -5,7 +5,7 @@
 import "list.cb";
 struct Inner { int v = 0; };
 struct NC { unique Inner* p = nullptr; ~NC() {} };
-expect_error("cannot copy this list: its element type owns a 'unique' pointer and has no 'copy()'");
+expect_error("cannot copy this list: its element type is not copyable");
 struct RetBagThis
 {
     list<NC> items;

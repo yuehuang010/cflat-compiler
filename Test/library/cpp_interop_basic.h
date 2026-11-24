@@ -2313,6 +2313,141 @@ namespace cppi_expr
     };
 }
 
+// An expression template copy-initializes a CFlat callee's by-value class parameter (ETARG).
+namespace cppi_etarg
+{
+    struct Tally
+    {
+        inline static int born = 0, copies = 0, dtors = 0;
+        double total = 0.0;
+        Tally(const Tally& other) : total(other.total) { ++born; ++copies; }
+        template <class D> Tally(const cppi_expr::VecBase<D>& other)
+        {
+            for (int i = 0; i < 3; ++i) total += other.derived().coeff(i);
+            ++born;
+        }
+        ~Tally() { ++dtors; }
+    };
+    // A greedy ctor template beats the derived-to-base copy (exact T = SliceD); the constrained
+    // twin rejects derived classes, so its slice keeps the copy ctor.
+    struct SliceB
+    {
+        inline static int born = 0, dtors = 0;
+        int how = 0;
+        int v = 5;
+        SliceB() { ++born; }
+        SliceB(const SliceB& o) : how(1), v(o.v) { ++born; }
+        template <class T> SliceB(const T& o) : how(2), v(o.v) { ++born; }
+        ~SliceB() { ++dtors; }
+    };
+    struct SliceD : SliceB {};
+    struct SliceCB
+    {
+        inline static int born = 0, dtors = 0;
+        int how = 0;
+        int v = 5;
+        SliceCB() { ++born; }
+        SliceCB(const SliceCB& o) : how(1), v(o.v) { ++born; }
+        template <class T> requires (!std::is_base_of_v<SliceCB, T>)
+        SliceCB(const T& o) : how(2), v(o.v) { ++born; }
+        ~SliceCB() { ++dtors; }
+    };
+    struct SliceCD : SliceCB {};
+    // BC reaches AmbC through both LC and RC: a by-value / pointer / reference conversion to BC is
+    // ambiguous. AmbG's greedy template binds AmbG directly, so its conversion is well-formed.
+    struct BC
+    {
+        int how = 0;
+        int v = 5;
+        BC() {}
+        BC(const BC& o) : how(1), v(o.v) {}
+        template <class T> requires (!std::is_base_of_v<BC, T>)
+        BC(const T& o) : how(2), v(o.v) {}
+    };
+    struct LC : BC {};
+    struct RC : BC {};
+    struct AmbC : LC, RC { int v = 7; };
+    struct BG
+    {
+        int how = 0;
+        int v = 5;
+        BG() {}
+        BG(const BG& o) : how(1), v(o.v) {}
+        template <class T> BG(const T& o) : how(2), v(o.v) {}
+    };
+    struct LG : BG {};
+    struct RG : BG {};
+    struct AmbG : LG, RG { int v = 7; };
+    struct BP { int v = 5; int get() const { return v; } };
+    struct LP : BP {};
+    struct RP : BP {};
+    struct AmbP : LP, RP {};
+    struct BV { int v = 5; virtual ~BV() {} };
+    struct LV : BV {};
+    struct RV : BV {};
+    struct AmbV : LV, RV {};
+    inline int TakeBP(BP b) { return b.v; }
+    inline int TakeBPRef(const BP& b) { return b.v; }
+    inline int TakeBPPtr(const BP* b) { return b->v; }
+    inline int TakeBC(BC b) { return b.how * 10 + b.v; }
+    inline int TakeBG(BG b) { return b.how * 10 + b.v; }
+    inline int operator+(const BP& a, const BP& b) { return a.v + b.v; }
+    inline AmbP& RefAmbP() { static AmbP a; return a; }
+    inline LP& RefLP() { static LP a; return a; }
+    // BY's ctors taking LY / AmbY outrank the derived-to-base copy; RY has none and slices.
+    struct LY;
+    struct AmbY;
+    struct BY
+    {
+        inline static int born = 0, dtors = 0;
+        int v = 5;
+        BY() { ++born; }
+        BY(const BY& o) : v(o.v) { ++born; }
+        BY(const LY&);
+        BY(const AmbY&);
+        BY& operator=(const BY& o) { v = o.v; return *this; }
+        ~BY() { ++dtors; }
+    };
+    struct LY : BY {};
+    struct RY : BY {};
+    struct AmbY : LY, RY {};
+    inline BY::BY(const LY&) : v(9) { ++born; }
+    inline BY::BY(const AmbY&) : v(11) { ++born; }
+    inline int TakeBY(BY b) { return b.v; }
+    // `b = move d` binds BMv's move assignment to d's base subobject: no temporary.
+    struct BMv
+    {
+        inline static int born = 0, dtors = 0;
+        int v = 5;
+        BMv() { ++born; }
+        BMv(const BMv& o) : v(o.v) { ++born; }
+        BMv(BMv&& o) : v(o.v) { ++born; }
+        ~BMv() { ++dtors; }
+        BMv& operator=(const BMv& o) { v = o.v + 100; return *this; }
+        BMv& operator=(BMv&& o) { v = o.v + 50; return *this; }
+    };
+    struct LMv : BMv {};
+    // CPPCOPY: a trivially copyable class with a deleted copy ctor still move-inits, returns a
+    // named local (implicit move), copy-assigns and binds prvalues.
+    struct BDc { int v = 5; BDc() = default; BDc(const BDc&) = delete; BDc(BDc&&) = default;
+        BDc& operator=(const BDc&) = default; };
+    inline BDc MakeBDc() { BDc t; t.v = 7; return t; }
+    inline int TakeBDc(BDc b) { return b.v; }
+    // A defaulted move ctor defined as deleted (implicit or `= default`) is ignored: `return l;`
+    // copies through the copy constructor ([class.copy.ctor]p10).
+    struct DMv { int v = 5; DMv() = default; DMv(const DMv&) = default; DMv(DMv&&) = delete;
+        DMv& operator=(const DMv&) = default; };
+    struct HMv { DMv m; int w = 4; };
+    struct HMv2 { DMv m; int w = 4; HMv2() = default; HMv2(const HMv2&) = default;
+        HMv2(HMv2&&) = default; HMv2& operator=(const HMv2&) = default; };
+    // CPPCOPY2: an explicit copy ctor still direct-inits, binds prvalues, copy-assigns, moves
+    // through a non-explicit move ctor (EXm) and serves a member-wise copy (direct-init).
+    struct EXc { int v = 5; EXc() = default; EXc(int x) : v(x) {} explicit EXc(const EXc&) = default; };
+    struct EXm { int v = 5; EXm() = default; explicit EXm(const EXm&) = default; EXm(EXm&&) = default; };
+    inline EXc MakeEXc() { return EXc(6); }
+    inline int TakeEXc(EXc b) { return b.v; }
+}
+
 // Constructor-template and temporary-lifetime coverage for expression-like arguments.
 namespace cppi_exprgap
 {

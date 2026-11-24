@@ -3,6 +3,12 @@
 // back to a byte-wise store.
 import cpp "cpp_interop_basic.h";
 
+// ETARG: a CFlat callee's by-value C++ class parameter copy-initializes like clang does.
+double EtargExplicitTake(cppi_expr.ExplicitVec3 v) { return v.sum(); }
+int EtargAmb(cppi_expr.Vec3 v) { return 1; }
+int EtargAmb(cppi_etarg.Tally t) { return 2; }
+interface IEtargExplicit { double take(cppi_expr.ExplicitVec3 v); };
+
 extern int main()
 {
     expect_error("cannot initialize C++ class 'cppi.Tracked' from this expression") {
@@ -19,6 +25,18 @@ extern int main()
     expect_error("cannot assign to C++ class 'cppi_expr.ExplicitVec3' from this expression") {
         cppi_expr.ExplicitVec3 assignExplicit = cppi_expr.ExplicitVec3(exprA + exprA);
         assignExplicit = exprA + exprA;
+    }
+    // An explicit ctor template never copy-initializes a parameter (clang: no matching function).
+    expect_error("no overload of 'EtargExplicitTake' matches the given arguments.") {
+        double explicitParam = EtargExplicitTake(exprA + exprA);
+    }
+    expect_error("no overload of 'take' matches the given arguments.") {
+        IEtargExplicit explicitIface = default;
+        double explicitIfaceParam = explicitIface.take(exprA + exprA);
+    }
+    // Two classes both built by a ctor template from the same expression: clang calls it ambiguous.
+    expect_error("ambiguous call to 'EtargAmb'") {
+        int ambiguousParam = EtargAmb(exprA + exprA);
     }
     // Constructing a polymorphic class template instantiates every virtual body (the vtable uses them);
     // an invalid one is a compile-time error at the construction site, never a link failure.

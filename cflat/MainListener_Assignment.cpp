@@ -629,6 +629,8 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFla
                                                             && stringLiteral->IsNarrow;
                                                         passthrough.CxxParamLastUse = IsLastUseOfForeignCxxParam(
                                                             compilerLLVM, ctx, passthrough);
+                                                        passthrough.UncopyableStructLastUse =
+                                                            IsLastUseOfUncopyableStruct(compilerLLVM, ctx, passthrough);
                                                         return FinishAssignmentExpressionNamed(passthrough, savedOwned);
                                                     }
                                                 }
@@ -937,12 +939,18 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFla
                     result.TypeAndValue.PointerDepth = joinShape.pointerDepth;
                     result.TypeAndValue.ElemPointer = joinShape.elemPointer;
                 }
-                // Both arms point at one native class: rank the call argument as that class
-                // pointer. Call arguments only, and `?:` only - a '??' join keeps its arms' ranking.
+                // One class at one depth: a `?:` call argument (`??`: C++ class only), or a native struct
+                // join with no typed destination (auto, deref, `->`), is that class pointer; typed ones convert per arm.
                 else if (joinShape.value == result.Primary && !joinShape.joinClassPointee.empty()
-                         && condCtx->Question() != nullptr
-                         && inCallArgument_ && IsCallArgumentThroughParens(ctx)
-                         && InferTernaryArmType(result.Primary).TypeName.empty())
+                         && InferTernaryArmType(result.Primary).TypeName.empty()
+                         && ((inCallArgument_ && IsCallArgumentThroughParens(ctx)
+                              && (condCtx->Question() != nullptr
+                                  || compilerLLVM->IsCxxRecord(joinShape.joinClassPointee)))
+                             || (!(inCallArgument_ && IsCallArgumentThroughParens(ctx))
+                                 && !compilerLLVM->IsCxxRecord(joinShape.joinClassPointee)
+                                 && (declExpectedType.TypeName.empty()
+                                     || declExpectedType.TypeName == "auto")
+                                 && !joinShape.cxxPointeeConst)))
                 {
                     result.TypeAndValue.TypeName = joinShape.joinClassPointee;
                     result.TypeAndValue.Pointer = true;
@@ -991,6 +999,7 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFla
                 result.TypeAndValue.ConstMask |= joinShape.sourceType.ConstMask != 0
                     ? joinShape.sourceType.ConstMask : 1u;
             result.CxxParamLastUse = IsLastUseOfForeignCxxParam(compilerLLVM, ctx, result);
+            result.UncopyableStructLastUse = IsLastUseOfUncopyableStruct(compilerLLVM, ctx, result);
             lastRedundantAsCtx_ = nullptr;
             return FinishAssignmentExpressionNamed(result, savedOwned);
         }
@@ -6155,7 +6164,16 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                                 return std::move(*prepared);
                             CxxCallArgumentScope cxxAssignRhsScope(inCxxCallArgument_,
                                 !namedVar.TypeAndValue.Pointer && compiler->IsCxxRecord(namedVar.TypeAndValue.TypeName));
-                            return ParseAssignmentExpressionNamed(assignCtx);
+                            auto* savedBaseMoveSite = cxxBaseAssignMoveSite_;
+                            std::string savedBaseMoveTarget = std::move(cxxBaseAssignMoveTarget_);
+                            cxxBaseAssignMoveSite_ = useMove && !namedVar.TypeAndValue.Pointer
+                                    && !compiler->IsCppStructName(tn)
+                                ? TopLevelMoveExpression(assignCtx) : nullptr;
+                            cxxBaseAssignMoveTarget_ = tn;
+                            auto parsed = ParseAssignmentExpressionNamed(assignCtx);
+                            cxxBaseAssignMoveSite_ = savedBaseMoveSite;
+                            cxxBaseAssignMoveTarget_ = std::move(savedBaseMoveTarget);
+                            return parsed;
                         }();
                         compiler->LowerNonCapturingClosureForCxx(
                             rhsNV, compiler->StdFunctionClosureSignature(tn));
@@ -6686,6 +6704,36 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     // `t = move u;` with a class source is `t = T(move u)`: the source binds as
                     // an rvalue (T(U&&) wins) and is consumed like any moved C++ local.
                     bool movedConversion = false;
+                    // `t = move d` with a derived d: T's assignment binds d's base subobject.
+                    if (useMove && !adoptedRaw && rhsTemp == nullptr && rhsNV.Storage != nullptr
+                        && !rhsNV.TypeAndValue.Pointer && rhsNV.TypeAndValue.TypeName != tn
+                        && !rhsNV.IsMoved && !rhsNV.ExplicitlyMovedNull
+                        && compiler->IsCxxDerivedToBaseValue(rhsNV.TypeAndValue,
+                               LLVMBackend::TypeAndValue{ .TypeName = tn }, &rhsNV))
+                    {
+                        if (compiler->IsCxxAmbiguousBase(rhsNV.TypeAndValue.TypeName, tn))
+                        {
+                            compiler->SetCurrentDebugLocation(ctx->getStart()->getLine());
+                            compiler->RejectCxxAmbiguousBaseConversion(rhsNV.TypeAndValue.TypeName, tn);
+                            return nullptr;
+                        }
+                        uint64_t baseOffset = 0;
+                        bool baseInaccessible = false;
+                        if (compiler->FindCxxValueBaseOffset(rhsNV.TypeAndValue.TypeName, tn,
+                                baseOffset, baseInaccessible, &rhsNV)
+                            && !baseInaccessible)
+                        {
+                            rhsNV.Storage = compiler->EmitCxxBaseAdjust(rhsNV.Storage, baseOffset);
+                            rhsNV.Primary = nullptr;
+                            rhsNV.TypeAndValue.TypeName = tn;
+                            rhsNV.BaseType = compiler->GetType(tempType);
+                            moveSourceNV.Storage = rhsNV.Storage;
+                            moveSourceNV.Primary = nullptr;
+                            moveSourceNV.TypeAndValue.TypeName = tn;
+                            moveSourceNV.BaseType = rhsNV.BaseType;
+                            sourceStorage = rhsNV.Storage;
+                        }
+                    }
                     if (useMove && !adoptedRaw && rhsTemp == nullptr
                         && !rhsNV.CallerName.empty() && rhsNV.Storage != nullptr
                         && !rhsNV.TypeAndValue.Pointer && rhsNV.TypeAndValue.TypeName != tn
@@ -6704,7 +6752,37 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                             movedConversion = true;
                         }
                     }
-                    if (convertibleSource)
+                    // No declared operator= took it: the copy / move assignment binds `const T&` to a
+                    // base subobject reached twice, which clang refuses as ambiguous.
+                    if (convertibleSource && !rhsNV.TypeAndValue.Pointer
+                        && compiler->IsCxxAmbiguousBase(rhsNV.TypeAndValue.TypeName, tn))
+                    {
+                        compiler->SetCurrentDebugLocation(ctx->getStart()->getLine());
+                        compiler->RejectCxxAmbiguousBaseConversion(rhsNV.TypeAndValue.TypeName, tn);
+                        return nullptr;
+                    }
+                    // A derived source binds the copy / move assignment's `const T&` / `T&&` to
+                    // its base subobject (clang): no `T(d)` temporary, no converting ctor.
+                    bool baseSubobjectSource = false;
+                    if (convertibleSource && !rhsNV.TypeAndValue.Pointer && rhsNV.Storage != nullptr
+                        && compiler->IsCxxDerivedToBaseValue(rhsNV.TypeAndValue,
+                               LLVMBackend::TypeAndValue{ .TypeName = tn }, &rhsNV))
+                    {
+                        uint64_t baseOffset = 0;
+                        bool baseInaccessible = false;
+                        if (compiler->FindCxxValueBaseOffset(rhsNV.TypeAndValue.TypeName, tn,
+                                baseOffset, baseInaccessible, &rhsNV)
+                            && !baseInaccessible)
+                        {
+                            rhsNV.Storage = compiler->EmitCxxBaseAdjust(rhsNV.Storage, baseOffset);
+                            rhsNV.Primary = nullptr;
+                            rhsNV.TypeAndValue.TypeName = tn;
+                            rhsNV.BaseType = compiler->GetType(tempType);
+                            sourceStorage = rhsNV.Storage;
+                            baseSubobjectSource = true;
+                        }
+                    }
+                    if (convertibleSource && !baseSubobjectSource)
                     {
                         LLVMBackend::NamedVariable converted = rhsNV;
                         compiler->SetCurrentDebugLocation(ctx->getStart()->getLine());
@@ -8141,7 +8219,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             if (operatorText == "=")
             {
                 RejectNewPointerSlotDepthMismatch(ctx, rightNV, namedVar.TypeAndValue);
-                compiler->RejectImplicitIntegerPointeePointerConversion(
+                compiler->RejectImplicitPointeePointerStore(
                     rightNV.TypeAndValue, namedVar.TypeAndValue);
             }
             arrayNewDesugarCtx = nullptr;
@@ -8296,19 +8374,37 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     && (llvm::isa<llvm::AllocaInst>(namedVar.Storage)
                         || llvm::isa<llvm::GlobalVariable>(namedVar.Storage)))
                     compiler->SetViewOfFixedArrayStorage(namedVar.CallerName, false);
-                // Field door of the address-of provenance (`h.p = &x;`), on the root binding so a
-                // later `move h.p` into a sink is refused; any other store to the path retires it.
-                if (!namedVar.FieldName.empty() && !namedVar.CallerName.empty()
-                    && !namedVar.MovePathHasDynamicIndex)
+                // Field / element door of the address-of provenance (`h.p = &x;`, `a[0] = px;`), on
+                // the root binding so a later `move h.p` is refused; another store retires it.
+                if (namedVar.TypeAndValue.ConstArraySize == 0) compiler->NoteWholeArrayAliasRead(rightNV);
+                const bool slotStore = !namedVar.FieldName.empty() || namedVar.IsElementAccess;
+                if (slotStore && !namedVar.CallerName.empty() && namedVar.MovePathHasDynamicIndex)
                 {
-                    const std::string fieldPath = LLVMBackend::FieldMoveKey(namedVar);
+                    /*
+                     * `a[i] = ...` may hit any element, so it can only ADD facts: a value that may
+                     * borrow (or a named struct carrying slot facts) marks every element under the
+                     * indexed array. It never retires one - `a[0] = px; a[i] = nullptr;` keeps a[0].
+                     */
+                    const auto& slotTV = namedVar.TypeAndValue;
+                    const bool storesBorrow = slotTV.Pointer && !slotTV.IsArrayView
+                        && compiler->StoredValueMayBorrowAddress(rightNV);
+                    const LLVMBackend::NamedVariable* structSource = !slotTV.Pointer
+                        && rightNV.FieldName.empty() && !rightNV.IsElementAccess
+                        && !rightNV.CallerName.empty()
+                        ? compiler->FindInnermostNamedVariable(rightNV.CallerName) : nullptr;
+                    if (storesBorrow)
+                        compiler->NoteDynamicSlotBorrow(namedVar.CallerName, namedVar, nullptr);
+                    else if (structSource != nullptr && !structSource->BorrowedAddressFields.empty())
+                        compiler->NoteDynamicSlotBorrow(namedVar.CallerName, namedVar,
+                            &structSource->BorrowedAddressFields);
+                }
+                else if (slotStore && !namedVar.CallerName.empty())
+                {
+                    const std::string fieldPath = LLVMBackend::BorrowSlotKey(namedVar);
                     if (!fieldPath.empty())
                         compiler->SetFieldBorrowedAddress(namedVar.CallerName, fieldPath,
                             namedVar.TypeAndValue.Pointer && !namedVar.TypeAndValue.IsArrayView
-                            && (compiler->IsBorrowedAddressValue(rightNV.Primary)
-                                || LLVMBackend::IsProvableNonHeapAddressSource(rightNV)
-                                || rightNV.PointsToBorrowedAddress
-                                || rightNV.MayPointToBorrowedAddress));
+                            && compiler->StoredValueMayBorrowAddress(rightNV));
                     // `o.h = h` of a whole named struct carries h's facts under the `h` path.
                     if (!fieldPath.empty() && !namedVar.TypeAndValue.Pointer
                         && rightNV.FieldName.empty() && !rightNV.IsElementAccess
@@ -8316,7 +8412,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         compiler->CopyFieldBorrowedAddressesUnder(namedVar.CallerName, fieldPath,
                             rightNV.CallerName);
                 }
-                else if (namedVar.FieldName.empty() && !namedVar.CallerName.empty()
+                else if (!slotStore && !namedVar.CallerName.empty()
                     && !namedVar.TypeAndValue.Pointer)
                 {
                     // `g = h` of a whole named struct carries h's facts; any other RHS retires g's.
@@ -8348,13 +8444,20 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         compiler->globalAssignBorrowOrigin_[namedVar.Storage] = globalBorrowOrigin;
                     else
                         compiler->globalAssignBorrowOrigin_.erase(namedVar.Storage);
-                    // Address-of provenance for the same global destination (`g = &x;`). Any
-                    // other RHS retires it, exactly as the origin ledger above is retired.
+                    // Address-of provenance for global `g = &x;`; any other RHS retires it. `g2 = g`
+                    // reads g's ledger before g2's entry is rewritten.
+                    const auto [srcGlobalProven, srcGlobalMay] = compiler->CopyReadBorrowState(rightNV);
                     if (compiler->IsBorrowedAddressValue(rightNV.Primary)
-                        || rightNV.PointsToBorrowedAddress)
+                        || rightNV.PointsToBorrowedAddress || srcGlobalProven)
                         compiler->globalAssignBorrowedAddress_.insert(namedVar.Storage);
                     else
                         compiler->globalAssignBorrowedAddress_.erase(namedVar.Storage);
+                    if (compiler->globalAssignBorrowedAddress_.count(namedVar.Storage) != 0
+                        || rightNV.MayPointToBorrowedAddress || srcGlobalMay
+                        || compiler->JoinHasBorrowedAddressArm(rightNV.Primary))
+                        compiler->globalAssignMayBorrowedAddress_.insert(namedVar.Storage);
+                    else
+                        compiler->globalAssignMayBorrowedAddress_.erase(namedVar.Storage);
                 }
                 // Retire the declaration-time "someone else frees this" facts about a POINTER
                 // binding that has just been pointed elsewhere - UNLESS the RHS binding proves an
@@ -8443,11 +8546,13 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     // Assignment twin of the declaration's address-of provenance: `p = &x;` makes
                     // the binding a proven borrow, any other RHS retires the fact (a stale borrow
                     // proof would be a false rejection at a later '?:' join).
+                    const auto [srcGlobalProven, srcGlobalMay] = compiler->CopyReadBorrowState(rightNV);
                     compiler->SetPointsToBorrowedAddress(
                         namedVar.CallerName,
                         compiler->IsBorrowedAddressValue(rightNV.Primary)
-                            || rightNV.PointsToBorrowedAddress,
-                        rightNV.MayPointToBorrowedAddress);
+                            || rightNV.PointsToBorrowedAddress || srcGlobalProven,
+                        rightNV.MayPointToBorrowedAddress || srcGlobalMay
+                            || compiler->JoinHasBorrowedAddressArm(rightNV.Primary));
                     compiler->SetStackCharBufferBorrow(
                         namedVar.CallerName,
                         rightNV.StackCharBufferBorrow,
@@ -12600,6 +12705,17 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 return finishStore(toStore);
             }
 
+            // `b = d;` into a trivially copyable C++ base: copy d's base subobject (clang's
+            // trivial copy assignment binds `const B&` to it).
+            if (operatorText == "=" && right != nullptr && right->getType()->isStructTy()
+                && !namedVar.TypeAndValue.Pointer && !rightNV.TypeAndValue.Pointer
+                && compiler->IsCxxTriviallyCopyableRecord(namedVar.TypeAndValue.TypeName)
+                && compiler->IsCxxDerivedToBaseValue(rightNV.TypeAndValue,
+                       LLVMBackend::TypeAndValue{ .TypeName = namedVar.TypeAndValue.TypeName },
+                       &rightNV))
+                if (auto* sliced = compiler->LoadCxxTrivialBaseCopy(rightNV, right,
+                        namedVar.TypeAndValue.TypeName, /*assignment*/ true))
+                    right = sliced;
             auto* assignResult = derefAssign(right, rhsUnsigned);
             if (operatorText == "=" && right != nullptr && right->getType()->isStructTy()
                 && !namedVar.TypeAndValue.Pointer)

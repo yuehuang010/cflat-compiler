@@ -2277,6 +2277,9 @@ public:
         // Set by the front-end when this expression is the last proven use of a foreign C++
         // by-value parameter. Transient call-site metadata; never cache-serialized.
         bool CxxParamLastUse = false;
+        // The last bare use of a by-value parameter / local whose copy-init clang refuses
+        // (IsLastUseOfUncopyableStruct): CFlat consumes it. Transient; never cached.
+        bool UncopyableStructLastUse = false;
         // Syntactic category of a call argument, set by the front end for C++ reference binding:
         // -1 unknown, 0 not an lvalue, 1 lvalue designator, 2 call (lvalue only via a T& result),
         // 3 assignment (`i = 3`, `i += 3`). Transient call-site metadata; never cache-serialized.
@@ -2530,6 +2533,14 @@ public:
         // Canonical move path below CallerName, with compile-time array indices only.
         std::string MovePathKey;
         bool MovePathHasDynamicIndex = false;
+        /*
+         * Past the FIRST dynamic index (`h.arr[i].p`): the MovePathKey of the indexed array
+         * (`arr`), its extent (0 = unknown, or a second dynamic index) and the static path below
+         * the element (`.p`). A dynamic-index store records every element's slot from these.
+         */
+        std::string MovePathDynamicPrefix;
+        std::string MovePathDynamicSuffix;
+        int MovePathDynamicExtent = 0;
         // The lock-set key the guarded-field READ check matched for this access, keyed on the
         // canonical receiver path ("o.inner.mtx"). Empty when the field is unguarded or the
         // receiver was not a plain path - the write check then falls back to GuardLockKey.
@@ -4011,6 +4022,9 @@ private:
     // its pointee, so it is positive proof of a borrow. Live compile-time state keyed by
     // llvm::Value identity - never part of the --init cache round-trip.
     llvm::DenseSet<llvm::Value*> borrowedAddressValues_;
+    // May-borrow twin: a field / element slot READ whose slot holds a recorded borrow (`h.p` after
+    // `h.p = &x;`), so a `?:` / `??` arm keeps the fact. Each read is its own load (never a constant).
+    llvm::DenseSet<const llvm::Value*> slotReadMayBorrowValues_;
     std::vector<llvm::Value*> movedBorrowedThroughFieldValues_;
 
     // '?:' joins of an OWNING-VALUE STRUCT whose arms did not all provably own, keyed by value
@@ -4584,6 +4598,13 @@ private:
     // Twin of globalAssignBorrowOrigin_ for `g = &x;` - an address-of RHS names no origin
     // binding, so the fact is a plain set. Same per-function lifetime and the same rationale.
     std::unordered_set<const llvm::Value*> globalAssignBorrowedAddress_;
+    // May-borrow twin (`g = c ? u : &x;`): read only by MoveSourceIsAddressBorrow, never by delete,
+    // whose wording claims a PROVEN address-of. Same per-function lifetime.
+    std::unordered_set<const llvm::Value*> globalAssignMayBorrowedAddress_;
+    // NoteBraceSlotBorrow ledgers (one declaration's lifetime).
+    std::vector<std::pair<const llvm::Value*, std::string>> braceSlotBorrows_;
+    std::unordered_map<const llvm::Value*, std::pair<const llvm::Value*, std::string>>
+        braceSlotParents_;
     std::unordered_map<std::string, StructData> dataStructures;
 
     // Maps annotation name -> field names declared in its body (empty vector = no-arg annotation).
@@ -5313,6 +5334,8 @@ private:
         std::unordered_set<const llvm::Value*> entryAssigned;
         std::unordered_set<const llvm::Value*> exitAssignedIntersection;
         std::unordered_set<const llvm::Value*> borrowedContinueStorages;
+        // Sources that may hold an address borrow on some `continue` edge (LoopSinkSourceMayBorrowAddress).
+        std::unordered_set<const llvm::Value*> mayBorrowContinueSources;
         std::unordered_map<const llvm::Value*, std::string> borrowedExitSources;
         bool isDoWhile = false;
         bool hasIncrement = false;
@@ -5518,6 +5541,8 @@ private:
     std::unordered_set<std::string> cxxVariadicCtorRequestsInProgress_;
     // `X&& r = source;` verdicts from clang, keyed "<source param spelling>|<X spelling>".
     std::unordered_map<std::string, std::pair<bool, std::string>> cxxRvalueRefBindVerdicts_;
+    // CFlat-callee copy-init verdicts through a C++ ctor template, keyed "<source>|<target>|<cv>".
+    std::unordered_map<std::string, bool> cflatParamCtorTemplateVerdicts_;
     void RememberCxxDefaultWrapper(const std::string& owner, const std::string& linkage,
                                   size_t arity, bool member);
     bool EnsureCxxDefaultWrapper(const std::string& name);
@@ -5690,6 +5715,7 @@ private:
         bool moveAssignBindsConstRef = false;
         bool moveAssignConstSourceBindsConstRef = false;
         uint8_t assignRefusedMask = 0;   // cflat_cinterop::CxxAssignRefused bits
+        uint16_t copyCtorRefusedMask = 0;   // cflat_cinterop::CxxCopyCtorRefused bits
         bool isAggregate = false;
         std::vector<cflat_cinterop::RawCxxCtorTemplate> ctorTemplates;
         std::vector<cflat_cinterop::RawCxxMember> members;
@@ -7109,6 +7135,8 @@ private:
     // Ledger a pointer value ADDRESS-OF produced (see borrowedAddressValues_).
     void RegisterBorrowedAddressValue(llvm::Value* value);
     bool IsBorrowedAddressValue(llvm::Value* value) const;
+    // A slot read (`h.p`, `a[0]`) whose slot may hold a borrow: ledger its loaded value.
+    void NoteSlotReadBorrowValue(const NamedVariable& read, llvm::Value* value);
     /*
      * Positive borrow proof for one '?:' arm: the arm value is an address-of result, or it was
      * loaded from a BINDING the front end already knows borrows (a non-move pointer parameter, an
@@ -7123,6 +7151,20 @@ private:
      * answer false. Borrowed-parameter sources keep their existing per-destination handling.
      */
     bool MoveSourceIsAddressBorrow(const NamedVariable& source) const;
+    /*
+     * A '?:' / '??' pointer join with at least ONE leaf arm that is a proven address borrow (an
+     * address-of value, a stack/global address, or a load off a slot whose binding may hold one).
+     * A may-borrow fact like a branch rebind: whatever the other arms hold, a `move` of the join
+     * may adopt storage nobody heap-allocated. Null arms are neutral; a non-join answers false.
+     */
+    bool JoinHasBorrowedAddressArm(const llvm::Value* joined) const;
+    // A pointer READ copied into another slot carries its source's ledger: a whole global
+    // (`NS* q = gp;`, per-function global ledger) or a field / element slot (`q = h.p`, may only).
+    // first = proven address-of, second = may-borrow (either record).
+    std::pair<bool, bool> CopyReadBorrowState(const NamedVariable& source) const;
+    // A plain pointer binding (no field, not a view) that may hold an address borrow - the loop
+    // back-edge / exit sink checks treat it as a borrowed source, like IsBorrowed.
+    static bool LoopSinkSourceMayBorrowAddress(const NamedVariable& live);
     // A field path last stored from an address-of value on some path (SetFieldBorrowedAddress).
     bool FieldHoldsBorrowedAddress(const NamedVariable& field) const;
     // By-value unique<T> operands are loaded before the transfer nulls their sources; a later
@@ -9242,6 +9284,7 @@ public:
         std::unordered_map<const llvm::Value*, llvm::Value*> movedOutSourceSlots;
         std::vector<std::pair<llvm::Value*, std::string>> movedBorrowedPtrValues;
         llvm::DenseSet<llvm::Value*> borrowedAddressValues;
+        llvm::DenseSet<const llvm::Value*> slotReadMayBorrowValues;
         std::vector<llvm::Value*> movedBorrowedThroughFieldValues;
         std::vector<llvm::Value*> nonOwningStructJoins;
         std::vector<std::pair<const llvm::Value*, UniqueFieldReadSource>> uniqueFieldReadValues;
@@ -9250,6 +9293,10 @@ public:
         std::vector<llvm::Value*> aliasTransferResults;
         std::vector<AliasReturnTempSlot> aliasReturnTempSlots;
         std::vector<llvm::Value*> tempFieldValues;
+        // Per-function global ledgers: a nested emission's function entry clears them.
+        std::unordered_map<const llvm::Value*, std::string> globalAssignBorrowOrigin;
+        std::unordered_set<const llvm::Value*> globalAssignBorrowedAddress;
+        std::unordered_set<const llvm::Value*> globalAssignMayBorrowedAddress;
     };
 
     BuilderState SaveBuilderState();
@@ -9358,6 +9405,29 @@ public:
                                                     bool includeDepthMismatch = true) const;
     void RejectImplicitIntegerPointeePointerConversion(const TypeAndValue& from,
                                                         const TypeAndValue& to);
+    // Store rule twin of the call rule: a native struct pointee never converts implicitly to a
+    // DIFFERENT native struct or a primitive pointee, nor back. A C++ record pointee converts
+    // only to itself or along a proven base route (PTRSAFE owns those); `cxxRecordArmOnly`
+    // answers just the arms with a C++ record side.
+    bool IsImplicitUnrelatedStructPointeeConversion(const TypeAndValue& from,
+                                                    const TypeAndValue& to,
+                                                    bool cxxRecordArmOnly = false) const;
+    // A STORE of `from` into a `to` slot (init, assign, field / element, return): both rules above.
+    void RejectImplicitPointeePointerStore(const TypeAndValue& from, const TypeAndValue& to);
+    static TypeAndValue DecayedPointeeSource(const TypeAndValue& from, const TypeAndValue& to);
+    // A one-dimensional fixed array as the pointer it decays to (`D*[2]` -> `D**`, `D[2]` ->
+    // `D*`); any other shape is returned as is.
+    static TypeAndValue ArrayDecayedPointer(const TypeAndValue& value);
+    // A multi-dimensional array's row (`arr[1]`: no leading size, inner dimensions) as `T[N]`.
+    static TypeAndValue RowAsFixedArray(const TypeAndValue& row);
+    // `B* = D[2][2]` (D a C++ class other than B): the array decays to a row pointer, refused.
+    bool IsCxxMultiDimArrayClassPointerConversion(const TypeAndValue& dest,
+                                                  const TypeAndValue& src) const;
+    bool RejectCxxMultiDimArrayClassPointerStore(const TypeAndValue& dest, const TypeAndValue& src,
+                                                 const std::string& destDesc);
+    // A call argument as the pointer it decays to; an unnamed fixed array of a C++ class takes
+    // the class from its IR array type.
+    TypeAndValue CxxArrayArgumentPointer(const NamedVariable& arg, llvm::Value* value) const;
     std::string ImplicitIntegerPointeeConversionText(const TypeAndValue& from,
                                                      const TypeAndValue& to) const;
     // Call matching: the predicate above on the pointers a C++ argument / parameter refer to.
@@ -10670,7 +10740,7 @@ public:
     // slot-picking arms so a second same-arity overload cannot turn a clean error into a miscompile.
     bool DiagnoseProvableInterfaceArgMismatch(const std::string& ifaceName,
         const std::string& methodName, const std::vector<NamedVariable>& args,
-        const std::vector<TypeAndValue>& params);
+        const std::vector<TypeAndValue>& params, bool reportPointee = true);
 
     /*
      * Pick the vtable slot for an interface call by visible overload and conversion rank. A
@@ -11833,8 +11903,15 @@ public:
      * subobject so the stored pointer really points at a `dest`. Returns `value` untouched when no
      * conversion applies, and reports when the base exists but is not public.
      */
+    // A compare of a derived and a base C++ class pointer converts the derived side first, as
+    // clang does (offset adjust; a virtual or ambiguous route goes through clang).
+    void AdjustCxxClassPointerCompare(const TypeAndValue& lhs, llvm::Value*& lhsValue,
+                                      const TypeAndValue& rhs, llvm::Value*& rhsValue);
     llvm::Value* AdjustCxxPointerForStore(const TypeAndValue& dest, const TypeAndValue& src,
                                           llvm::Value* value, const std::string& destDesc);
+    // [expr.eq]/[conv.qual]: a multi-level pointer compare across two classes of one C++
+    // hierarchy (`D** == B**`) has no composite type, like the store form. LogError when so.
+    void RejectCxxClassPointerCompare(const TypeAndValue& lhs, const TypeAndValue& rhs);
     /*
      * The implicit class-pointer conversions clang refuses at a store: base -> derived (`D* = B*`)
      * and a multi-level pointer to a different class of the same hierarchy (`B** = D**`, no
@@ -11842,6 +11919,10 @@ public:
      */
     bool RejectCxxClassPointerStore(const TypeAndValue& dest, const TypeAndValue& src,
                                     const std::string& destDesc);
+    // [conv.ptr]/[class.derived]: `base` reached from `derived` through more than one non-virtual
+    // subobject; a by-value / reference conversion is then ill-formed. LogError and true when so.
+    bool IsCxxAmbiguousBase(const std::string& derived, const std::string& base) const;
+    bool RejectCxxAmbiguousBaseConversion(const std::string& derived, const std::string& base);
     /*
      * An explicit `(T*)p` between C++ class pointers is static_cast when the classes are related:
      * an upcast adds the base offset, a downcast subtracts it (null stays null); an ambiguous or
@@ -11882,6 +11963,9 @@ public:
      * legal to hold through a pointer and illegal to construct, copy or name a member of.
      */
     bool RejectUnsupportedCxxLayout(const std::string& typeName);
+    // The same refusal reached from an LLVM storage type: peels fixed-array dimensions and names
+    // the refused C++ class when the element is its unsized shell. False for any other type.
+    bool RejectUnsizedCxxLayout(llvm::Type* type);
     // Refuse creating an ABSTRACT C++ class: it has an unoverridden pure virtual member, so no
     // complete object of it can exist.
     bool RejectAbstractCxxClass(const std::string& typeName, const char* what);
@@ -12165,6 +12249,20 @@ public:
                                          const TypeAndValue& param,
                                          bool cxxByValueParam = false,
                                          bool allowTemplateClassConversion = false);
+    // A CFlat callee's by-value C++ class parameter copy-initialized from a different C++ class
+    // value through a ctor template clang alone can see (`take(a + b)` into `Vec3(const VecBase<D>&)`).
+    bool CflatClassParamCopyInitsByCtorTemplate(const NamedVariable& arg, const TypeAndValue& param);
+    // The base subobject of a derived C++ value, loaded as a `baseType` value (null: no unique,
+    // accessible base).
+    llvm::Value* LoadCxxBaseSubobject(const NamedVariable& source, llvm::Value* value,
+                                      const std::string& baseType);
+    // LoadCxxBaseSubobject when the base's copy member is the implicit trivial public one; an
+    // ambiguous base is refused (logged, `value` returned).
+    llvm::Value* LoadCxxTrivialBaseCopy(const NamedVariable& source, llvm::Value* value,
+                                        const std::string& baseType, bool assignment);
+    bool CxxSliceKeepsMove(const std::string& baseType) const;
+    bool SelectsCxxNonCopyCtorForDerived(const std::string& baseType, const NamedVariable& arg,
+                                         const TypeAndValue& derivedType, bool allowScalarNarrowing);
     // `intoSlot` non-null: construct straight into that slot (a declared local, a return slot)
     // instead of an owned end-of-statement temporary.
     bool MaterializeImplicitCxxClassArgument(NamedVariable& arg,
@@ -12883,6 +12981,33 @@ public:
     std::string CxxSameClassAssignmentRefusal(const std::string& typeName, uint8_t kinds);
     // The extractor's verdict alone: clang refuses a same-class `dst = src` for every one of `kinds`.
     bool CxxSameClassAssignmentRefused(const std::string& typeName, uint8_t kinds) const;
+    // Clang refuses the same-class copy-init of trivially copyable imported class `typeName` from
+    // a (const) lvalue or, `rvalue`, an xvalue: which constructor refused it and why (None: usable).
+    enum class CxxCopyCtorFault { None, CopyDeleted, CopyInaccessible, CopyExplicit, MoveDeleted,
+                                  MoveInaccessible, MoveExplicit };
+    CxxCopyCtorFault CxxTrivialCopyCtorRefusal(const std::string& typeName, bool constSource,
+                                               bool rvalue) const;
+    // A CFlat struct whose implicit member-wise copy clang would define as deleted: the by-value
+    // trivially copyable C++ class field (nested CFlat structs walked) whose copy is refused.
+    bool FindUncopyableCxxField(const std::string& typeName, bool constSource, std::string& fieldPath,
+                                std::string& fieldType, CxxCopyCtorFault& fault) const;
+    // A CFlat struct with no usable move: some field's member-wise move is refused (its implicit
+    // move is deleted) and its const copy fallback is too - that copy's blocking field is returned.
+    bool FindUnmovableCxxStruct(const std::string& typeName, std::string& fieldPath,
+                                std::string& fieldType, CxxCopyCtorFault& fault) const;
+    // is_copyable(T) of a CFlat struct: false when a by-value NONTRIVIAL C++ class field has no usable
+    // copy ctor (its synthesized copy cannot be emitted). Trivial fields keep FindUncopyableCxxField.
+    bool HasUncopyableCxxField(const std::string& typeName) const;
+    bool HasCxxRecords() const { return !cxxRecordEntries_.empty(); }
+    // Where a copy-init lands, for CxxCopyInitRefusal's message: local `name`, parameter `name` of
+    // `owner`, the return slot, element `name` of `owner`, field `name`.
+    enum class CxxCopyInitSite { Local, Parameter, ReturnSlot, Element, Field };
+    // Clang's refusal of a copy-init at `site` from a (const) lvalue, or `rvalue` (implicit move),
+    // of `typeName`: a trivially copyable C++ class or a CFlat struct holding one by value.
+    // Localized message, empty when the copy is usable.
+    std::string CxxCopyInitRefusal(const std::string& typeName, bool constSource, bool rvalue,
+                                   CxxCopyInitSite site, const std::string& name = {},
+                                   const std::string& owner = {}) const;
     // A by-value C++ class field (nested CFlat structs walked) whose same-class assignment clang
     // refuses for every one of `kinds`: its dotted path and C++ type, false when there is none.
     bool FindUnassignableCxxField(const std::string& typeName, uint8_t kinds,
@@ -13761,13 +13886,49 @@ public:
     void SetPointsToBorrowedAddress(const std::string& name, bool value, bool mayValue);
     // Field twin keyed on FieldMoveKey; an empty path retires every field fact of the binding.
     void SetFieldBorrowedAddress(const std::string& name, const std::string& path, bool value);
+    // Whether slot `path` of `root` is tracked at all (an element path needs a fixed-array root).
+    static bool SlotPathTrackedOn(const NamedVariable& root, const std::string& path);
+    /*
+     * A dynamic-index store (`a[i] = px;`, `h.arr[i] = px;`) of a value that may borrow: every
+     * element under `prefix` may now hold it (marker `prefix[*`). It never retires a fact.
+     */
+    // `structFacts`: a whole named struct stored (`a[i] = h;`) lands its facts under each element.
+    void NoteDynamicSlotBorrow(const std::string& name, const NamedVariable& slot,
+        const std::unordered_set<std::string>* structFacts);
+    // Borrow-ledger key of a slot: FieldMoveKey, plus member-array elements (`arr[0]`).
+    static std::string BorrowSlotKey(const NamedVariable& nv);
+    /*
+     * Ledger markers beside plain slot paths: `arr[*` (a dynamic store may have put a borrow in any
+     * element), `arr[0]#` (a later static store owns that element), `arr[!` (the member array
+     * decayed, its elements are no longer tracked). Overrides join by intersection.
+     */
+    static bool SlotPathEscaped(const NamedVariable& root, const std::string& path);
+    static bool SlotPathUnderDynamicMarker(const NamedVariable& root, const std::string& path);
+    static void MergeBorrowedAddressFields(std::unordered_set<std::string>& into,
+        const std::unordered_set<std::string>& other);
     // `&name` escaped: retire and stop recording its field facts.
     void MarkFieldFactsEscaped(const std::string& name);
+    // A whole fixed array read where it decays (call argument, `T** p = a;`): its element slots
+    // can now be written through that alias, so its slot facts escape like `&h`.
+    void NoteWholeArrayAliasRead(const NamedVariable& source);
     // Whole-struct copy `g = h` / `H g = h`: the destination inherits the source's field facts.
     void CopyFieldBorrowedAddresses(const std::string& destination, const std::string& source);
     // `o.h = h`: h's facts land on o under `prefix.` (prefix = FieldMoveKey of the stored field).
     void CopyFieldBorrowedAddressesUnder(const std::string& destination, const std::string& prefix,
         const std::string& source);
+    // A stored pointer value that may hold an address borrow (`&x`, a borrowed binding or slot,
+    // a join with a borrowed arm) - the field / element / brace store doors record it.
+    bool StoredValueMayBorrowAddress(const NamedVariable& value) const;
+    /*
+     * Brace-init twin of the field / element door, for one declaration: a borrowed value stored
+     * into slot `path` of `destination` is parked; a nested brace destination links to its parent
+     * slot; ApplyBraceSlotBorrows lands the facts whose root is the binding's storage, then clears.
+     */
+    void NoteBraceSlotBorrow(const llvm::Value* destination, const std::string& path);
+    void NoteBraceNestedSlot(const llvm::Value* child, const llvm::Value* parent,
+        const std::string& path);
+    void ApplyBraceSlotBorrows(const std::string& name);
+    void ClearBraceSlotBorrows();
     // Record/retire provenance that a char pointer or string borrows a current-frame buffer.
     void SetStackCharBufferBorrow(const std::string& name, bool value,
                                   const std::string& source, size_t scopeDepth);
@@ -14147,6 +14308,7 @@ public:
             bool BorrowsOwningLocal = false;
             bool OwningLocalBorrowAfterRebind = false;
             bool PointerRebound = false;
+            bool MayPointToBorrowedAddress = false;
             llvm::Value* OwningLocalStorage = nullptr;
             std::string BorrowedOrigin;
             std::string BorrowedUniqueField;

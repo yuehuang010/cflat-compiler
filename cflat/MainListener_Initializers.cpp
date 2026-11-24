@@ -1242,7 +1242,9 @@ bool MainListener::EmitOneFieldInit(
                 SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = typeName }), fieldName));
             return false;
         }
-        compiler->RejectImplicitIntegerPointeePointerConversion(rightNV.TypeAndValue, fieldType);
+        // A named field initializer copy-initializes the field: an lvalue needs a usable copy ctor.
+        if (RejectUnusableFieldCopy(errCtx, rightNV, fieldType, fieldName)) return false;
+        compiler->RejectImplicitPointeePointerStore(rightNV.TypeAndValue, fieldType);
         if ((fieldType.TypeName == "string" || fieldType.TypeName == "string_view")
             && !fieldType.Pointer
             && RejectStackCharBufferEscape(rightNV, errCtx))
@@ -1271,6 +1273,10 @@ bool MainListener::EmitOneFieldInit(
         RejectConstRecordPointeeStore(errCtx, fieldType, rightNV, "field", fieldName);
 
         RejectRawHeapArrayIntoUniqueField(rightNV, fieldType, fieldName, errCtx);
+        // `H h = { .p = px }`: brace twin of the `h.p = px;` borrow door (landed per declaration).
+        if (fieldType.Pointer && !fieldType.IsArrayView && fieldType.ConstArraySize == 0
+            && compiler->StoredValueMayBorrowAddress(rightNV))
+            compiler->NoteBraceSlotBorrow(structPtr, fieldName);
 
         // Brace leg of the code-value store gate. This is a SEPARATE lowering path from the `=`
         // assignment site, so `h.p = w` being rejected says nothing about `Holder h = { p = w }`.
@@ -1958,7 +1964,9 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
             LogErrorContext(ae, std::format("incompatible function pointer initializer: {}", why));
         // A field default initializer is a field store (`cppi.CrPair* p = &crConst;` is refused).
         RejectConstRecordPointeeStore(ae, field, nv, "field", field.VariableName);
-        compiler->RejectImplicitIntegerPointeePointerConversion(nv.TypeAndValue, field);
+        compiler->RejectImplicitPointeePointerStore(nv.TypeAndValue, field);
+        // `struct W { X d = g; }` copy-initializes the field from `g` at every construction.
+        RejectUnusableFieldCopy(ae, nv, field, field.VariableName);
         llvm::Value* val = LoadNamedVariable(nv);
         // A scalar initializer of a C++ class field (`IntC c = 5;`) is a converting constructor
         // call, the same one a local `IntC c = 5;` makes; a plain store would leave the field unset.
@@ -2790,6 +2798,46 @@ void MainListener::RejectNewPointerSlotDepthMismatch(
             SpellType(*compiler, source), SpellType(*compiler, target)));
     }
 
+bool MainListener::RejectUnusableFieldCopy(antlr4::ParserRuleContext* ctx,
+        const LLVMBackend::NamedVariable& source, const LLVMBackend::TypeAndValue& field,
+        const std::string& fieldName) {
+        auto* compiler = Compiler(ctx);
+        if (field.Pointer || field.ElemPointer || field.IsArrayView || field.IsAlias
+            || field.ConstArraySize != 0 || source.TypeAndValue.Pointer
+            || source.TypeAndValue.ConstArraySize != 0
+            || ((source.IsRvalue || source.Storage == nullptr) && !source.IsExplicitMove)
+            || compiler->ResolveTypeAlias(source.TypeAndValue.TypeName)
+                != compiler->ResolveTypeAlias(field.TypeName))
+            return false;
+        // `f = move s` / a consumed last use move-constructs the field.
+        const bool moved = source.IsExplicitMove || source.UncopyableStructLastUse;
+        const std::string why = compiler->CxxCopyInitRefusal(field.TypeName,
+            !moved && compiler->CxxConstReceiverKind(source) != 0, moved,
+            LLVMBackend::CxxCopyInitSite::Field, fieldName);
+        if (why.empty()) return false;
+        LogCopyInitRefusalContext(compiler, ctx, why);
+        return true;
+}
+
+bool MainListener::RejectUnusableElementCopy(antlr4::ParserRuleContext* ctx,
+        const LLVMBackend::NamedVariable& source, const LLVMBackend::TypeAndValue& element,
+        size_t index, const std::string& arrayName) {
+        auto* compiler = Compiler(ctx);
+        if (element.Pointer || element.ElemPointer || element.IsArrayView || source.TypeAndValue.Pointer
+            || ((source.IsRvalue || source.Storage == nullptr) && !source.IsExplicitMove)
+            || compiler->ResolveTypeAlias(source.TypeAndValue.TypeName)
+                != compiler->ResolveTypeAlias(element.TypeName))
+            return false;
+        // `{ move s }` / a consumed last use move-constructs the element.
+        const bool moved = source.IsExplicitMove || source.UncopyableStructLastUse;
+        const std::string why = compiler->CxxCopyInitRefusal(element.TypeName,
+            !moved && compiler->CxxConstReceiverKind(source) != 0, moved,
+            LLVMBackend::CxxCopyInitSite::Element, std::to_string(index), arrayName);
+        if (why.empty()) return false;
+        LogCopyInitRefusalContext(compiler, ctx, why);
+        return true;
+}
+
 bool MainListener::RejectConstDiscardingConversion(
     antlr4::ParserRuleContext* ctx, const LLVMBackend::NamedVariable& source, llvm::Value* value,
     const LLVMBackend::TypeAndValue& target) {
@@ -3268,6 +3316,7 @@ void MainListener::EmitFieldInitializer(
                         && !compiler->IsCxxRecord(nestedField.TypeName)
                         && explicitNoArgConstructors_.count(nestedField.TypeName) == 0;
                     suspendCompletedObject(nullptr, &fieldName, nestedDestination);
+                    compiler->NoteBraceNestedSlot(nestedDestination, structPtr, fieldName);
                     const bool builtFresh = nestedFresh && EmitFreshBraceInitializeAggregate(
                         nestedDestination, nestedField.TypeName, nested, true);
                     if (builtFresh)
@@ -4297,8 +4346,13 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                     }
                 }
                 else
+                {
+                    if (!multidim)
+                        compiler->NoteBraceNestedSlot(braceElemPtr, arrAlloc,
+                            "[" + std::to_string(i) + "]");
                     EmitBraceElementIntoFixedSlot(braceElemPtr, elemStructTy, tv.TypeName, fi,
                                                   rejectFrameBoundReferences);
+                }
                 continue;
             }
             auto* assignment = fi->assignmentExpression(0);
@@ -4444,7 +4498,10 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
             llvm::Value* val = LoadNamedVariable(nv);
             if (!val) continue;
 
-            compiler->RejectImplicitIntegerPointeePointerConversion(nv.TypeAndValue, fixedElemTV);
+            if (RejectUnusableElementCopy(fi, nv, fixedElemTV, i, name))
+                continue;
+
+            compiler->RejectImplicitPointeePointerStore(nv.TypeAndValue, fixedElemTV);
 
             if (RejectImplicitPrimitiveToPointer(
                     fi, fixedElemTV, nv, val, "brace-initialize",
@@ -4506,6 +4563,10 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                     /*intoFreshSlot*/ true);
                 continue;
             }
+            // `T*[2] a = { px, ... }`: element twin of the `a[0] = px;` borrow door.
+            if (!multidim && fixedElemTV.Pointer && !fixedElemTV.IsArrayView
+                && compiler->StoredValueMayBorrowAddress(nv))
+                compiler->NoteBraceSlotBorrow(arrAlloc, "[" + std::to_string(i) + "]");
             ConsumeOwningBraceElementSource(nv, val, elemPtr, fixedElemTV, tv.TypeName, fi);
             // Update mode: the element is live (the aggregate's constructor built it), so destroy
             // it before the store, as the braced override does. val is already an owned value.
@@ -5186,7 +5247,7 @@ void MainListener::EmitGlobalFixedArrayInit(
                                 ? &globalElemTV : compiler->GetEncodedClosureType(globalElemTV.TypeName);
                             gclo && gclo->IsThinFnPtr() && !globalElemTV.Pointer)
                             val = compiler->BareFunctionToThinValue(val, gclo);
-                        compiler->RejectImplicitIntegerPointeePointerConversion(nv.TypeAndValue, globalElemTV);
+                        compiler->RejectImplicitPointeePointerStore(nv.TypeAndValue, globalElemTV);
                         RejectConstDiscardingConversion(fi, nv, val, globalElemTV);
                         val = compiler->AdjustCxxPointerForStore(globalElemTV, nv.TypeAndValue, val,
                             std::format("element {} of '{}'", leafIndices[i], name));
@@ -5423,7 +5484,7 @@ void MainListener::EmitGlobalFixedArrayInit(
                             return nullptr;
                         if (value != nullptr)
                         {
-                            compiler->RejectImplicitIntegerPointeePointerConversion(nv.TypeAndValue, fieldTV);
+                            compiler->RejectImplicitPointeePointerStore(nv.TypeAndValue, fieldTV);
                             RejectConstDiscardingConversion(fieldInit, nv, value, fieldTV);
                             fieldValue = foldGlobalInteger(value);
                         }
@@ -5488,7 +5549,7 @@ void MainListener::EmitGlobalFixedArrayInit(
                         ? &globalElemTV : compiler->GetEncodedClosureType(globalElemTV.TypeName);
                     gclo && gclo->IsThinFnPtr() && !globalElemTV.Pointer)
                     val = compiler->BareFunctionToThinValue(val, gclo);
-                compiler->RejectImplicitIntegerPointeePointerConversion(nv.TypeAndValue, globalElemTV);
+                compiler->RejectImplicitPointeePointerStore(nv.TypeAndValue, globalElemTV);
                 RejectConstDiscardingConversion(fi, nv, val, globalElemTV);
                 val = compiler->AdjustCxxPointerForStore(globalElemTV, nv.TypeAndValue, val,
                                                          std::format("element {} of '{}'", i, name));
@@ -6197,6 +6258,8 @@ void MainListener::EmitArrayViewInferredInit(
                     "incompatible function pointer initializer: {}", why));
             llvm::Value* val = LoadNamedVariable(nv);
             if (!val) continue;
+            if (RejectUnusableElementCopy(fi, nv, elemTV, i, name))
+                continue;
 
             if (RejectImplicitPrimitiveToPointer(
                     fi, elemTV, nv, val, "brace-initialize",

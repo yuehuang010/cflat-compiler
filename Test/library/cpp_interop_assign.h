@@ -716,3 +716,47 @@ inline Cnt mkCnt() { Cnt t; t.v = 9; return t; }
 inline int cntCounts() { return cntCopyCtor * 10000 + cntMoveCtor * 1000 + cntCopyAssign * 100
     + cntMoveAssign * 10 + cntDtor; }
 } // namespace cppopeq
+
+// SLICEPICK: a derived value into a trivially copyable base copies the base subobject only
+// through the base's usable copy member; clang refuses these.
+namespace cppslice
+{
+struct LDel : cppopeq::Del {};
+class BPrivTriv { public: int v = 5; BPrivTriv() = default; BPrivTriv(const BPrivTriv&) = default;
+    private: BPrivTriv& operator=(const BPrivTriv&) = default; };
+struct LPrivTriv : BPrivTriv {};
+struct BMoveOnly { int v = 5; BMoveOnly() {} BMoveOnly(BMoveOnly&&) = default;
+    BMoveOnly& operator=(BMoveOnly&&) = default; };
+struct LMoveOnly : BMoveOnly {};
+struct BDelCopy { int v = 5; BDelCopy() = default; BDelCopy(const BDelCopy&) = delete;
+    BDelCopy(BDelCopy&&) = default; BDelCopy& operator=(const BDelCopy&) = default; };
+struct LDelCopy : BDelCopy {};
+struct BDelMove { int v = 5; BDelMove() {} BDelMove(const BDelMove& o) : v(o.v) {}
+    BDelMove(BDelMove&&) = delete; };
+struct LDelMove : BDelMove {};
+} // namespace cppslice
+
+// CPPCOPY: a same-class copy-init of a trivially copyable class still needs clang's usable copy
+// constructor (deleted, private, implicitly deleted through a member).
+namespace cppcopy
+{
+class PrivCopy { public: int v = 5; PrivCopy() = default; private: PrivCopy(const PrivCopy&) = default; };
+struct HoldDelCopy { cppslice::BDelCopy f; int w = 4; };
+inline int TakeDelCopy(cppslice::BDelCopy b) { return b.v; }
+struct UserDelMove { int v = 5; UserDelMove() = default; UserDelMove(const UserDelMove&) = default;
+    UserDelMove(UserDelMove&&) = delete; };
+// CPPCOPY2: copy-init never uses an explicit copy constructor.
+struct ExplCopy { int v = 5; ExplCopy() = default; explicit ExplCopy(const ExplCopy&) = default; };
+struct ExplCopyMove { int v = 5; ExplCopyMove() = default; explicit ExplCopyMove(const ExplCopyMove&) = default;
+    ExplCopyMove(ExplCopyMove&&) = default; };
+inline int TakeExplCopy(ExplCopy b) { return b.v; }
+} // namespace cppcopy
+
+// CPPCOPY3: a deleted copy ctor with no move ctor (an xvalue falls back to the deleted copy).
+namespace cppcopy3
+{
+struct DelNoMove { int v = 5; DelNoMove() = default; DelNoMove(const DelNoMove&) = delete;
+    DelNoMove& operator=(const DelNoMove&) = default; };
+class PrivMove { public: int v = 5; PrivMove() = default; PrivMove(const PrivMove&) = default;
+    private: PrivMove(PrivMove&&) = default; };
+} // namespace cppcopy3

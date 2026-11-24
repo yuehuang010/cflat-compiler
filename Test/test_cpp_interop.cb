@@ -281,6 +281,7 @@ int t74StaticLocalArray()
 import cpp {"library/t25_csurface.hpp", "library/cpp_t14_template_functor.hpp", "library/cpp_t22_constrained_members.hpp"};
 import cpp "library/cpp_interop_demand_fail.h";
 import cpp {"library/cpp_interop_anon.h", "library/cpp_interop_explicit.h", "library/cpp_t496_ctorf2i.hpp", "library/cpp_t253_brace_move.hpp", "library/cpp_t261_named_unwind.hpp", "library/cpp_t470_braceunwind.hpp", "library/cpp_interop_refgate.h"};
+import cpp "library/cpp_joinarg.h";
 import cpp "library/cpp_interop_basic.cpp";
 import cpp {"library/cpp_interop_member_shadow.h", "library/cpp_interop_twin.h", "library/cpp_t24_argconv.hpp", "library/cpp_t35_ownerexpr.hpp", "library/cpp_t42_convref.hpp", "library/cpp_t48_nullptr.hpp", "library/cpp_t52_refnull.hpp", "library/cpp_t111_nullptr_t.hpp", "library/cpp_t98_macro_constant.hpp", "library/cpp_t98_macro_ref.hpp", "library/cpp_t28_fwdref.hpp", "library/cpp_t525_fnwrap_r3.hpp", "library/t84_conversion.hpp", "library/cpp_t27_ptrdiff.hpp", "library/cpp_interop_lastuse.h", "library/cpp_interop_refdef.hpp"};
 import cpp "library/cpp_interop_demand_fail.h";
@@ -455,6 +456,9 @@ import cpp {"cstddef", "climits", "library/cpp_grpsys.hpp"};
 import cpp {"cstddef", "library/grpsys/cpp_grpsys_sub.hpp"};
 import "list.cb";
 import "dictionary.cb";
+import "queue.cb";
+import "array.cb";
+import "hpc/btree.cb";
 import "thread.cb";
 import "malloc_allocator.cb";
 import "unique.cb";
@@ -470,6 +474,7 @@ import "diagnostic/heap_audit.cb";
 // Standard streams: one grouped std import (stringstream is not visible through a user header alone).
 import cpp {"sstream", "fstream", "iostream", "iomanip"};
 import cpp {"library/cpp_interop_stream.h", "library/cpp_interop_list.h"};
+import cpp "library/cpp_ostream_base.hpp";
 // Assignment into a live object from a temporary: instrumented, header-only.
 import cpp {"library/cpp_interop_assign.h", "library/cpp_t231_byvalue.hpp", "library/cpp_t239_ternary_byvalue.hpp", "library/cpp_t331_override.hpp", "library/cpp_interop_proxy_assign.h", "library/t29_valarray_subscript.hpp", "library/cpp_interop_refbinding.h", "library/cpp_interop_opaque_return.hpp", "library/cpp_t34_traits_static.hpp", "library/t17_empty_return.hpp", "memory", "library/cpp_t46_smartdot.hpp", "library/cpp_interop_uniqueptr.h", "library/cpp_t492_fieldmove.hpp", "library/cpp_objoin.hpp"};
 
@@ -6058,12 +6063,115 @@ PtrSafeD ptrSafeGd = default;
 PtrSafeD* ptrSafeGDown = (PtrSafeD*)(PtrSafeF*)&ptrSafeGd;
 PtrSafeF* ptrSafeGUp = (PtrSafeF*)&ptrSafeGd;
 PtrSafeF*[1] ptrSafeGArr = { &ptrSafeGd };
+// ARRDEPTH: a `PtrSafeD[2]` returned or passed as `PtrSafeF*` decays first, then adds the base
+// offset (global, field and local arrays; CFlat and C++ callees).
+PtrSafeD[2] arrDepthGObjs = default;
+struct ArrDepthHold { int k = 0; PtrSafeD[2] a = default; };
+PtrSafeF* arrDepthRet() { return arrDepthGObjs; }
+PtrSafeF* arrDepthRetField(ArrDepthHold* h) { return h->a; }
+int arrDepthTakeF(PtrSafeF* p) { return p->value; }
+// JOINARG: a row `jaGRows[1]` of a `JaD[2][2]` returned or passed as `JaB*` adds the JaB offset.
+JaD[2][2] jaGRows = default;
+JaB* jaRowRet() { return jaGRows[1]; }
+int jaCfTakeB(JaB* p) { return p->b; }
+interface IJaTake { int m(JaB* p); };
+class JaTakeImpl : IJaTake { int k = 0; int m(JaB* p) { return p->b; } };
 interface IConvPtr { int m(ConvPtrR r); int n(ConvPtrRN r); };
 class ConvPtrImpl : IConvPtr
 {
     int z = default;
     int m(ConvPtrR r) { return r.value + 40; }
     int n(ConvPtrRN r) { return r.value + 50; }
+};
+// ETARG: an expression template / class value copy-initializes a CFlat callee's by-value C++
+// class parameter through the target's ctor template (clang++ -std=c++20 values in comments).
+double EtargTake(cppi_expr.Vec3 v) { return v.v[0] + v.v[1] + v.v[2]; }
+int EtargPick(cppi_expr.Vec3 v) { return 1000 + (int)v.sum(); }
+int EtargPick(cppi_exprgap.RequiresTarget r) { return 2000 + r.value; }
+int EtargPickExact(cppi_expr.Vec3 v) { return 1; }
+int EtargPickExact(cppi_expr.ExplicitVec3 v) { return 2; }
+double EtargGeneric<T>(T k, cppi_expr.Vec3 v) { return (double)k + v.sum(); }
+int EtargTally(cppi_etarg.Tally t) { return (int)t.total; }
+double EtargTwo(cppi_expr.Vec3 x, cppi_expr.Vec3 y) { return x.sum() * 2.0 + y.sum(); }
+struct EtargTaker { int base = 0; double take(cppi_expr.Vec3 v) { return v.sum() + (double)base; } };
+interface IEtarg
+{
+    double take(cppi_expr.Vec3 v);
+    int tally(cppi_etarg.Tally t);
+    int req(cppi_exprgap.RequiresTarget r);
+};
+class EtargImpl : IEtarg
+{
+    int z = default;
+    double take(cppi_expr.Vec3 v) { return v.sum() + 1.0; }
+    int tally(cppi_etarg.Tally t) { return (int)t.total; }
+    int req(cppi_exprgap.RequiresTarget r) { return r.value; }
+};
+// A derived value into a base whose greedy ctor template clang prefers over the slicing copy.
+int EtargSlice(cppi_etarg.SliceB b) { return b.how * 10 + b.v; }
+int EtargSliceC(cppi_etarg.SliceCB b) { return b.how * 10 + b.v; }
+int EtargSliceGeneric<T>(T k, cppi_etarg.SliceB b) { return b.how * 10 + b.v + (int)k; }
+interface IEtargSlice { int take(cppi_etarg.SliceB b); int ctake(cppi_etarg.SliceCB b); };
+class EtargSliceImpl : IEtargSlice
+{
+    int z = default;
+    int take(cppi_etarg.SliceB b) { return b.how * 10 + b.v; }
+    int ctake(cppi_etarg.SliceCB b) { return b.how * 10 + b.v; }
+};
+// AmbG reaches BG twice; its greedy ctor template binds AmbG directly, so no slice is formed.
+int EtargAmbG(cppi_etarg.BG b) { return b.how * 10 + b.v; }
+int EtargAmbGGeneric<T>(T k, cppi_etarg.BG b) { return b.how * 10 + b.v + (int)k; }
+cppi_etarg.BG EtargAmbGReturn(cppi_etarg.AmbG* a) { return *a; }
+int EtargLeftBC(cppi_etarg.BC b) { return b.how * 10 + b.v; }
+int EtargLeftBP(cppi_etarg.BP b) { return b.v; }
+int EtargTakeBY(cppi_etarg.BY b) { return b.v; }
+int EtargTakeBYGeneric<T>(T k, cppi_etarg.BY b) { return b.v + (int)k; }
+// CPPCOPY: a [cpp] struct deriving a C++ class moves into it through the base subobject.
+[cpp] struct EtargCppLMv : cppi_etarg.BMv {};
+int EtargTakeBDc(cppi_etarg.BDc b) { return b.v; }
+cppi_etarg.BDc EtargBDcLocal() { cppi_etarg.BDc local = default; local.v = 8; return local; }
+cppi_etarg.HMv EtargHMvLocal() { cppi_etarg.HMv local = default; local.w = 7; return local; }
+cppi_etarg.HMv2 EtargHMv2Local() { cppi_etarg.HMv2 local = default; local.w = 9; return local; }
+// CPPCOPY2: an explicit copy ctor and a deleted-copy field leave direct-init, moves and prvalues usable.
+cppi_etarg.EXm EtargEXmLocal() { cppi_etarg.EXm local = default; local.v = 8; return local; }
+struct EtargEXHolder { cppi_etarg.EXc f = default; int z = 3; };
+struct EtargBDcHolder { cppi_etarg.BDc f = default; int z = 1; };
+EtargBDcHolder EtargBDcHolderLocal() { EtargBDcHolder local = default; local.z = 5; return local; }
+int EtargTakeBDcHolder(EtargBDcHolder h) { return h.f.v + h.z; }
+// CPPCOPY3: a deleted field move falls back to the struct's usable copy (clang).
+struct Cppcopy3UdmHost { cppcopy.UserDelMove f = default; int z = 1; };
+struct Cppcopy3EcmHost { cppcopy.ExplCopyMove f = default; int z = 1; };
+Cppcopy3UdmHost Cppcopy3UdmLocal() { Cppcopy3UdmHost local = default; local.z = 5; return local; }
+Cppcopy3UdmHost Cppcopy3UdmMoveOut() { Cppcopy3UdmHost local = default; local.z = 6; return move local; }
+int Cppcopy3TakeUdm(Cppcopy3UdmHost h) { return h.z; }
+int Cppcopy3TakeEcm(cppcopy.ExplCopyMove b) { return b.v; }
+// CPPCOPY4: a holder of a move-only class fills a queue / dictionary (its copy() stays unused),
+// a forwarded parameter moves at its last use, and `return p;` of a deleted-copy class moves.
+struct Cppcopy4UpHost { std.unique_ptr<int> p = default; int z = 0; };
+int Cppcopy4Fwd(queue<Cppcopy4UpHost>* q, Cppcopy4UpHost h, int k)
+{
+    if (k == 0) { q.enqueue(h); return 1; }
+    q.enqueue(h);
+    return 2;
+}
+cppslice.BDelCopy Cppcopy4RetDelCopy(cppslice.BDelCopy p) { return p; }
+cppi_etarg.BDc Cppcopy4RetBDc(cppi_etarg.BDc p, int k)
+{
+    if (k > 0) return p;
+    cppi_etarg.BDc t = default;
+    t.v = 9;
+    return t;
+}
+cppi_etarg.BY EtargBYReturn(cppi_etarg.LY* d) { return *d; }
+int EtargAssignBYGeneric<T>(T x) { cppi_etarg.BY b = default; b = x; return b.v; }
+struct EtargBPHolder { cppi_etarg.BP f; };
+struct EtargBMvHolder { cppi_etarg.BMv f; int z = 0; };
+interface IEtargAmbG { int take(cppi_etarg.BG b); int takeBY(cppi_etarg.BY b); };
+class EtargAmbGImpl : IEtargAmbG
+{
+    int z = default;
+    int take(cppi_etarg.BG b) { return b.how * 10 + b.v; }
+    int takeBY(cppi_etarg.BY b) { return b.v; }
 };
 
 extern int main()
@@ -19403,6 +19511,132 @@ extern int main()
     if (ptrSafeGDown != &ptrSafeGd || ptrSafeGDown->z != 1)            return 9951;
     if (ptrSafeGUp->value != 3 || ptrSafeGArr[0]->value != 3
         || (void*)ptrSafeGUp == (void*)&ptrSafeGd)                     return 9952;
+    // CPPRECPTR: a derived / base class pointer compare converts the derived side first (clang
+    // true both ways; pre-fix the raw addresses differed by PtrSafeF's offset in PtrSafeD).
+    PtrSafeF* ptrSafeCmpF = &ptrSafeD;
+    PtrSafeD* ptrSafeCmpD = &ptrSafeD;
+    if (!(ptrSafeCmpD == ptrSafeCmpF) || ptrSafeCmpF != ptrSafeCmpD
+        || ptrSafeCmpD == &ptrSafeA)                                    return 9953;
+    // ACCEPT SET (passes pre-fix too): void* and nullptr into a class pointer, an explicit
+    // cast from an unrelated pointee, same-class compares.
+    int ptrSafeRaw = 4;
+    void* ptrSafeVoid = &ptrSafeD;
+    PtrSafeD* ptrSafeFromVoid = ptrSafeVoid;
+    PtrSafeF* ptrSafeNone = nullptr;
+    PtrSafeF* ptrSafeCast = (PtrSafeF*)&ptrSafeRaw;
+    if (ptrSafeFromVoid->z != 1 || ptrSafeNone != nullptr || ptrsafe_takef(ptrSafeNone) != -1
+        || (void*)ptrSafeCast != (void*)&ptrSafeRaw || ptrSafeFromVoid != &ptrSafeD) return 9954;
+    // OSTREAM: stringstream reaches ostream through iostream past istream's virtual basic_ios;
+    // that off-route virtual base must not make the public route look inaccessible.
+    std.stringstream ostreamSs = std.stringstream();
+    std.ostream* ostreamO = &ostreamSs;
+    std.istream* ostreamI = &ostreamSs;
+    std.iostream* ostreamIo = &ostreamSs;
+    std.ios_base* ostreamIb = &ostreamSs;
+    if (ostream_at(&ostreamSs, ostreamO) != ostream_want_o(&ostreamSs)
+        || ostream_istream_at(&ostreamSs, ostreamI) != ostream_want_i(&ostreamSs)
+        || ostream_iostream_at(&ostreamSs, ostreamIo) != ostream_want_io(&ostreamSs)
+        || ostream_ios_at(&ostreamSs, ostreamIb) != ostream_want_ios(&ostreamSs))  return 9957;
+    std.ostream* ostreamO2 = nullptr;
+    ostreamO2 = &ostreamSs;
+    if (ostream_at(&ostreamSs, &ostreamSs) != ostream_want_o(&ostreamSs)
+        || ostream_at(&ostreamSs, ostreamO2) != ostream_want_o(&ostreamSs))       return 9958;
+    if (ostream_put_ref(ostreamSs, 12) != 1 || ostream_put_ptr(ostreamO, 34) != 1
+        || ostream_put_ref(*ostreamO2, 5) != 1)                                   return 9959;
+    if (ostream_text_is(ostreamSs, "12;34;5;") != 1
+        || ostream_read_int(*ostreamI) != 12)                                     return 9960;
+    // LITSUB ACCEPT SET (passes pre-fix too): same-class T** compares, nullptr, void* and an
+    // explicit (PtrSafeF**) cast stay legal; only a cross-class T** compare is refused.
+    PtrSafeD* ptrSafeCmpD2 = &ptrSafeD;
+    PtrSafeD** ptrSafePpD = &ptrSafeCmpD;
+    PtrSafeD** ptrSafePpD2 = &ptrSafeCmpD2;
+    PtrSafeF** ptrSafePpF = &ptrSafeCmpF;
+    void* ptrSafePpVoid = (void*)ptrSafePpD;
+    if (ptrSafePpD == ptrSafePpD2 || !(ptrSafePpD == ptrSafePpD) || ptrSafePpD == nullptr
+        || ptrSafePpVoid != ptrSafePpD || (PtrSafeF**)ptrSafePpD == ptrSafePpF
+        || *ptrSafePpD2 != ptrSafeCmpD)                                 return 9955;
+    // ARRDEPTH ACCEPT SET (passes pre-fix too): a same-class `T*[2]` decays to `T**` (const on
+    // the outer levels too), same-class ?: / ?? joins (an array arm too), void*, nullptr, casts.
+    int arrDepthC = 1;
+    PtrSafeD*[2] arrDepthD = default;
+    arrDepthD[1] = ptrSafeCmpD;
+    PtrSafeF*[2] arrDepthF = default;
+    arrDepthF[0] = ptrSafeCmpF;
+    PtrSafeD** arrDepthPd = arrDepthD;
+    PtrSafeF** arrDepthPf = arrDepthF;
+    (const PtrSafeD*)* arrDepthCd = arrDepthD;
+    PtrSafeD** arrDepthJoin = arrDepthC ? ptrSafePpD : ptrSafePpD2;
+    PtrSafeD** arrDepthCoal = ptrSafePpD2 ?? ptrSafePpD;
+    if (arrDepthPd[1] != ptrSafeCmpD || arrDepthPd != arrDepthD || arrDepthPf[0] != ptrSafeCmpF
+        || arrDepthCd[1] != ptrSafeCmpD || *arrDepthJoin != ptrSafeCmpD || *arrDepthCoal != ptrSafeCmpD2
+        || !((arrDepthC ? arrDepthD : ptrSafePpD) == arrDepthPd)
+        || (ptrSafePpD ?? ptrSafePpD2) != ptrSafePpD || (void*)arrDepthD != (void*)arrDepthPd
+        || arrDepthD == nullptr || (arrDepthC ? ptrSafePpD : ptrSafePpD2) == nullptr
+        || (PtrSafeF**)arrDepthD != (PtrSafeF**)arrDepthPd)             return 9961;
+    // ARRDEPTH: a `PtrSafeD[2]` decays to `PtrSafeD*` before the base conversion, so a store,
+    // `=`, compare, cast and a `?:` arm add the PtrSafeF offset; a `??` join compares as its
+    // class (clang).
+    // Pre-fix each used the raw derived address (9962 read T305R4Pad bytes as `value`).
+    PtrSafeD[2] arrDepthObjs = default;
+    PtrSafeD* arrDepthNoD = nullptr;
+    PtrSafeF* arrDepthUp = arrDepthObjs;
+    if (arrDepthUp->value != 3 || arrDepthUp != (PtrSafeF*)&arrDepthObjs[0])  return 9962;
+    PtrSafeF* arrDepthUp2 = nullptr;
+    arrDepthUp2 = arrDepthObjs;
+    if (arrDepthUp2 != (PtrSafeF*)&arrDepthObjs[0])                           return 9963;
+    if (!(arrDepthObjs == (PtrSafeF*)&arrDepthObjs[0]))                       return 9964;
+    if (((PtrSafeF*)arrDepthObjs)->value != 3)                                return 9965;
+    if (!(ptrSafeCmpF == (arrDepthNoD ?? ptrSafeCmpD))
+        || ptrSafeCmpF != (arrDepthNoD ?? ptrSafeCmpD))                       return 9966;
+    PtrSafeF* arrDepthJoinUp = arrDepthC ? arrDepthObjs : ptrSafeCmpF;
+    if (arrDepthJoinUp != (PtrSafeF*)&arrDepthObjs[0] || arrDepthJoinUp->value != 3) return 9967;
+    // Pre-fix 9968 compared unequal (the return skipped the offset), 9969 / 9970 read the pad.
+    ArrDepthHold arrDepthH = default;
+    if (arrDepthRet() != (PtrSafeF*)&arrDepthGObjs[0] || arrDepthRet()->value != 3) return 9968;
+    if (arrDepthRetField(&arrDepthH)->value != 3)                             return 9969;
+    if (arrDepthTakeF(arrDepthObjs) != 3 || ptrsafe_takef(arrDepthObjs) != 3
+        || ptrsafe_takef(arrDepthH.a) != 3 || arrDepthTakeF(arrDepthH.a) != 3) return 9970;
+    // JOINARG ACCEPT SET (passes pre-fix too): a same-class T** join argument, a nullptr arm,
+    // void*, a cast join, a depth-1 join into a base parameter, the exact T** overload.
+    int jaC = 1;
+    JaD jaD1 = default;
+    JaD jaD2 = default;
+    JaD* jaP1 = &jaD1;
+    JaD* jaP2 = &jaD2;
+    JaD* jaPn = nullptr;
+    JaD** jaDpp = &jaP1;
+    JaD** jaDpp2 = &jaP2;
+    JaD** jaDnull = nullptr;
+    if (ja_take_dpp(jaC ? jaDpp : jaDpp2) != 3 || ja_take_dpp(jaC ? jaDpp : nullptr) != 3
+        || ja_take_dpp(jaDnull ?? jaDpp) != 3 || ja_take_void(jaC ? jaDpp : jaDpp2) != 4
+        || ja_take_bpp((JaB**)(jaC ? jaDpp : jaDpp2)) != 1 || ja_ov6(jaC ? jaDpp : jaDpp2) != 1
+        || ja_take_b(jaC ? jaP1 : jaP2) != 2 || jaCfTakeB(jaC ? jaP1 : jaP2) != 2
+        || ja_ov4(jaC ? jaP1 : nullptr) != 2)                                  return 9971;
+    // JOINARG: a ?: / ?? join argument keeps its own class, so overloads rank it like clang.
+    // Pre-fix the join took the FIRST candidate's parameter class: each picked overload 1.
+    if (ja_ov2(jaC ? jaDpp : jaDpp2) != 2 || ja_ov2(jaDnull ?? jaDpp) != 2)  return 9972;
+    if (ja_ov4(jaC ? jaP1 : jaP2) != 2 || ja_ov4(jaPn ?? jaP1) != 2)          return 9973;
+    // ACCEPT SET (passes pre-fix too): a depth-1 ?? join argument still adds the JaB offset.
+    if (ja_take_b(jaPn ?? jaP1) != 2 || jaCfTakeB(jaPn ?? jaP1) != 2)        return 9974;
+    // JOINARG: a row `jaRows[1]` of a `JaD[2][2]` decays to `JaD*` before the base conversion.
+    // Pre-fix every row below used the raw derived address and read JaA.a = 1.
+    JaD[2][2] jaRows = default;
+    JaB* jaRowB = jaRows[1];
+    JaB* jaRowB2 = nullptr;
+    jaRowB2 = jaRows[1];
+    JaB* jaRowQ = &jaD1;
+    JaB* jaRowJoin = jaC ? jaRows[1] : jaRowQ;
+    if (jaRowB->b != 2 || jaRowB2->b != 2 || jaRowJoin->b != 2
+        || ((JaB*)jaRows[1])->b != 2 || jaRowB != jaRows[1])                  return 9975;
+    if (ja_take_b(jaRows[1]) != 2 || jaCfTakeB(jaRows[1]) != 2 || jaRowRet()->b != 2) return 9976;
+    // Pre-fix the row matched the unrelated JaX* overload (2).
+    if (ja_ov3(jaRows[1]) != 1 || ja_ov4(jaRows[1]) != 2)                    return 9977;
+    // JOINARG: an interface method's C++ class pointer argument moves to the base subobject like
+    // a direct call's. Pre-fix every form passed the raw JaD address (read JaA.a = 1).
+    JaTakeImpl jaTakeImpl = default;
+    IJaTake jaTake = &jaTakeImpl;
+    if (jaTake.m(jaC ? jaP1 : jaP2) != 2 || jaTake.m(jaPn ?? jaP1) != 2 || jaTake.m(jaP1) != 2
+        || jaTake.m(&jaD1) != 2 || jaTake.m(jaRows[1]) != 2)                   return 9978;
     // ACCEPT SET (passes pre-fix too): an exact `const int*` overload beats the user-defined
     // conversion, and a spelled constructor argument already converted.
     if (cppexp.conv_ip_exact(&cipK) != 2 || cppexp.conv_ip_exact(cipP) != 2)   return 2272;
@@ -26223,8 +26457,8 @@ extern int main()
     if (w13ConstGlobal.get() != 3 || w13ConstGlobalArray[0].get() != 3
         || w13ConstGlobalArray[1].get() != 3) return 8003;
     // A mutable pointer still binds to P*, and a const pointer binds to const P*.
-    cppi.CrReceiverValue* w13MutablePointer = &crTemplateLocal;
-    const cppi.CrReceiverValue* w13ConstPointer = &crTemplateLocal;
+    cppi.CrReceiverValue* w13MutablePointer = &cppi.crReceiverGlobal;
+    const cppi.CrReceiverValue* w13ConstPointer = &cppi.crReceiverGlobal;
     if (cppi.cr_take_mut(w13MutablePointer) != 7
         || cppi.cr_take_const(w13ConstPointer) != 3) return 8004;
     // CFlat const on a scalar is C++ const: the template deduces const int*, and its store is refused.
@@ -26525,6 +26759,354 @@ extern int main()
     cppi_expr.ExplicitVec3 exprExplicit = cppi_expr.ExplicitVec3(exprA + exprB);
     if (exprExplicit.sum() != 21.0) return 7463;
     if (cppi_expr.Vec3(exprA + exprB).sum() != 21.0) return 7464;
+    // ETARG: master refused every call below ("no overload matches") except the interface `req`
+    // and the `EtargPick(exprGapArg)` arm; master's interface `req` returned 5 (bytes of Expr).
+    if (EtargTake(exprA + exprB) != 21.0) return 27450;
+    if (EtargTake((exprA + exprB) + (exprA + exprB)) != 42.0) return 27451;
+    if (EtargTake(cppi_expr.Vec3.Ones()) != 3.0) return 27452;
+    {
+        cppi_exprgap.Expr exprGapArg = cppi_exprgap.Expr(5);
+        // clang picks Vec3 for the sum and RequiresTarget for the Expr; ExplicitVec3 is never viable.
+        if (EtargPick(exprA + exprB) != 1021 || EtargPick(exprGapArg) != 2105
+            || EtargPickExact(exprA + exprB) != 1) return 27453;
+    }
+    if (EtargGeneric<int>(1, exprA + exprB) != 22.0 || EtargGeneric(2, exprA + exprB) != 23.0)
+        return 27454;
+    if (EtargTwo(exprA + exprB, cppi_expr.Vec3.Ones()) != 45.0) return 27455;
+    {
+        EtargTaker etargTaker;
+        etargTaker.base = 2;
+        if (etargTaker.take(exprA + exprB) != 23.0) return 27456;
+    }
+    // clang: each Tally is built once, in place, by the template ctor (born 3, copies 0, dtors 3).
+    cppi_etarg.Tally.born = 0; cppi_etarg.Tally.copies = 0; cppi_etarg.Tally.dtors = 0;
+    if (EtargTally(exprA + exprB) != 21 || EtargTally(cppi_expr.Vec3.Ones()) != 3
+        || EtargTally(exprA) != 6) return 27457;
+    if (cppi_etarg.Tally.born != 3 || cppi_etarg.Tally.copies != 0
+        || cppi_etarg.Tally.dtors != 3) return 27458;
+    {
+        cppi_exprgap.Expr.born = 0; cppi_exprgap.Expr.dtors = 0;
+        cppi_exprgap.RequiresTarget.born = 0; cppi_exprgap.RequiresTarget.dtors = 0;
+        cppi_etarg.Tally.born = 0; cppi_etarg.Tally.copies = 0; cppi_etarg.Tally.dtors = 0;
+        int etargIfaceReq = 0;
+        int etargIfaceTally = 0;
+        double etargIfaceTake = 0.0;
+        {
+            cppi_exprgap.Expr exprGapIface = cppi_exprgap.Expr(5);
+            EtargImpl etargImpl;
+            IEtarg etargIface = etargImpl;
+            etargIfaceTake = etargIface.take(exprA + exprB);
+            etargIfaceTally = etargIface.tally(exprA + exprB);
+            etargIfaceReq = etargIface.req(exprGapIface);
+        }
+        // clang: 22 / 21 / 105; Tally 1 born, 0 copies, 1 dtor; RequiresTarget and Expr 1/1.
+        if (etargIfaceTake != 22.0 || etargIfaceTally != 21 || etargIfaceReq != 105) return 27459;
+        if (cppi_etarg.Tally.born != 1 || cppi_etarg.Tally.copies != 0 || cppi_etarg.Tally.dtors != 1
+            || cppi_exprgap.RequiresTarget.born != 1 || cppi_exprgap.RequiresTarget.dtors != 1
+            || cppi_exprgap.Expr.born != 1 || cppi_exprgap.Expr.dtors != 1) return 27460;
+    }
+    {
+        // clang: 25 (template) direct/generic/interface, 15 (copy) for the constrained base and
+        // an exact base; SliceB born 6 / dtors 6, SliceCB 3 / 3. Master gave 15 for the template rows.
+        cppi_etarg.SliceB.born = 0; cppi_etarg.SliceB.dtors = 0;
+        cppi_etarg.SliceCB.born = 0; cppi_etarg.SliceCB.dtors = 0;
+        {
+            cppi_etarg.SliceD sliceD = default;
+            cppi_etarg.SliceCD sliceCD = default;
+            cppi_etarg.SliceB sliceB = default;
+            EtargSliceImpl sliceImpl;
+            IEtargSlice sliceIface = sliceImpl;
+            if (EtargSlice(sliceD) != 25 || EtargSliceGeneric(1, sliceD) != 26
+                || sliceIface.take(sliceD) != 25) return 27461;
+            if (EtargSliceC(sliceCD) != 15 || sliceIface.ctake(sliceCD) != 15
+                || EtargSlice(sliceB) != 15) return 27462;
+        }
+        if (cppi_etarg.SliceB.born != 6 || cppi_etarg.SliceB.dtors != 6
+            || cppi_etarg.SliceCB.born != 3 || cppi_etarg.SliceCB.dtors != 3) return 27463;
+    }
+    {
+        // clang: 27 (AmbG via BG's template, v = AmbG::v 7) direct/interface/init/return/C++,
+        // 28 generic; one-path bases: LC 15, LP 5 (moved, by value), LV 5 (adopted), LP& 5, + 10.
+        cppi_etarg.AmbG ambG = default;
+        EtargAmbGImpl ambGImpl;
+        IEtargAmbG ambGIface = ambGImpl;
+        cppi_etarg.BG ambGInit = ambG;
+        cppi_etarg.BG ambGRet = EtargAmbGReturn(&ambG);
+        if (EtargAmbG(ambG) != 27 || ambGIface.take(ambG) != 27 || EtargAmbGGeneric(1, ambG) != 28)
+            return 27464;
+        if (ambGInit.how * 10 + ambGInit.v != 27 || ambGRet.how * 10 + ambGRet.v != 27
+            || cppi_etarg.TakeBG(ambG) != 27) return 27465;
+        cppi_etarg.LP movedP = default;
+        if (EtargLeftBP(move movedP) != 5) return 27467;
+        cppi_etarg.LC leftC = default;
+        cppi_etarg.LP leftP = default;
+        cppi_etarg.BP plainB = default;
+        if (EtargLeftBC(leftC) != 15 || leftP + plainB != 10) return 27466;
+        unique cppi_etarg.BV* leftV = new cppi_etarg.LV();
+        cppi_etarg.BP* leftRef = cppi_etarg.RefLP();
+        if (leftV->v != 5 || leftRef->v != 5) return 27468;
+    }
+    {
+        // clang: BY(const LY&) 9 / BY(const AmbY&) 11 beat the slice copy (direct, generic,
+        // interface, C++, return, init, moved); RY slices 6. BY born 15 / dtors 15. Master: 5 / CE.
+        cppi_etarg.BY.born = 0; cppi_etarg.BY.dtors = 0;
+        {
+            cppi_etarg.LY ly = default;
+            cppi_etarg.AmbY ambY = default;
+            cppi_etarg.RY ry = default;
+            ry.v = 6;
+            EtargAmbGImpl byImpl;
+            IEtargAmbG byIface = byImpl;
+            if (EtargTakeBY(ly) != 9 || EtargTakeBYGeneric(1, ly) != 10 || byIface.takeBY(ly) != 9
+                || cppi_etarg.TakeBY(ly) != 9) return 27469;
+            cppi_etarg.BY byRet = EtargBYReturn(&ly);
+            cppi_etarg.BY byAmb = ambY;
+            if (byRet.v != 9 || byAmb.v != 11 || EtargTakeBY(ambY) != 11
+                || cppi_etarg.TakeBY(ambY) != 11) return 27470;
+            cppi_etarg.LY movedLY = default;
+            if (EtargTakeBY(move movedLY) != 9 || EtargTakeBY(move ry) != 6) return 27471;
+        }
+        if (cppi_etarg.BY.born != 15 || cppi_etarg.BY.dtors != 15) return 27472;
+    }
+    {
+        // clang: `b = d` binds B's copy assignment to d's base subobject: BC 5 / BG 5 (master
+        // 15 / 25), BY 7 with no temporary (born 3); `new BG(lg)` takes the template 25 (master 15).
+        cppi_etarg.BC assignC = default;
+        cppi_etarg.LC fromC = default;
+        assignC = fromC;
+        cppi_etarg.BG assignG = default;
+        cppi_etarg.LG fromG = default;
+        assignG = fromG;
+        if (assignC.how * 10 + assignC.v != 5 || assignG.how * 10 + assignG.v != 5) return 27473;
+        cppi_etarg.BY.born = 0;
+        cppi_etarg.LY fromY = default;
+        fromY.v = 7;
+        if (EtargAssignBYGeneric(fromY) != 7 || cppi_etarg.BY.born != 3) return 27474;
+        unique cppi_etarg.BG* newG = new cppi_etarg.BG(fromG);
+        if (newG->how * 10 + newG->v != 25) return 27475;
+    }
+    {
+        // clang: a trivial base copies the derived value's base subobject at init / assignment /
+        // field / deref (master: "unrelated struct type"); after `LP + BP`, `F(move lp)` 5.
+        cppi_etarg.LP trivD = default;
+        trivD.v = 6;
+        cppi_etarg.BP trivInit = trivD;
+        cppi_etarg.BP trivAssign = default;
+        trivAssign = trivD;
+        EtargBPHolder trivHolder = default;
+        trivHolder.f = trivD;
+        cppi_etarg.BP* trivPtr = &trivAssign;
+        *trivPtr = trivD;
+        if (trivInit.v != 6 || trivAssign.v != 6 || trivHolder.f.v != 6) return 27476;
+        cppi_etarg.BP trivPlain = default;
+        int trivSum = trivD + trivPlain;
+        cppi_etarg.LP trivMoved = default;
+        if (EtargLeftBP(move trivMoved) + trivSum != 16) return 27477;
+    }
+    {
+        // clang: `b = move d` move-assigns from d's base subobject: v 55, BMv born 2 / dtors 2
+        // (master built a BMv(d) temporary: born 3 / dtors 3).
+        cppi_etarg.BMv.born = 0; cppi_etarg.BMv.dtors = 0;
+        int movedAssign = 0;
+        {
+            cppi_etarg.LMv mvSource = default;
+            cppi_etarg.BMv mvTarget = default;
+            mvTarget = move mvSource;
+            movedAssign = mvTarget.v;
+        }
+        if (movedAssign != 55 || cppi_etarg.BMv.born != 2 || cppi_etarg.BMv.dtors != 2) return 27478;
+    }
+    {
+        // clang: `b = move d` with a [cpp] struct d deriving BMv move-assigns from d's base
+        // subobject (v 55, born 2 / dtors 2) at a local, through a pointer and into a field.
+        // Master: "'d' is not a 'cppi_etarg.BMv' value that can be assigned".
+        cppi_etarg.BMv.born = 0; cppi_etarg.BMv.dtors = 0;
+        int cppMoved = 0;
+        {
+            EtargCppLMv cppSource = default;
+            cppi_etarg.BMv cppTarget = default;
+            cppTarget = move cppSource;
+            cppMoved = cppTarget.v;
+        }
+        if (cppMoved != 55 || cppi_etarg.BMv.born != 2 || cppi_etarg.BMv.dtors != 2) return 27479;
+        cppi_etarg.BMv.born = 0; cppi_etarg.BMv.dtors = 0;
+        {
+            EtargCppLMv cppSource = default;
+            EtargCppLMv cppSource2 = default;
+            cppi_etarg.BMv cppTarget = default;
+            EtargBMvHolder cppHolder = default;
+            cppi_etarg.BMv* cppTargetPtr = &cppTarget;
+            *cppTargetPtr = move cppSource;
+            cppHolder.f = move cppSource2;
+            cppMoved = cppTarget.v + cppHolder.f.v;
+        }
+        if (cppMoved != 110 || cppi_etarg.BMv.born != 4 || cppi_etarg.BMv.dtors != 4) return 27480;
+    }
+    {
+        // clang: a deleted copy ctor leaves move init 7, implicit-move return 8, prvalue 7,
+        // copy assignment 7 and moved by-value args 5 + 5 usable (the copies are refused).
+        cppi_etarg.BDc dcSource = cppi_etarg.MakeBDc();
+        cppi_etarg.BDc dcMoved = move dcSource;
+        cppi_etarg.BDc dcLocal = EtargBDcLocal();
+        cppi_etarg.BDc dcAssigned = default;
+        dcAssigned = dcMoved;
+        cppi_etarg.BDc dcArg = default;
+        cppi_etarg.BDc dcArg2 = default;
+        int dcArgs = EtargTakeBDc(move dcArg) + cppi_etarg.TakeBDc(move dcArg2);
+        if (dcMoved.v != 7 || dcLocal.v != 8 || dcAssigned.v != 7 || dcArgs != 10) return 27481;
+    }
+    {
+        // clang: a defaulted-as-deleted move ctor (implicit HMv, `= default` HMv2) is ignored,
+        // so `return local;` copies: 7 / 9. A user-deleted move (DMv) is refused (err file).
+        cppi_etarg.HMv hmLocal = EtargHMvLocal();
+        cppi_etarg.HMv2 hm2Local = EtargHMv2Local();
+        if (hmLocal.w != 7 || hm2Local.w != 9) return 27482;
+    }
+    {
+        // clang: an explicit copy ctor leaves prvalue init 6, direct-init 6, copy assignment 6,
+        // a temporary argument 6, a move through EXm 7, implicit-move return 8 and a member-wise
+        // struct copy 6 + 3 usable (copy-init from an lvalue is refused, err file).
+        cppi_etarg.EXc exA = cppi_etarg.MakeEXc();
+        cppi_etarg.EXc exB = cppi_etarg.EXc(exA);
+        cppi_etarg.EXc exC = default;
+        exC = exA;
+        int exArg = cppi_etarg.TakeEXc(cppi_etarg.MakeEXc());
+        cppi_etarg.EXm exM = default;
+        exM.v = 7;
+        cppi_etarg.EXm exM2 = move exM;
+        cppi_etarg.EXm exM3 = EtargEXmLocal();
+        EtargEXHolder exH = default;
+        exH.f = exA;
+        EtargEXHolder exH2 = exH;
+        if (exA.v != 6 || exB.v != 6 || exC.v != 6 || exArg != 6 || exM2.v != 7 || exM3.v != 8
+            || exH2.f.v + exH2.z != 9) return 27483;
+    }
+    {
+        // clang: a struct holding a deleted-copy class still moves 4, returns a local 5, takes a
+        // moved argument 6 and copy-assigns 7; prvalue / moved elements and fields build 7 + 9.
+        EtargBDcHolder dhA = default;
+        dhA.z = 4;
+        EtargBDcHolder dhB = move dhA;
+        EtargBDcHolder dhC = EtargBDcHolderLocal();
+        EtargBDcHolder dhD = default;
+        int dhArg = EtargTakeBDcHolder(move dhD);
+        EtargBDcHolder dhE = default;
+        EtargBDcHolder dhF = default;
+        dhF.z = 7;
+        dhE = dhF;
+        EtargBDcHolder dhG = { f = cppi_etarg.MakeBDc(), z = 2 };
+        cppi_etarg.BDc dcSrc = default;
+        dcSrc.v = 9;
+        cppi_etarg.BDc[2] dcArr = { cppi_etarg.MakeBDc(), move dcSrc };
+        cppi_etarg.BDc[] dcView = { cppi_etarg.MakeBDc() };
+        if (dhB.z != 4 || dhC.z != 5 || dhArg != 6 || dhE.z != 7 || dhG.f.v != 7
+            || dcArr[0].v + dcArr[1].v != 16 || dcView[0].v != 7) return 27484;
+    }
+    {
+        // CFlat consumes a by-value parameter / local at its last use, so list<T>.insert's
+        // forwarded `add(value)` and a last-use `take(h)` stay usable: 2 + 2, 2 + 7, 5 + 4.
+        list<EtargBDcHolder> dhList = default;
+        EtargBDcHolder dhIn = default;
+        EtargBDcHolder dhIns = default;
+        dhIns.z = 2;
+        dhList.add(move dhIn);
+        dhList.insert(0, move dhIns);
+        list<cppi_etarg.BDc> dcList = default;
+        cppi_etarg.BDc dcIn = default;
+        cppi_etarg.BDc dcIns = cppi_etarg.MakeBDc();
+        dcList.add(move dcIn);
+        dcList.insert(0, move dcIns);
+        EtargBDcHolder dhLast = default;
+        dhLast.z = 4;
+        int dhLastArg = EtargTakeBDcHolder(dhLast);
+        if (dhList.count() + dhList[0].z != 4 || dcList.count() + dcList[0].v != 9
+            || dhLastArg != 9) return 27485;
+    }
+    {
+        // CPPCOPY3 (clang): a struct whose field move is deleted moves through its copy: 2, a
+        // returned local 5 / `move` 6, arguments 3 + 4, element 2. An explicit-copy class with a
+        // default move moves into a parameter 8, element 9 and field 7; a deleted-copy holder 4.
+        Cppcopy3UdmHost uA = default;
+        uA.z = 2;
+        Cppcopy3UdmHost uB = move uA;
+        Cppcopy3UdmHost uC = Cppcopy3UdmLocal();
+        Cppcopy3UdmHost uD = Cppcopy3UdmMoveOut();
+        Cppcopy3UdmHost uE = default;
+        uE.z = 3;
+        int uArg = Cppcopy3TakeUdm(move uE);
+        Cppcopy3UdmHost uF = default;
+        uF.z = 4;
+        int uLast = Cppcopy3TakeUdm(uF);
+        int uBz = uB.z;
+        Cppcopy3UdmHost[1] uArr = { move uB };
+        cppcopy.ExplCopyMove eA = default;
+        eA.v = 8;
+        int eArg = Cppcopy3TakeEcm(move eA);
+        cppcopy.ExplCopyMove eB = default;
+        eB.v = 9;
+        cppcopy.ExplCopyMove[1] eArr = { move eB };
+        cppcopy.ExplCopyMove eC = default;
+        eC.v = 7;
+        Cppcopy3EcmHost eHost = { f = move eC, z = 1 };
+        EtargBDcHolder dhM = default;
+        dhM.z = 4;
+        EtargBDcHolder[1] dhArr = { move dhM };
+        if (uBz != 2 || uC.z != 5 || uD.z != 6 || uArg != 3 || uLast != 4 || uArr[0].z != 2
+            || eArg != 8 || eArr[0].v != 9 || eHost.f.v != 7 || dhArr[0].z != 4) return 27486;
+    }
+    {
+        // clang (std::queue / std::map with std::move, `return p;` an xvalue): queue<Host> 1 + 8 + 3,
+        // a forwarded last use 1 + 5, dictionary 4 + 6, a trivial deleted-copy holder queue 2,
+        // and `return p;` of a deleted-copy class 6 / 4 (pre-fix: all refused).
+        queue<Cppcopy4UpHost> upQueue = default;
+        Cppcopy4UpHost upA = default;
+        upA.p = std.make_unique<int>(8);
+        upA.z = 3;
+        upQueue.enqueue(move upA);
+        Cppcopy4UpHost upOut = upQueue.dequeue();
+        int upFirst = upQueue.count() + *upOut.p + upOut.z;
+        Cppcopy4UpHost upB = default;
+        upB.z = 5;
+        int upFwd = Cppcopy4Fwd(&upQueue, move upB, 0);
+        upFwd = upFwd + upQueue.dequeue().z;
+        dictionary<int, Cppcopy4UpHost> upDict = default;
+        Cppcopy4UpHost upC = default;
+        upC.p = std.make_unique<int>(4);
+        upC.z = 6;
+        upDict.set(1, move upC);
+        int upDictV = *upDict[1].p + upDict[1].z;
+        queue<EtargBDcHolder> dhQueue = default;
+        EtargBDcHolder dhQ = default;
+        dhQ.z = 2;
+        dhQueue.enqueue(move dhQ);
+        cppslice.BDelCopy delA = default;
+        delA.v = 6;
+        cppslice.BDelCopy delR = Cppcopy4RetDelCopy(move delA);
+        cppi_etarg.BDc bdA = default;
+        bdA.v = 4;
+        cppi_etarg.BDc bdR = Cppcopy4RetBDc(move bdA, 1);
+        if (upFirst != 11 || upFwd != 6 || upDictV != 10 || dhQueue.dequeue().z != 2 || delR.v != 6
+            || bdR.v != 4) return 27487;
+    }
+    {
+        // A last-use argument of a deleted-copy-field holder moves into array.set 4 and btree
+        // add / set / insert 1 + 1 + 1 (review r1: refused once is_copyable(T) turned false).
+        array<EtargBDcHolder> dhArray = new EtargBDcHolder[2];
+        EtargBDcHolder dhSet = default;
+        dhSet.z = 4;
+        dhArray.set(0, dhSet);
+        btree<int, EtargBDcHolder> dhTree = default;
+        EtargBDcHolder dhAdd = default;
+        dhAdd.z = 1;
+        dhTree.add(1, dhAdd);
+        EtargBDcHolder dhTreeSet = default;
+        dhTreeSet.z = 2;
+        dhTree.set(2, dhTreeSet);
+        EtargBDcHolder dhIns = default;
+        dhIns.z = 3;
+        dhTree.insert(3, dhIns);
+        if (dhArray.get(0).z != 4 || dhTree.count() != 3) return 27488;
+    }
     cppf.Flex* flexTail = (cppf.Flex*)malloc((i64)sizeof(cppf.Flex) + 2 * (i64)sizeof(int));
     flexTail->data[0] = 73;
     flexTail->data[1] = 74;

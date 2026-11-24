@@ -1,0 +1,692 @@
+// TRAPJOIN: a '?:' / '??' join with an address-of arm may hold storage nobody heap-allocated, so
+// an explicit `move` of it (or of a binding copied from it) into any slot is refused.
+import "unique.cb";
+
+struct TrapjoinErr { int k = 7; };
+struct TrapjoinErrHolder { TrapjoinErr* p = nullptr; };
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    void trapjoinErrDecl(bool c)
+    {
+        unique TrapjoinErr* u = new TrapjoinErr(); TrapjoinErr x = default; TrapjoinErr* px = &x;
+        TrapjoinErr* q = c ? u : px;
+        unique TrapjoinErr* t = move q;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    void trapjoinErrDirect(bool c)
+    {
+        unique TrapjoinErr* u = new TrapjoinErr(); TrapjoinErr x = default; TrapjoinErr* px = &x;
+        unique TrapjoinErr* t = move (c ? u : px);
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    void trapjoinErrAssign(bool c)
+    {
+        unique TrapjoinErr* u = new TrapjoinErr(); TrapjoinErr x = default; TrapjoinErr* px = &x;
+        unique TrapjoinErr* t = new TrapjoinErr();
+        TrapjoinErr* q = c ? u : px;
+        t = move q;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    void trapjoinErrRebound(bool c)
+    {
+        unique TrapjoinErr* u = new TrapjoinErr(); TrapjoinErr x = default; TrapjoinErr* px = &x;
+        TrapjoinErr* q = nullptr;
+        q = c ? u : px;
+        unique TrapjoinErr* t = move q;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    void trapjoinErrCoalesce(bool c)
+    {
+        unique TrapjoinErr* u = new TrapjoinErr(); TrapjoinErr x = default; TrapjoinErr* px = &x;
+        TrapjoinErr* q = px ?? u;
+        unique TrapjoinErr* t = move q;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    void trapjoinErrMayCoalesce(bool c)
+    {
+        unique TrapjoinErr* u = new TrapjoinErr(); TrapjoinErr x = default;
+        TrapjoinErr* n = nullptr;
+        if (!c) n = &x;
+        TrapjoinErr* q = n ?? u;
+        unique TrapjoinErr* t = move q;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    void trapjoinErrNested(bool c, bool d)
+    {
+        unique TrapjoinErr* u = new TrapjoinErr(); TrapjoinErr x = default; TrapjoinErr* px = &x;
+        TrapjoinErr* q = c ? u : (d ? px : u);
+        unique TrapjoinErr* t = move q;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    void trapjoinErrTwoAddresses(bool c)
+    {
+        TrapjoinErr x = default; TrapjoinErr y = default;
+        TrapjoinErr* q = c ? &x : &y;
+        unique TrapjoinErr* t = move q;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    void trapjoinErrRawDest(bool c)
+    {
+        TrapjoinErr x = default; TrapjoinErr y = default; TrapjoinErr* px = &x;
+        TrapjoinErr* q = c ? px : &y;
+        TrapjoinErr* r = move q;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    void trapjoinErrCopy(bool c)
+    {
+        unique TrapjoinErr* u = new TrapjoinErr(); TrapjoinErr x = default; TrapjoinErr* px = &x;
+        TrapjoinErr* q = c ? u : px;
+        TrapjoinErr* q2 = q;
+        unique TrapjoinErr* t = move q2;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    void trapjoinErrField(bool c)
+    {
+        unique TrapjoinErr* u = new TrapjoinErr(); TrapjoinErr x = default; TrapjoinErr* px = &x;
+        TrapjoinErrHolder h = default;
+        h.p = c ? u : px;
+        unique TrapjoinErr* t = move h.p;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    void trapjoinErrTuple(bool c)
+    {
+        unique TrapjoinErr* u = new TrapjoinErr(); TrapjoinErr x = default; TrapjoinErr* px = &x;
+        TrapjoinErr* q = c ? u : px;
+        (unique<TrapjoinErr>, int) tt = (move q, 4);
+    }
+}
+
+expect_error("from borrowed value 'q' - the source still owns it") {
+    int trapjoinErrLoop(bool c)
+    {
+        unique TrapjoinErr* u = new TrapjoinErr(); TrapjoinErr x = default; TrapjoinErr* px = &x;
+        TrapjoinErr* q = new TrapjoinErr();
+        int s = 0;
+        for (int i = 0; i < 2; i++)
+        {
+            unique TrapjoinErr* t = move q;
+            s = s + t->k;
+            q = c ? u : px;
+        }
+        return s;
+    }
+}
+
+expect_error("from borrowed value 'q' - the source still owns it") {
+    int trapjoinErrLoopCoalesce(bool c)
+    {
+        unique TrapjoinErr* u = new TrapjoinErr(); TrapjoinErr x = default; TrapjoinErr* px = &x;
+        TrapjoinErr* q = new TrapjoinErr();
+        int s = 0;
+        int i = 0;
+        while (i < 2)
+        {
+            unique TrapjoinErr* t = move q;
+            s = s + t->k;
+            q = px ?? u;
+            i++;
+        }
+        return s;
+    }
+}
+
+expect_error("from borrowed value 'q' - the source still owns it") {
+    int trapjoinErrContinue(bool c)
+    {
+        unique TrapjoinErr* u = new TrapjoinErr(); TrapjoinErr x = default; TrapjoinErr* px = &x;
+        TrapjoinErr* q = new TrapjoinErr();
+        int s = 0;
+        for (int i = 0; i < 2; i++)
+        {
+            unique TrapjoinErr* t = move q;
+            s = s + t->k;
+            q = new TrapjoinErr();
+            if (i == 0) { q = c ? u : px; continue; }
+        }
+        return s;
+    }
+}
+
+expect_error("from borrowed value 'q' - the source still owns it") {
+    int trapjoinErrContinueThenRebind(bool c)
+    {
+        unique TrapjoinErr* u = new TrapjoinErr(); TrapjoinErr x = default; TrapjoinErr* px = &x;
+        TrapjoinErr* q = new TrapjoinErr();
+        int s = 0;
+        for (int i = 0; i < 2; i++)
+        {
+            unique TrapjoinErr* t = move q;
+            s = s + t->k;
+            if (i == 0) { q = c ? u : px; continue; }
+            q = new TrapjoinErr();
+        }
+        return s;
+    }
+}
+
+TrapjoinErr* trapjoinErrGlobal = nullptr;
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int trapjoinErrGlobalJoin(bool c)
+    {
+        unique TrapjoinErr* u = new TrapjoinErr(); TrapjoinErr x = default; TrapjoinErr* px = &x;
+        trapjoinErrGlobal = c ? u : px;
+        unique TrapjoinErr* t = move trapjoinErrGlobal;
+        return t->k;
+    }
+}
+
+// GLOBCOPY: a copy of a global inherits the global's per-function borrow ledger.
+struct GlobcopyErr { int k = 7; };
+struct GlobcopyErrHolder { GlobcopyErr* p = default; };
+GlobcopyErr* globcopyErrG = nullptr;
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int globcopyErrDeclCopy()
+    {
+        GlobcopyErr x = default;
+        globcopyErrG = &x;
+        GlobcopyErr* q = globcopyErrG;
+        unique GlobcopyErr* t = move q;
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int globcopyErrJoinGlobalCopy(bool c)
+    {
+        unique GlobcopyErr* u = new GlobcopyErr(); GlobcopyErr x = default; GlobcopyErr* px = &x;
+        globcopyErrG = c ? u : px;
+        GlobcopyErr* q = nullptr;
+        q = globcopyErrG;
+        unique GlobcopyErr* t = move q;
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int globcopyErrFieldCopy()
+    {
+        GlobcopyErr x = default;
+        globcopyErrG = &x;
+        GlobcopyErrHolder h = default;
+        h.p = globcopyErrG;
+        unique GlobcopyErr* t = move h.p;
+        return t->k;
+    }
+}
+
+expect_error("cannot delete 'q' - the address-of expression it comes from borrows storage") {
+    int globcopyErrDeleteCopy()
+    {
+        GlobcopyErr x = default;
+        globcopyErrG = &x;
+        GlobcopyErr* q = globcopyErrG;
+        delete q;
+        return 0;
+    }
+}
+
+// Global to global; its own pointee type, so the first `unique` of it emits that type's helpers
+// mid-function - a nested emission that must not wipe the enclosing function's ledger.
+struct GlobcopyErrG2G { int k = 7; };
+GlobcopyErrG2G* globcopyErrA = nullptr;
+GlobcopyErrG2G* globcopyErrB = nullptr;
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int globcopyErrGlobalToGlobal()
+    {
+        GlobcopyErrG2G x = default;
+        globcopyErrA = &x;
+        globcopyErrB = globcopyErrA;
+        unique GlobcopyErrG2G* t = move globcopyErrB;
+        return t->k;
+    }
+}
+
+// Join arm read straight off the global, again with a fresh pointee type.
+struct GlobcopyErrJoin { int k = 7; };
+GlobcopyErrJoin* globcopyErrJ = nullptr;
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int globcopyErrJoinArm(bool c)
+    {
+        GlobcopyErrJoin x = default;
+        globcopyErrJ = &x;
+        unique GlobcopyErrJoin* t = move (c ? globcopyErrJ : new GlobcopyErrJoin());
+        return t->k;
+    }
+}
+
+// FLDCOPY: a borrowed address stored into a field / element slot (`=` or brace init) stays
+// borrowed through copies out of the slot; moving any of them into a unique is refused.
+struct FcE { int k = 7; };
+struct FcH { FcE* p = default; };
+struct FcO { FcH h = default; };
+FcE* fldcopyErrG = nullptr;
+int fldcopyErrRead(FcE* p) { return p->k; }
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopyErrFieldCopyDecl()
+    {
+        FcE x = default; FcE* px = &x;
+        FcH h = default; h.p = px; FcE* q = h.p; unique FcE* t = move q;
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopyErrFieldCopyAssign()
+    {
+        FcE x = default; FcE* px = &x;
+        FcH h = default; h.p = px; FcE* q = nullptr; q = h.p; unique FcE* t = move q;
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopyErrElemMove()
+    {
+        FcE x = default; FcE* px = &x;
+        FcE*[2] a = default; a[0] = px; unique FcE* t = move a[0];
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopyErrElemCopy()
+    {
+        FcE x = default; FcE* px = &x;
+        FcE*[2] a = default; a[0] = px; FcE* q = a[0]; unique FcE* t = move q;
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopyErrElemAssignMove()
+    {
+        FcE x = default; FcE* px = &x;
+        FcE*[2] a = default; a[0] = px; unique FcE* t = nullptr; t = move a[0];
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopyErrDesignated()
+    {
+        FcE x = default; FcE* px = &x;
+        FcH h = { .p = px }; unique FcE* t = move h.p;
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopyErrDesignatedCopy()
+    {
+        FcE x = default; FcE* px = &x;
+        FcH h = { .p = px }; FcE* q = h.p; unique FcE* t = move q;
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopyErrNestedCopy()
+    {
+        FcE x = default; FcE* px = &x;
+        FcO o = default; o.h.p = px; FcE* q = o.h.p; unique FcE* t = move q;
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopyErrNestedBrace()
+    {
+        FcE x = default; FcE* px = &x;
+        FcO o = { .h = { .p = px } }; unique FcE* t = move o.h.p;
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopyErrFieldToField()
+    {
+        FcE x = default; FcE* px = &x;
+        FcH h = default; FcH h2 = default; h.p = px; h2.p = h.p; unique FcE* t = move h2.p;
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopyErrWholeCopy()
+    {
+        FcE x = default; FcE* px = &x;
+        FcH h = default; h.p = px; FcH h2 = h; FcE* q = h2.p; unique FcE* t = move q;
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopyErrArrayBrace()
+    {
+        FcE x = default; FcE* px = &x;
+        FcE*[2] a = { px, nullptr }; unique FcE* t = move a[0];
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopyErrStructArrayBrace()
+    {
+        FcE x = default; FcE* px = &x;
+        FcH[2] a = { { .p = px }, { } }; unique FcE* t = move a[0].p;
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopyErrElemToField()
+    {
+        FcE x = default; FcE* px = &x;
+        FcE*[2] a = default; a[0] = px; FcH h = default; h.p = a[0]; unique FcE* t = move h.p;
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopyErrGlobalFromField()
+    {
+        FcE x = default; FcE* px = &x;
+        FcH h = default; h.p = px; fldcopyErrG = h.p; unique FcE* t = move fldcopyErrG;
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopyErrElemReadCall()
+    {
+        FcE x = default; FcE* px = &x;
+        FcE*[2] a = default; a[0] = px; int s = fldcopyErrRead(a[0]); unique FcE* t = move a[0];
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopyErrFieldBranch(bool c)
+    {
+        FcE x = default; FcE* px = &x;
+        FcH h = default; h.p = new FcE(); if (c) h.p = px; FcE* q = h.p; unique FcE* t = move q;
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopyErrElemLoop(bool c)
+    {
+        FcE x = default; FcE* px = &x;
+        FcE*[2] a = default; for (int i = 0; i < 2; i++) { a[1] = px; } unique FcE* t = move a[1];
+        return t->k;
+    }
+}
+
+// An int-slot store at a dynamic index (`h.n[i] = 1`) cannot overwrite the pointer field.
+struct FcHN { FcE* p = default; int[4] n = default; };
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopyErrDynamicUnrelatedSlot(int i)
+    {
+        FcE x = default;
+        FcHN h = default; h.p = &x; h.n[i] = 1;
+        unique FcE* t = move h.p;
+        return t->k;
+    }
+}
+
+// The ledger does not see a callee's writes: a copy after `h.reset()` is refused like `move h.p`.
+struct FcHR { FcE* p = default; void reset() { p = new FcE(); } };
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopyErrMethodResetCopy()
+    {
+        FcE x = default;
+        FcHR h = default; h.p = &x; h.reset();
+        FcE* q = h.p;
+        unique FcE* t = move q;
+        return t->k;
+    }
+}
+
+// FLDCOPY2: a `?:` / `??` arm reading a borrowed slot keeps the slot's fact; a runtime-index
+// store only ever ADDS facts (never retires one); member-array elements (`h.arr[0]`) are slots.
+struct Fc2E { int k = 7; };
+struct Fc2EH { Fc2E* p = default; Fc2E*[2] arr = default; };
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopy2ErrJoinFieldArm(bool c)
+    {
+        Fc2E x = default; Fc2EH h = default; h.p = &x;
+        unique Fc2E* t = move (c ? h.p : new Fc2E());
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopy2ErrCoalesceFieldArm()
+    {
+        Fc2E x = default; Fc2EH h = default; h.p = &x; Fc2E* n = nullptr;
+        unique Fc2E* t = move (h.p ?? n);
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopy2ErrJoinElemArm(bool c)
+    {
+        Fc2E x = default; Fc2E*[2] a = default; a[0] = &x;
+        unique Fc2E* t = move (c ? a[0] : new Fc2E());
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopy2ErrJoinFieldArmCopy(bool c)
+    {
+        Fc2E x = default; Fc2EH h = default; h.p = &x;
+        Fc2E* q = c ? h.p : new Fc2E(); unique Fc2E* t = move q;
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopy2ErrCoalesceFieldArmCopy()
+    {
+        Fc2E x = default; Fc2EH h = default; h.p = &x; Fc2E* n = nullptr;
+        Fc2E* q = h.p ?? n; unique Fc2E* t = move q;
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopy2ErrJoinNestedFieldArm(bool c, bool d)
+    {
+        Fc2E x = default; Fc2EH h = default; h.p = &x;
+        unique Fc2E* t = move (c ? (d ? h.p : nullptr) : new Fc2E());
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopy2ErrJoinPointerRootArm(bool c)
+    {
+        Fc2E x = default; Fc2EH h = default; Fc2EH* ph = &h; ph->p = &x;
+        unique Fc2E* t = move (c ? ph->p : new Fc2E());
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopy2ErrDynNullKeepsBorrow(int i)
+    {
+        Fc2E x = default; Fc2E* px = &x; Fc2E*[2] a = default; a[0] = px;
+        a[i] = nullptr; unique Fc2E* t = move a[0];
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopy2ErrDynNewKeepsBorrow()
+    {
+        Fc2E x = default; Fc2E* px = &x; Fc2E*[2] a = default; a[0] = px;
+        int j = 1; a[j] = new Fc2E(); unique Fc2E* t = move a[0];
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopy2ErrDynNullKeepsBorrowCopy(int i)
+    {
+        Fc2E x = default; Fc2E* px = &x; Fc2E*[2] a = default; a[0] = px;
+        a[i] = nullptr; Fc2E* q = a[0]; unique Fc2E* t = move q;
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopy2ErrDynStoreBorrow(int i)
+    {
+        Fc2E x = default; Fc2E*[2] a = default; a[i % 2] = &x;
+        unique Fc2E* t = move a[0];
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopy2ErrMemberDynNullKeepsBorrow(int i)
+    {
+        Fc2E x = default; Fc2EH h = default; h.arr[0] = &x;
+        h.arr[i] = nullptr; unique Fc2E* t = move h.arr[0];
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopy2ErrMemberDynStoreBorrow(int i)
+    {
+        Fc2E x = default; Fc2EH h = default; h.arr[i % 2] = &x;
+        unique Fc2E* t = move h.arr[0];
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopy2ErrMemberElemMove()
+    {
+        Fc2E x = default; Fc2EH h = default; h.arr[0] = &x;
+        unique Fc2E* t = move h.arr[0];
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopy2ErrMemberElemCopy()
+    {
+        Fc2E x = default; Fc2EH h = default; h.arr[0] = &x;
+        Fc2E* q = h.arr[0]; unique Fc2E* t = move q;
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopy2ErrMemberElemStructCopy()
+    {
+        Fc2E x = default; Fc2EH h = default; h.arr[0] = &x;
+        Fc2EH g = h; unique Fc2E* t = move g.arr[0];
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopy2ErrDynStructStore(int i)
+    {
+        Fc2E x = default; Fc2EH g = default; g.p = &x; Fc2EH[2] sa = default;
+        sa[i % 2] = g; unique Fc2E* t = move sa[0].p;
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopy2ErrDynNestedMemberStore(int i)
+    {
+        Fc2E x = default; Fc2EH[2] sa = default; sa[i % 2].arr[1] = &x;
+        unique Fc2E* t = move sa[0].arr[1];
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopy2ErrDyn2DKeepsBorrow(int i)
+    {
+        Fc2E x = default; Fc2E*[2][2] g = default; g[0][1] = &x;
+        g[i][1] = nullptr; unique Fc2E* t = move g[0][1];
+        return t->k;
+    }
+}
+
+// Review r1: a member array decay escapes only its own elements; a join arm keeps its slot fact
+// when the other arm first instantiates a generic; a static owned store on one branch only.
+void fc2EFill(Fc2E** a) { a[0] = new Fc2E(); a[1] = new Fc2E(); }
+unique T* fc2EMake<T>() { return new T(); }
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopy2ErrMemberDecayKeepsOther()
+    {
+        Fc2E x = default; Fc2EH h = default; h.p = &x; fc2EFill(h.arr);
+        unique Fc2E* t = move h.p;
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopy2ErrJoinArmGenericFirstUse(bool c)
+    {
+        Fc2E x = default; Fc2EH h = default; h.p = &x;
+        unique Fc2E* t = move (c ? h.p : fc2EMake<Fc2E>());
+        return t->k;
+    }
+}
+
+expect_error("cannot move a borrowed pointer; move from the owning slot") {
+    int fldcopy2ErrWideDynOneBranchOwned(bool c, int i)
+    {
+        Fc2E x = default; Fc2E*[100] a = default; a[i] = &x;
+        if (c) a[0] = new Fc2E();
+        unique Fc2E* t = move a[0];
+        return t->k;
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

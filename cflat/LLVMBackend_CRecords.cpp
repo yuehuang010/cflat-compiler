@@ -4505,6 +4505,28 @@ bool LLVMBackend::RejectUnsupportedCxxLayout(const std::string& typeName)
         return true;
     }
 
+bool LLVMBackend::RejectUnsizedCxxLayout(llvm::Type* type)
+{
+        while (auto* arrayTy = llvm::dyn_cast_or_null<llvm::ArrayType>(type))
+            type = arrayTy->getElementType();
+        auto* structTy = llvm::dyn_cast_or_null<llvm::StructType>(type);
+        if (structTy == nullptr || structTy->isSized()) return false;
+        // Error path only: find the class whose registered shell IS this type.
+        for (const auto& [name, info] : cxxClasses_)
+        {
+            if (info.layoutRefusal.empty()) continue;
+            auto data = dataStructures.find(name);
+            if (data == dataStructures.end() || data->second.StructType != structTy) continue;
+            // Inside a generic instantiation the class arrived as a type argument: report at
+            // the user's instantiation site, not at the template line.
+            const auto& origin = gts.activeInstantiationOrigin;
+            std::optional<ReportingFileScope> atOrigin;
+            if (origin.valid) atOrigin.emplace(this, origin.file, origin.line, origin.column);
+            return RejectUnsupportedCxxLayout(name);
+        }
+        return false;
+    }
+
 bool LLVMBackend::RejectAbstractCxxClass(const std::string& typeName, const char* what)
 {
         const CxxClassInfo* info = GetCxxClassInfo(typeName);
@@ -4523,9 +4545,10 @@ bool LLVMBackend::FindCxxBaseOffset(const std::string& derived, const std::strin
         if (derived == base) { offsetOut = 0; return true; }
         const CxxClassInfo* info = GetCxxClassInfo(derived);
         if (info == nullptr) return false;
+        // `foundButInaccessible` means "reaches `base`, but not by a public non-virtual route":
+        // a virtual base off the route says nothing, and a later public route clears it.
         for (const auto& b : info->bases)
         {
-            if (b.isVirtual) { foundButInaccessible = true; continue; }
             const std::string resolvedIdentity = ResolveCxxBaseIdentity(b);
             // Record-only bases have no CxxClassInfo entry, so retain the direct spelling used
             // by the pre-identity lookup path instead of dropping the conversion.
@@ -4536,11 +4559,12 @@ bool LLVMBackend::FindCxxBaseOffset(const std::string& derived, const std::strin
             const bool hit = baseIdentity == base
                 || FindCxxBaseOffset(baseIdentity, base, inner, innerInaccessible);
             if (!hit) { foundButInaccessible = foundButInaccessible || innerInaccessible; continue; }
-            if (b.access != cflat_cinterop::AccessPublic || innerInaccessible)
+            if (b.isVirtual || b.access != cflat_cinterop::AccessPublic)
             {
                 foundButInaccessible = true;
                 continue;
             }
+            foundButInaccessible = false;
             offsetOut = b.offsetBytes + (baseIdentity == base ? 0 : inner);
             return true;
         }
@@ -4744,9 +4768,66 @@ LLVMBackend::CxxBaseRoutes LLVMBackend::CollectCxxBaseRoutes(const std::string& 
         return routes;
 }
 
-bool LLVMBackend::RejectCxxClassPointerStore(const TypeAndValue& dest, const TypeAndValue& src,
+bool LLVMBackend::IsCxxAmbiguousBase(const std::string& derived, const std::string& base) const
+{
+        if (derived.empty() || base.empty() || derived == base || !IsCxxRecord(derived)
+            || !IsCxxRecord(base))
+            return false;
+        return CollectCxxBaseRoutes(derived, base, false).nonVirtual > 1;
+}
+
+bool LLVMBackend::RejectCxxAmbiguousBaseConversion(const std::string& derived,
+                                                   const std::string& base)
+{
+        if (!IsCxxAmbiguousBase(derived, base)) return false;
+        LogError(std::format("ambiguous conversion from derived class '{}' to base class '{}'",
+                             SpellType(*this, TypeAndValue{ .TypeName = derived }),
+                             SpellType(*this, TypeAndValue{ .TypeName = base })));
+        return true;
+}
+
+// `D[2][2]` (a row of a 3-D array too): SpellType spells no array dimensions.
+static std::string SpellCxxMultiDimArray(LLVMBackend& backend, const LLVMBackend::TypeAndValue& src)
+{
+        const LLVMBackend::TypeAndValue array = LLVMBackend::RowAsFixedArray(src);
+        std::string spelled = SpellType(backend, LLVMBackend::TypeAndValue{ .TypeName = array.TypeName })
+            + std::format("[{}]", array.ConstArraySize);
+        for (uint64_t inner : array.ConstInnerDimensions) spelled += std::format("[{}]", inner);
+        return spelled;
+}
+
+bool LLVMBackend::IsCxxMultiDimArrayClassPointerConversion(const TypeAndValue& dest,
+                                                            const TypeAndValue& src) const
+{
+        // Still an array after one decay step: a `D[2][2]` (or a `D[3][4]` row of a 3-D array)
+        // decays to `D(*)[N]`, a pointer to a row, which converts to no other class pointer.
+        const bool multiDim = !src.Pointer && !src.IsArrayView && !src.ElemPointer
+            && ((src.ConstArraySize > 0 && !src.ConstInnerDimensions.empty())
+                || src.ConstInnerDimensions.size() >= 2);
+        return multiDim && dest.Pointer && dest.ValuePointerDepth() == 1 && !dest.ElemPointer
+            && !dest.IsArrayView && !dest.IsFunctionPointer && dest.ConstArraySize == 0
+            && !src.TypeName.empty() && src.TypeName != dest.TypeName
+            && IsCxxRecord(src.TypeName) && IsCxxRecord(dest.TypeName);
+}
+
+bool LLVMBackend::RejectCxxMultiDimArrayClassPointerStore(const TypeAndValue& dest,
+                                                          const TypeAndValue& src,
+                                                          const std::string& destDesc)
+{
+        if (!IsCxxMultiDimArrayClassPointerConversion(dest, src)) return false;
+        LogError(std::format(
+            "cannot convert '{}' to '{}' for {}: a multi-dimensional array decays to a pointer to "
+            "its first row, not to a class pointer", SpellCxxMultiDimArray(*this, src),
+            SpellType(*this, dest), destDesc));
+        return true;
+}
+
+bool LLVMBackend::RejectCxxClassPointerStore(const TypeAndValue& dest,
+                                             const TypeAndValue& arraySrc,
                                              const std::string& destDesc)
 {
+        const TypeAndValue src = dest.ConstArraySize > 0 ? arraySrc : ArrayDecayedPointer(arraySrc);
+        if (RejectCxxMultiDimArrayClassPointerStore(dest, src, destDesc)) return true;
         if (!dest.Pointer || !src.Pointer || dest.IsFunctionPointer || src.IsFunctionPointer
             || dest.IsArrayView || src.IsArrayView || dest.TypeName == src.TypeName
             || !IsCxxRecord(dest.TypeName) || !IsCxxRecord(src.TypeName))
@@ -4772,9 +4853,11 @@ bool LLVMBackend::RejectCxxClassPointerStore(const TypeAndValue& dest, const Typ
         return true;
 }
 
-llvm::Value* LLVMBackend::LowerCxxClassPointerCast(const TypeAndValue& src,
+llvm::Value* LLVMBackend::LowerCxxClassPointerCast(const TypeAndValue& arraySrc,
                                                    const TypeAndValue& dest, llvm::Value* ptr)
 {
+        // `(B*)derivedArray` is static_cast of the decayed `D*`, like the implicit store.
+        const TypeAndValue src = ArrayDecayedPointer(arraySrc);
         if (ptr == nullptr || !ptr->getType()->isPointerTy() || !src.Pointer || !dest.Pointer
             || src.IsFunctionPointer || dest.IsFunctionPointer || src.IsArrayView
             || dest.IsArrayView || src.ValuePointerDepth() != 1 || dest.ValuePointerDepth() != 1
@@ -5223,10 +5306,13 @@ bool LLVMBackend::LowerCxxReferenceToBase(const std::string& derived, const std:
 }
 
 llvm::Value* LLVMBackend::AdjustCxxPointerForStore(const TypeAndValue& dest,
-                                                   const TypeAndValue& src, llvm::Value* value,
+                                                   const TypeAndValue& arraySrc, llvm::Value* value,
                                                    const std::string& destDesc)
 {
+        // A fixed array source is its decayed pointer: `B* = D[2]` adjusts, `B** = D*[2]` is refused.
+        const TypeAndValue src = dest.ConstArraySize > 0 ? arraySrc : ArrayDecayedPointer(arraySrc);
         if (value == nullptr || !value->getType()->isPointerTy()) return value;
+        if (RejectCxxMultiDimArrayClassPointerStore(dest, src, destDesc)) return value;
         if (!dest.Pointer || !src.Pointer || dest.TypeName == src.TypeName) return value;
         if (!IsCxxRecord(dest.TypeName) || !IsCxxRecord(src.TypeName)) return value;
         if (RejectCxxClassPointerStore(dest, src, destDesc)) return value;
@@ -5252,6 +5338,62 @@ llvm::Value* LLVMBackend::AdjustCxxPointerForStore(const TypeAndValue& dest,
         return value;
     }
 
+void LLVMBackend::RejectCxxClassPointerCompare(const TypeAndValue& arrayLhs,
+                                               const TypeAndValue& arrayRhs)
+{
+        const TypeAndValue lhs = ArrayDecayedPointer(arrayLhs);
+        const TypeAndValue rhs = ArrayDecayedPointer(arrayRhs);
+        // `D[2][2] == B*` compares a row pointer with a class pointer: clang refuses it.
+        for (const auto& [array, pointer] : { std::pair{ &lhs, &rhs }, std::pair{ &rhs, &lhs } })
+            if (IsCxxMultiDimArrayClassPointerConversion(*pointer, *array))
+            {
+                LogError(std::format(
+                    "cannot compare '{}' with '{}': a multi-dimensional array decays to a pointer "
+                    "to its first row, not to a class pointer",
+                    SpellCxxMultiDimArray(*this, array == &lhs ? lhs : rhs),
+                    SpellType(*this, *pointer)));
+                return;
+            }
+        auto shaped = [](const TypeAndValue& t) {
+            return t.Pointer && !t.IsFunctionPointer && !t.IsArrayView && !t.IsInterfacePointer;
+        };
+        if (!shaped(lhs) || !shaped(rhs) || lhs.TypeName == rhs.TypeName
+            || !IsCxxRecord(lhs.TypeName) || !IsCxxRecord(rhs.TypeName))
+            return;
+        const int depth = lhs.ValuePointerDepth();
+        if (depth < 2 || rhs.ValuePointerDepth() != depth) return;
+        // Unrelated classes are RejectImplicitPointeePointerStore's; only a base route is left.
+        if (!CollectCxxBaseRoutes(lhs.TypeName, rhs.TypeName, false).Found()
+            && !CollectCxxBaseRoutes(rhs.TypeName, lhs.TypeName, false).Found())
+            return;
+        LogError(std::format(
+            "cannot compare '{}' with '{}': a multi-level pointer compares only with the same "
+            "class, '{}' and '{}' differ", SpellType(*this, lhs), SpellType(*this, rhs),
+            SpellType(*this, TypeAndValue{ .TypeName = lhs.TypeName }),
+            SpellType(*this, TypeAndValue{ .TypeName = rhs.TypeName })));
+}
+
+void LLVMBackend::AdjustCxxClassPointerCompare(const TypeAndValue& arrayLhs,
+                                               llvm::Value*& lhsValue,
+                                               const TypeAndValue& arrayRhs,
+                                               llvm::Value*& rhsValue)
+{
+        const TypeAndValue lhs = ArrayDecayedPointer(arrayLhs);
+        const TypeAndValue rhs = ArrayDecayedPointer(arrayRhs);
+        auto plain = [](const TypeAndValue& t) {
+            return t.Pointer && !t.IsFunctionPointer && !t.IsArrayView && !t.IsInterfacePointer
+                && t.ValuePointerDepth() == 1;
+        };
+        if (lhsValue == nullptr || rhsValue == nullptr || !plain(lhs) || !plain(rhs)
+            || lhs.TypeName == rhs.TypeName || !IsCxxRecord(lhs.TypeName)
+            || !IsCxxRecord(rhs.TypeName))
+            return;
+        if (CollectCxxBaseRoutes(lhs.TypeName, rhs.TypeName, false).Found())
+            lhsValue = AdjustCxxPointerForStore(rhs, lhs, lhsValue, "comparison");
+        else if (CollectCxxBaseRoutes(rhs.TypeName, lhs.TypeName, false).Found())
+            rhsValue = AdjustCxxPointerForStore(lhs, rhs, rhsValue, "comparison");
+}
+
 llvm::Value* LLVMBackend::AdjustCxxPointerForUniqueAdoption(
     const NamedVariable& arg, const TypeAndValue& param, llvm::Value* value,
     const std::string& destDesc)
@@ -5264,6 +5406,7 @@ llvm::Value* LLVMBackend::AdjustCxxPointerForUniqueAdoption(
         if (!IsCxxRecord(targetName) || !IsCxxRecord(sourceName)
             || targetName == sourceName)
             return value;
+        if (RejectCxxAmbiguousBaseConversion(sourceName, targetName)) return value;
 
         uint64_t offset = 0;
         bool inaccessible = false;
@@ -5424,6 +5567,7 @@ bool LLVMBackend::TryAdoptRawPointerIntoCxxUniquePtr(const std::string& typeName
         // unique_ptr(pointer) parameter.
         if (sourceType != pointee)
         {
+            if (RejectCxxAmbiguousBaseConversion(sourceType, pointee)) return true;
             uint64_t offset = 0;
             bool inaccessible = false;
             if (!FindCxxBaseOffset(sourceType, pointee, offset, inaccessible)) return false;
@@ -5514,6 +5658,7 @@ llvm::Value* LLVMBackend::CxxReferenceResultAsPointer(const TypeAndValue& dest,
         // A different destination class only binds when it is a PUBLIC base of the referent;
         // anything else keeps the caller's refusal rather than aliasing an unrelated layout.
         if (!IsCxxRecord(dest.TypeName)) return nullptr;
+        if (RejectCxxAmbiguousBaseConversion(srcTv.TypeName, dest.TypeName)) return src.Storage;
         uint64_t offset = 0;
         bool inaccessible = false;
         if (FindCxxBaseOffset(srcTv.TypeName, dest.TypeName, offset, inaccessible))

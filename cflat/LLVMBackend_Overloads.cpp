@@ -276,12 +276,164 @@ std::string LLVMBackend::ImplicitIntegerPointeeConversionText(
                        "use an explicit cast '({})p'", fromType, toType, toType);
 }
 
+bool LLVMBackend::IsImplicitUnrelatedStructPointeeConversion(
+    const TypeAndValue& row, const TypeAndValue& to, bool cxxRecordArmOnly) const
+{
+    // A multi-dimensional array's row converts as the one-dimensional array it is.
+    const TypeAndValue from = RowAsFixedArray(row);
+    // Plain object pointers at equal depth >= 1 only; views, interfaces, function pointers, simd
+    // and C++ reference shapes keep their own rules. A fixed array / view source decays to T*.
+    auto plainPointer = [](const TypeAndValue& t) {
+        return !t.IsFunctionPointer && !t.IsInterface && !t.IsInterfacePointer && !t.IsSimd
+            && !t.CxxConstRef() && !t.IsRvalueRef && !t.IsCxxRefToPointer && !t.IsCxxNullptrT
+            && t.ConstInnerDimensions.empty();
+    };
+    if (!plainPointer(from) || !plainPointer(to) || to.IsArrayView || to.ConstArraySize != 0
+        || !to.Pointer)
+        return false;
+    // Equal depths only (T* vs U*, T** vs U**); a depth mismatch has its own diagnostic.
+    const bool fromDecays = from.IsArrayView
+        || (from.ConstArraySize > 0 && (!from.Pointer || from.PointerDepth > 0 || from.ElemPointer));
+    if (!fromDecays && !from.Pointer) return false;
+    const int fromDepth = fromDecays ? from.ElementPointerDepth() + 1 : from.ValuePointerDepth();
+    if (fromDepth < 1 || fromDepth != to.ValuePointerDepth()) return false;
+    auto resolvedPointee = [&](const TypeAndValue& value) {
+        std::string resolved = ResolveTypeAlias(value.TypeName);
+        std::string manglingAlias = ResolveManglingPointerAlias(resolved);
+        if (!manglingAlias.empty()) resolved = std::move(manglingAlias);
+        std::string backing = GetEnumBackingType(resolved);
+        return backing.empty() ? resolved : ResolveTypeAlias(backing);
+    };
+    const std::string fromBase = resolvedPointee(from);
+    const std::string toBase = resolvedPointee(to);
+    if (fromBase.empty() || toBase.empty() || fromBase == toBase
+        || CanonicalPointeeTypeName(fromBase) == CanonicalPointeeTypeName(toBase))
+        return false;
+    // A generic pointer alias shadowed by a same-spelled struct cannot prove its base.
+    if ((!ResolveManglingPointerAlias(from.TypeName).empty() && dataStructures.contains(from.TypeName))
+        || (!ResolveManglingPointerAlias(to.TypeName).empty() && dataStructures.contains(to.TypeName)))
+        return false;
+    auto nativeStruct = [&](const std::string& name) {
+        return dataStructures.contains(name) && !IsCxxRecord(name)
+            && generatedCxxRecords_.count(name) == 0 && !IsCoreUniqueType(name)
+            && !IsInterfaceType(name) && name != "string" && name != "string_view";
+    };
+    auto primitive = [&](const std::string& name) {
+        return IsPrimitiveTypeName(name) && name != "void";
+    };
+    // C++ records: refuse only a pair with no base route either way and no unknown class on
+    // the walk (a route, even virtual or private, stays PTRSAFE's conversion).
+    auto cxxRecord = [&](const std::string& name) {
+        return IsCxxRecord(name) && dataStructures.contains(name);
+    };
+    auto unrelatedCxxRecords = [&](const std::string& a, const std::string& b) {
+        const CxxBaseRoutes up = CollectCxxBaseRoutes(a, b, false);
+        const CxxBaseRoutes down = CollectCxxBaseRoutes(b, a, false);
+        return !up.Found() && !down.Found() && !up.unknown && !down.unknown;
+    };
+    const bool fromCxx = cxxRecord(fromBase);
+    const bool toCxx = cxxRecord(toBase);
+    if (fromCxx || toCxx)
+    {
+        if (fromCxx && toCxx) return unrelatedCxxRecords(fromBase, toBase);
+        const std::string& other = fromCxx ? toBase : fromBase;
+        return nativeStruct(other) || primitive(other);
+    }
+    if (cxxRecordArmOnly) return false;
+    return (nativeStruct(fromBase) && (nativeStruct(toBase) || primitive(toBase)))
+        || (primitive(fromBase) && nativeStruct(toBase));
+}
+
 void LLVMBackend::RejectImplicitIntegerPointeePointerConversion(
     const TypeAndValue& from, const TypeAndValue& to)
 {
     if (!IsImplicitIntegerPointeePointerConversion(from, to)) return;
     if (from.IsSimd || to.IsSimd) return;
     LogError(ImplicitIntegerPointeeConversionText(from, to));
+}
+
+void LLVMBackend::RejectImplicitPointeePointerStore(const TypeAndValue& from, const TypeAndValue& to)
+{
+    if (from.IsSimd || to.IsSimd) return;
+    if (IsImplicitIntegerPointeePointerConversion(from, to))
+        LogError(ImplicitIntegerPointeeConversionText(from, to));
+    else if (IsImplicitUnrelatedStructPointeeConversion(from, to))
+        LogError(ImplicitIntegerPointeeConversionText(DecayedPointeeSource(from, to), to));
+}
+
+// Spell an array / view source as the pointer it decays to (`NY*[2]` -> `NY**`).
+LLVMBackend::TypeAndValue LLVMBackend::DecayedPointeeSource(const TypeAndValue& row,
+                                                           const TypeAndValue& to)
+{
+    const TypeAndValue from = RowAsFixedArray(row);
+    if (!from.IsArrayView && from.ConstArraySize <= 0) return from;
+    TypeAndValue source;
+    source.TypeName = from.TypeName;
+    source.Pointer = true;
+    source.PointerDepth = to.ValuePointerDepth();
+    return source;
+}
+
+LLVMBackend::TypeAndValue LLVMBackend::RowAsFixedArray(const TypeAndValue& row)
+{
+    // A row of a multi-dimensional array (`arr[1]` of `D[2][2]`) carries its own dimensions as
+    // inner ones with no leading size; spell it as the array it is (`D[2]`).
+    TypeAndValue value = row;
+    if (value.ConstArraySize == 0 && !value.ConstInnerDimensions.empty() && !value.Pointer
+        && !value.IsArrayView)
+    {
+        value.ConstArraySize = value.ConstInnerDimensions.front();
+        value.ConstInnerDimensions.erase(value.ConstInnerDimensions.begin());
+    }
+    return value;
+}
+
+LLVMBackend::TypeAndValue LLVMBackend::ArrayDecayedPointer(const TypeAndValue& row)
+{
+    const TypeAndValue value = RowAsFixedArray(row);
+    // The decay shape IsImplicitUnrelatedStructPointeeConversion reads: a struct element array,
+    // or a pointer element array with a recorded element depth.
+    if (value.ConstArraySize <= 0 || !value.ConstInnerDimensions.empty() || value.IsArrayView
+        || value.IsSimd || value.IsInterface || value.IsInterfacePointer || value.IsFunctionPointer
+        || (value.Pointer && value.PointerDepth == 0 && !value.ElemPointer))
+        return row;
+    const int depth = value.Pointer ? value.ElementPointerDepth() + 1 : 1;
+    TypeAndValue decayed = value;
+    decayed.ConstArraySize = 0;
+    decayed.Pointer = true;
+    decayed.PointerDepth = depth;
+    decayed.ElemPointer = depth >= 2;
+    return decayed;
+}
+
+LLVMBackend::TypeAndValue LLVMBackend::CxxArrayArgumentPointer(const NamedVariable& arg,
+                                                               llvm::Value* value) const
+{
+    TypeAndValue type = arg.TypeAndValue;
+    // A fixed-array argument (or a row `arr[1]` of a multi-dimensional one) arrives unnamed; its
+    // C++ element class is the IR array's element.
+    if ((type.ConstArraySize > 0 || !type.ConstInnerDimensions.empty()) && type.TypeName.empty()
+        && !type.Pointer)
+        for (llvm::Value* source : { arg.Storage, arg.Primary, value })
+        {
+            llvm::Type* stored = nullptr;
+            if (auto* alloca = llvm::dyn_cast_or_null<llvm::AllocaInst>(source))
+                stored = alloca->getAllocatedType();
+            else if (auto* global = llvm::dyn_cast_or_null<llvm::GlobalVariable>(source))
+                stored = global->getValueType();
+            else if (auto* gep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(source))
+                stored = llvm::isa<llvm::ArrayType>(gep->getResultElementType())
+                    ? gep->getResultElementType() : gep->getSourceElementType();
+            auto* array = llvm::dyn_cast_or_null<llvm::ArrayType>(stored);
+            auto* record = array != nullptr
+                ? llvm::dyn_cast<llvm::StructType>(array->getElementType()) : nullptr;
+            if (record != nullptr && record->hasName() && IsCxxRecord(record->getName().str()))
+            {
+                type.TypeName = record->getName().str();
+                break;
+            }
+        }
+    return ArrayDecayedPointer(type);
 }
 
 #if defined(__APPLE__)
@@ -894,8 +1046,9 @@ bool LLVMBackend::UnrelatedPointeePair(const NamedVariable& arg, const FunctionS
                                        size_t index, TypeAndValue& from, TypeAndValue& to) const
 {
     if (index >= candidate.Parameters.size()) return false;
-    from = arg.HasOriginalArgumentType ? arg.OriginalArgumentType : arg.TypeAndValue;
-    if (from.Pointer && from.TypeName.empty() && !arg.InferSourceTypeName.empty())
+    from = RowAsFixedArray(arg.HasOriginalArgumentType ? arg.OriginalArgumentType : arg.TypeAndValue);
+    if ((from.Pointer || from.ConstArraySize > 0) && from.TypeName.empty()
+        && !arg.InferSourceTypeName.empty())
         from.TypeName = arg.InferSourceTypeName;
     // A plain "..." argument is a char array: its decayed pointer is char* whatever the lowered
     // type says. Only the literal's own text counts, not a variable initialized from one.
@@ -932,7 +1085,22 @@ bool LLVMBackend::UnrelatedPointeePair(const NamedVariable& arg, const FunctionS
         to.IsRvalueRef = false;
         to.IsCxxRefToPointer = false;
     }
-    return IsImplicitIntegerPointeePointerConversion(from, to, /*includeDepthMismatch*/ false);
+    if (IsImplicitIntegerPointeePointerConversion(from, to, /*includeDepthMismatch*/ false))
+        return true;
+    // A `D[2][2]` decays to a row pointer: no other C++ class pointer parameter takes it.
+    if (IsCxxMultiDimArrayClassPointerConversion(to, from)) return true;
+    // Native callees take the store rule's struct pointee arm; C++ callees its C++ record arms.
+    if (from.IsSimd || to.IsSimd
+        || !IsImplicitUnrelatedStructPointeeConversion(from, to, candidate.IsCxx))
+        return false;
+    // A C++ record arm needs one proven source pointee: an original type that disagrees with
+    // the lowered one (a `?:` of literals typed for a converting ctor) proves nothing.
+    if (arg.HasOriginalArgumentType && !arg.IsStringLiteral && !arg.TypeAndValue.TypeName.empty()
+        && arg.TypeAndValue.TypeName != arg.OriginalArgumentType.TypeName
+        && IsImplicitUnrelatedStructPointeeConversion(from, to, true))
+        return false;
+    from = DecayedPointeeSource(from, to);
+    return true;
 }
 
 // T85: some C++ candidate of an operator set is not viable for `arg` at `index` by its pointee, so
@@ -4258,8 +4426,10 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                                                && paramIndex == 0;
                     cxxUserCtorConversion = !cxxReceiverParam
                         && !pointerShadowedByBool(arg, paramIndex)
-                        && CanImplicitlyConstructCxxClass(arg, *candidateParamItr,
-                            cxxByValueParam || cxxIndirectValueParam, candidates.size() > 1);
+                        && (CanImplicitlyConstructCxxClass(arg, *candidateParamItr,
+                                cxxByValueParam || cxxIndirectValueParam, candidates.size() > 1)
+                            || (!candidate.IsCxx
+                                && CflatClassParamCopyInitsByCtorTemplate(arg, *candidateParamItr)));
                     if (cxxUserCtorConversion)
                     {
                         result = 1;
@@ -4635,8 +4805,10 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     const bool cxxReceiverParam = candidate.IsCxx && candidate.IsMethod
                                                && paramIndex == 0;
                     if (!cxxReceiverParam && !pointerShadowedByBool(arg, paramIndex)
-                        && CanImplicitlyConstructCxxClass(arg, *candidateParamItr,
-                            cxxByValueParam || cxxIndirectValueParam, candidates.size() > 1))
+                        && (CanImplicitlyConstructCxxClass(arg, *candidateParamItr,
+                                cxxByValueParam || cxxIndirectValueParam, candidates.size() > 1)
+                            || (!candidate.IsCxx
+                                && CflatClassParamCopyInitsByCtorTemplate(arg, *candidateParamItr))))
                     {
                         result = 1;
                         if (candidate.IsCxx)
@@ -7331,6 +7503,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         const std::vector<antlr4::ParserRuleContext*>* argumentContexts)
 {
         std::vector<NamedVariable> arguments(inputArguments);
+        for (const NamedVariable& argument : inputArguments) NoteWholeArrayAliasRead(argument);
         // These describe only the call being lowered. Clear them before overload probing so a
         // later non-C++ call cannot make a chained result reuse an earlier sret temporary.
         lastCxxRetTemp_ = nullptr;
@@ -8880,12 +9053,28 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                         shownReceiver, bareMemberName, shownReceiver, bound));
                 return nullptr;
             }
-            // A lone arity-fitting candidate refused by the pointee rule names the conversion and its
-            // cast instead of "no overload"; other-arity overloads (core helpers) do not count.
+            // A lone arity-fitting candidate refused by the pointee rule names the conversion and cast;
+            // other-arity overloads and other structs' same-named methods do not count.
+            std::string arityReceiver;
+            if (!arguments.empty())
+            {
+                arityReceiver = arguments.front().TypeAndValue.TypeName;
+                if (arityReceiver.empty() && arguments.front().BaseType)
+                    if (auto* st = llvm::dyn_cast<llvm::StructType>(arguments.front().BaseType))
+                        arityReceiver = st->getName().str();
+            }
+            auto ownMember = [&](const FunctionSymbol& c) {
+                return c.IsMethod && !c.Parameters.empty()
+                    && c.Parameters.front().VariableName.ends_with("__")
+                    && c.Parameters.front().TypeName == arityReceiver;
+            };
+            const bool countOwnMembersOnly = !arityReceiver.empty()
+                && std::any_of(candidates.begin(), candidates.end(), ownMember);
             const FunctionSymbol* loneByArity = nullptr;
             size_t arityMatches = 0;
             for (const auto& c : candidates)
             {
+                if (countOwnMembersOnly && !ownMember(c)) continue;
                 const bool fits = c.Variadic ? arguments.size() >= c.Parameters.size()
                                              : c.Parameters.size() == arguments.size();
                 if (fits) { loneByArity = &c; ++arityMatches; }
@@ -9433,6 +9622,14 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             == cflat_cinterop::RawAbiSlot::Indirect;
                     std::string note = DescribeCxxImplicitArgumentBlock(
                         arguments[i], *pi, byValueParam || indirectValueParam);
+                    // A by-value base reached through two subobjects: name clang's reason.
+                    if (note.empty() && !pi->Pointer && !pi->IsAlias
+                        && !arguments[i].TypeAndValue.Pointer
+                        && IsCxxAmbiguousBase(arguments[i].TypeAndValue.TypeName, pi->TypeName))
+                        note = std::format(
+                            "ambiguous conversion from derived class '{}' to base class '{}'",
+                            DisplayCxxClassName(arguments[i].TypeAndValue.TypeName),
+                            DisplayCxxClassName(pi->TypeName));
                     if (note.empty()) continue;
                     msg += std::format("  [{}] argument {}: {}\n",
                         StripCxxConstTwin(c.SourceName.empty() ? shownFunctionName : c.SourceName),
@@ -10074,9 +10271,37 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     continue;
                 }
             }
+            // A derived value into a base with a ctor template: clang's copy-init picks the ctor (an
+            // exact `template <class T> B(const T&)` beats the slicing copy); ranking stays derived-to-base.
+            if (!candidate.IsCxx && !param.Pointer && !param.IsAlias && !param.IsRvalueRef
+                && !matched[i].TypeAndValue.Pointer && IsCxxRecord(matched[i].TypeAndValue.TypeName)
+                && IsCxxBaseOf(param.TypeName, matched[i].TypeAndValue.TypeName)
+                && CflatClassParamCopyInitsByCtorTemplate(matched[i], param))
+            {
+                std::string refusal;
+                if (ConvertThroughCxxConvertingCtor(matched[i], param.TypeName, nullptr, refusal)
+                    != CxxConvertingCtorResult::Converted)
+                    LogErrorMessage("cannot pass this expression to '{}'; {}",
+                                    { diagnosticFunctionName,
+                                      refusal.empty() ? std::string("no conversion") : refusal });
+                continue;
+            }
             if (!CanImplicitlyConstructCxxClass(matched[i], candidate.Parameters[i],
                 cxxByValueParam || cxxIndirectValueParam, candidates.size() > 1))
             {
+                // The ranking's ctor-template copy-init: build the parameter as `T v = arg;` does.
+                if (!candidate.IsCxx
+                    && CflatClassParamCopyInitsByCtorTemplate(matched[i], candidate.Parameters[i]))
+                {
+                    std::string refusal;
+                    const auto verdict = ConvertThroughCxxConvertingCtor(
+                        matched[i], candidate.Parameters[i].TypeName, nullptr, refusal);
+                    if (verdict != CxxConvertingCtorResult::Converted)
+                        LogErrorMessage("cannot pass this expression to '{}'; {}",
+                                        { diagnosticFunctionName,
+                                          refusal.empty() ? std::string("no conversion") : refusal });
+                    continue;
+                }
                 // Conversion-OPERATOR direction, selected by the same rank above.
                 if (!matched[i].TypeAndValue.Pointer
                     && !CxxConversionOperatorTo(matched[i].TypeAndValue.TypeName,
@@ -11636,7 +11861,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             for (size_t i = 0; i < candidate.Parameters.size() && i < matched.size()
                             && i < argList.size(); ++i)
             {
-                const TypeAndValue& at = matched[i].TypeAndValue;
+                // A `D[2]` argument converts as the `D*` it decays to.
+                const TypeAndValue at = CxxArrayArgumentPointer(matched[i], argList[i]);
                 const TypeAndValue& pt = candidate.Parameters[i];
                 if ((IsCxxDerivedToBasePointer(at, pt) && !at.ElemPointer)
                     || IsCxxDerivedToClangBasePointer(at, pt))
@@ -11795,6 +12021,56 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             NullAliasedUniqueByValueArgs(*transferParams, matched, argList);
         std::vector<llvm::Value*> sinkConsumedTemps = std::move(moveTransferConsumedTemps_);
         moveTransferConsumedTemps_.clear();
+        // An lvalue into a by-value trivially copyable C++ class parameter is a copy-init: clang
+        // still requires a usable copy constructor (the nontrivial path checks it below).
+        for (size_t i = 0; i < candidate.Parameters.size() && i < matched.size(); ++i)
+        {
+            const TypeAndValue& param = candidate.Parameters[i];
+            const NamedVariable& arg = matched[i];
+            if (param.Pointer || param.IsAlias || param.IsRvalueRef || param.IsCxxRef()
+                || arg.TypeAndValue.Pointer
+                || ((arg.IsRvalue || arg.Storage == nullptr) && !arg.IsExplicitMove)
+                || ResolveTypeAlias(arg.TypeAndValue.TypeName) != ResolveTypeAlias(param.TypeName))
+                continue;
+            // `f(move x)` / a consumed last use move-constructs the parameter.
+            if (arg.IsExplicitMove || arg.CxxParamLastUse || arg.UncopyableStructLastUse)
+            {
+                const std::string why = CxxCopyInitRefusal(param.TypeName, false, true,
+                    CxxCopyInitSite::Parameter, param.VariableName, diagnosticFunctionName);
+                if (!why.empty()) LogError(why);
+                continue;
+            }
+            const CxxCopyCtorFault fault = CxxTrivialCopyCtorRefusal(param.TypeName,
+                CxxConstReceiverKind(arg) != 0, false);
+            // An explicit copy ctor, or a CFlat struct whose member-wise copy is deleted.
+            if (fault == CxxCopyCtorFault::None || fault == CxxCopyCtorFault::CopyExplicit)
+            {
+                const std::string why = CxxCopyInitRefusal(param.TypeName, CxxConstReceiverKind(arg) != 0,
+                    false, CxxCopyInitSite::Parameter, param.VariableName, diagnosticFunctionName);
+                if (!why.empty()) LogError(why);
+                continue;
+            }
+            const bool moveRemedy = CxxTrivialCopyCtorRefusal(param.TypeName, false, true)
+                == CxxCopyCtorFault::None;
+            const std::string shown = DisplayCxxClassName(param.TypeName);
+            const bool deleted = fault == CxxCopyCtorFault::CopyDeleted;
+            if (deleted && moveRemedy)
+                LogErrorMessage("cannot copy C++ class '{}' into parameter '{}' of '{}': its copy "
+                                     "constructor is deleted - pass 'move x' or a temporary",
+                    { shown, param.VariableName, diagnosticFunctionName });
+            else if (deleted)
+                LogErrorMessage("cannot copy C++ class '{}' into parameter '{}' of '{}': its copy "
+                                     "constructor is deleted",
+                    { shown, param.VariableName, diagnosticFunctionName });
+            else if (moveRemedy)
+                LogErrorMessage("cannot copy C++ class '{}' into parameter '{}' of '{}': its copy "
+                                     "constructor is not accessible - pass 'move x' or a temporary",
+                    { shown, param.VariableName, diagnosticFunctionName });
+            else
+                LogErrorMessage("cannot copy C++ class '{}' into parameter '{}' of '{}': its copy "
+                                     "constructor is not accessible",
+                    { shown, param.VariableName, diagnosticFunctionName });
+        }
 
         /*
          * M4b - foreign nontrivial C++ values crossing this call by value.
@@ -12229,7 +12505,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             && i < argList.size(); ++i)
             {
                 const TypeAndValue& pt = candidate.Parameters[i];
-                const TypeAndValue& at = matched[i].TypeAndValue;
+                const TypeAndValue at = CxxArrayArgumentPointer(matched[i], argList[i]);
                 uint64_t off = 0;
                 bool inaccessible = false;
                 if ((IsCxxDerivedToBasePointer(at, pt) && !at.ElemPointer)
@@ -14739,16 +15015,108 @@ void LLVMBackend::SetFieldBorrowedAddress(const std::string& name, const std::st
         if (nv == nullptr) return;
         if (path.empty())
         {
-            nv->BorrowedAddressFields.clear();
+            // Escaped member arrays stay escaped: their aliases outlive any store to the root.
+            std::erase_if(nv->BorrowedAddressFields,
+                [](const std::string& known) { return !known.ends_with("[!"); });
             return;
         }
-        // A store to `a` retires the facts below it (`a.p`, `a[0]`) along with `a` itself.
+        // A store to `a` retires the facts below it (`a.p`, `a[0]`, `a[0]#`) along with `a` itself.
         std::erase_if(nv->BorrowedAddressFields, [&](const std::string& known) {
             return known == path || (known.size() > path.size()
                 && known.compare(0, path.size(), path) == 0
-                && (known[path.size()] == '.' || known[path.size()] == '['));
+                && (known[path.size()] == '.' || known[path.size()] == '['
+                    || known[path.size()] == '#')
+                && !known.ends_with("[!"));
         });
-        if (value && !nv->FieldFactsEscaped) nv->BorrowedAddressFields.insert(path);
+        if (nv->FieldFactsEscaped || !SlotPathTrackedOn(*nv, path) || SlotPathEscaped(*nv, path))
+            return;
+        if (value)
+            nv->BorrowedAddressFields.insert(path);
+        else if (SlotPathUnderDynamicMarker(*nv, path))
+            nv->BorrowedAddressFields.insert(path + "#");
+    }
+
+bool LLVMBackend::SlotPathEscaped(const NamedVariable& root, const std::string& path)
+{
+        for (size_t open = path.find('['); open != std::string::npos; open = path.find('[', open + 1))
+            if (root.BorrowedAddressFields.contains(path.substr(0, open) + "[!")) return true;
+        return false;
+    }
+
+bool LLVMBackend::SlotPathUnderDynamicMarker(const NamedVariable& root, const std::string& path)
+{
+        // `prefix[*` covers `path` unless a later static store (`path#` or an ancestor's) owns it.
+        bool covered = false;
+        for (size_t open = path.find('['); open != std::string::npos; open = path.find('[', open + 1))
+        {
+            if (!root.BorrowedAddressFields.contains(path.substr(0, open) + "[*")) continue;
+            covered = true;
+            const size_t close = path.find(']', open);
+            if (close == std::string::npos) return true;
+            for (size_t cut = path.find_first_of(".[", close + 1); ;
+                 cut = path.find_first_of(".[", cut + 1))
+            {
+                if (root.BorrowedAddressFields.contains(path.substr(0, cut) + "#"))
+                {
+                    covered = false;
+                    break;
+                }
+                if (cut == std::string::npos) break;
+            }
+            if (covered) return true;
+        }
+        return false;
+    }
+
+void LLVMBackend::NoteDynamicSlotBorrow(const std::string& name, const NamedVariable& slot,
+        const std::unordered_set<std::string>* structFacts)
+{
+        NamedVariable* nv = FindInnermostNamedVariable(name);
+        if (nv == nullptr || nv->FieldFactsEscaped) return;
+        // Known small extent: every element's slot, so a later static store retires its own.
+        constexpr int kMaxExpandedExtent = 64;
+        const int extent = slot.MovePathDynamicExtent;
+        if (extent > 0 && extent <= kMaxExpandedExtent)
+        {
+            for (int k = 0; k < extent; ++k)
+            {
+                const std::string path = slot.MovePathDynamicPrefix + "[" + std::to_string(k) + "]"
+                    + slot.MovePathDynamicSuffix;
+                if (!SlotPathTrackedOn(*nv, path) || SlotPathEscaped(*nv, path)) continue;
+                if (structFacts == nullptr)
+                    nv->BorrowedAddressFields.insert(path);
+                else
+                    for (const std::string& below : *structFacts)
+                        nv->BorrowedAddressFields.insert(
+                            path + (below.front() == '[' ? "" : ".") + below);
+            }
+            return;
+        }
+        // Unknown extent: the marker `prefix[*` stands for every element under the array.
+        const std::string under = slot.MovePathDynamicPrefix + "[";
+        if (!SlotPathTrackedOn(*nv, under + "*") || SlotPathEscaped(*nv, under + "0]")) return;
+        // The new store may hit an element a static store had proven owned: drop those overrides.
+        std::erase_if(nv->BorrowedAddressFields, [&](const std::string& known) {
+            return known.starts_with(under) && known.ends_with("#");
+        });
+        nv->BorrowedAddressFields.insert(under + "*");
+    }
+
+std::string LLVMBackend::BorrowSlotKey(const NamedVariable& nv)
+{
+        if (nv.MovePathHasDynamicIndex) return {};
+        // FieldMoveKey keeps a member-array element (`h.arr[0]`) out of move tracking only.
+        std::string key = FieldMoveKey(nv);
+        if (key.empty() && nv.IsElementAccess) key = nv.MovePathKey;
+        return key;
+    }
+
+bool LLVMBackend::SlotPathTrackedOn(const NamedVariable& root, const std::string& path)
+{
+        // `[K]` element facts only on a fixed-array alloca; a pointer root's slots have aliases.
+        return path.empty() || path.front() != '['
+            || (root.TypeAndValue.ConstArraySize > 0 && !root.TypeAndValue.IsArrayView
+                && llvm::isa_and_nonnull<llvm::AllocaInst>(root.Storage));
     }
 
 void LLVMBackend::MarkFieldFactsEscaped(const std::string& name)
@@ -14759,17 +15127,52 @@ void LLVMBackend::MarkFieldFactsEscaped(const std::string& name)
         nv->BorrowedAddressFields.clear();
     }
 
+void LLVMBackend::NoteWholeArrayAliasRead(const NamedVariable& source)
+{
+        if (source.IsElementAccess || source.CallerName.empty()
+            || source.TypeAndValue.ConstArraySize == 0)
+            return;
+        if (source.FieldName.empty())
+        {
+            MarkFieldFactsEscaped(source.CallerName);
+            return;
+        }
+        // A member fixed array (`fill(h.arr)`): only its own elements escape (`arr[!`), never the
+        // root's other slots (`h.p`).
+        const std::string arrayPath = BorrowSlotKey(source);
+        NamedVariable* nv = FindInnermostNamedVariable(source.CallerName);
+        if (nv == nullptr || arrayPath.empty()) return;
+        const std::string under = arrayPath + "[";
+        std::erase_if(nv->BorrowedAddressFields,
+            [&](const std::string& known) { return known.starts_with(under); });
+        nv->BorrowedAddressFields.insert(under + "!");
+    }
+
 void LLVMBackend::CopyFieldBorrowedAddresses(const std::string& destination, const std::string& source)
 {
         NamedVariable* dst = FindInnermostNamedVariable(destination);
         if (dst == nullptr) return;
         const NamedVariable* src = FindInnermostNamedVariable(source);
-        if (src == nullptr || src == dst || dst->FieldFactsEscaped)
-        {
-            if (src != dst) dst->BorrowedAddressFields.clear();
-            return;
-        }
-        dst->BorrowedAddressFields = src->BorrowedAddressFields;
+        if (src == dst) return;
+        std::unordered_set<std::string> escaped;
+        for (const std::string& known : dst->BorrowedAddressFields)
+            if (known.ends_with("[!")) escaped.insert(known);
+        if (src == nullptr || dst->FieldFactsEscaped)
+            dst->BorrowedAddressFields.clear();
+        else
+            dst->BorrowedAddressFields = src->BorrowedAddressFields;
+        dst->BorrowedAddressFields.insert(escaped.begin(), escaped.end());
+    }
+
+void LLVMBackend::MergeBorrowedAddressFields(std::unordered_set<std::string>& into,
+        const std::unordered_set<std::string>& other)
+{
+        // Facts and markers join by union; an owned override (`[0]#`) only where both paths agree.
+        std::erase_if(into, [&](const std::string& known) {
+            return known.ends_with("#") && !other.contains(known);
+        });
+        for (const std::string& known : other)
+            if (!known.ends_with("#")) into.insert(known);
     }
 
 void LLVMBackend::CopyFieldBorrowedAddressesUnder(const std::string& destination,
@@ -14781,6 +15184,52 @@ void LLVMBackend::CopyFieldBorrowedAddressesUnder(const std::string& destination
         if (dst == nullptr || src == nullptr || src == dst || dst->FieldFactsEscaped) return;
         for (const std::string& path : src->BorrowedAddressFields)
             dst->BorrowedAddressFields.insert(prefix + (path.front() == '[' ? "" : ".") + path);
+    }
+
+bool LLVMBackend::StoredValueMayBorrowAddress(const NamedVariable& value) const
+{
+        return IsBorrowedAddressValue(value.Primary) || IsProvableNonHeapAddressSource(value)
+            || value.PointsToBorrowedAddress || value.MayPointToBorrowedAddress
+            || CopyReadBorrowState(value).second || JoinHasBorrowedAddressArm(value.Primary);
+    }
+
+void LLVMBackend::NoteBraceSlotBorrow(const llvm::Value* destination, const std::string& path)
+{
+        if (destination != nullptr && !path.empty()) braceSlotBorrows_.emplace_back(destination, path);
+    }
+
+void LLVMBackend::NoteBraceNestedSlot(const llvm::Value* child, const llvm::Value* parent,
+        const std::string& path)
+{
+        if (child != nullptr && parent != nullptr && child != parent && !path.empty())
+            braceSlotParents_[child] = { parent, path };
+    }
+
+void LLVMBackend::ApplyBraceSlotBorrows(const std::string& name)
+{
+        const NamedVariable* nv = name.empty() ? nullptr : FindInnermostNamedVariable(name);
+        const llvm::Value* root = nv != nullptr ? nv->Storage : nullptr;
+        if (root != nullptr && llvm::isa<llvm::AllocaInst>(root))
+            for (const auto& [destination, leaf] : braceSlotBorrows_)
+            {
+                // Walk the nested-destination links up to the binding's storage, building the path.
+                std::string path = leaf;
+                const llvm::Value* at = destination;
+                for (size_t depth = 0; at != root && depth < 64; ++depth)
+                {
+                    auto it = braceSlotParents_.find(at);
+                    if (it == braceSlotParents_.end()) { at = nullptr; break; }
+                    path = it->second.second + (path.front() == '[' ? "" : ".") + path;
+                    at = it->second.first;
+                }
+                if (at == root) SetFieldBorrowedAddress(name, path, true);
+            }
+    }
+
+void LLVMBackend::ClearBraceSlotBorrows()
+{
+        braceSlotBorrows_.clear();
+        braceSlotParents_.clear();
     }
 
 void LLVMBackend::SetStackCharBufferBorrow(const std::string& name, bool value,

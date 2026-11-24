@@ -6435,6 +6435,33 @@ bool testInterfaceByValueTempDestroyedOnce()
     return result;
 }
 
+// CPPRECPTR: an interface value compared with an object pointer tests object identity, like
+// fat-vs-fat. Pre-fix `i == p` was false for the same object and `p == i` found no operator==.
+bool testInterfaceObjectPointerCompare()
+{
+    bool result = true;
+    Circle c = default;
+    Circle d = default;
+    IShape i = &c;
+    IShape j = &c;
+    Circle* pc = &c;
+    Circle* pd = &d;
+    void* pv = &c;
+    result &= Test("ifaceptr_cmp_same", (i == pc ? 10 : 0) + (i == j ? 1 : 0), 11);
+    result &= Test("ifaceptr_cmp_reversed", (pc == i ? 10 : 0) + (pc != i ? 1 : 0), 10);
+    result &= Test("ifaceptr_cmp_other", (i == pd ? 10 : 0) + (i != pd ? 1 : 0), 1);
+    result &= Test("ifaceptr_cmp_void", (i == pv ? 10 : 0) + (pv == i ? 1 : 0), 11);
+    FileStream fs = default;
+    IReader r = &fs;
+    IWriter w = &fs;
+    FileStream* pfs = &fs;
+    result &= Test("ifaceptr_cmp_second_iface", (r == pfs ? 10 : 0) + (w == pfs ? 1 : 0), 11);
+    Circle* none = nullptr;
+    IShape n = none;
+    result &= Test("ifaceptr_cmp_null_object", (n == none ? 10 : 0) + (i == none ? 1 : 0), 10);
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -6554,6 +6581,7 @@ extern int main()
     total++; passed += testAutoCopyInterface()                          ? 1 : 0;
     total++; passed += testInterfaceValuePointerArguments()              ? 1 : 0;
     total++; passed += testInterfaceByValueTempDestroyedOnce()           ? 1 : 0;
+    total++; passed += testInterfaceObjectPointerCompare()               ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

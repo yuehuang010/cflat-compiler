@@ -4469,21 +4469,87 @@ bool IsLastUseOfForeignCxxParam(
     const auto parameter = compiler->GetFunctionArgument(name);
     if (parameter.Storage == nullptr || source.Storage != parameter.Storage)
         return false;
+    // A struct whose member-wise copy is deleted has no copy to fall back on: a use a `return`
+    // ends the path after is its last (as IsLastUseOfUncopyableStruct counts it).
+    return IsLastBareUseInScope(useCtx, name, nullptr,
+                                compiler->HasCxxRecords()
+                                    && compiler->HasUncopyableCxxField(source.TypeAndValue.TypeName));
+}
 
-    CFlatParser::FunctionDefinitionContext* function = nullptr;
+// The function body enclosing `useCtx` (null inside a lambda or outside a function).
+static antlr4::tree::ParseTree* EnclosingFunctionBody(antlr4::ParserRuleContext* useCtx)
+{
     for (antlr4::tree::ParseTree* node = useCtx; node != nullptr; node = node->parent)
     {
         if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr)
-            return false;
+            return nullptr;
         if (auto* fn = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(node))
-        {
-            function = fn;
-            break;
-        }
+            return fn->compoundStatement();
     }
-    antlr4::tree::ParseTree* body = function != nullptr
-        ? static_cast<antlr4::tree::ParseTree*>(function->compoundStatement()) : nullptr;
+    return nullptr;
+}
+
+bool IsLastUseOfUncopyableStruct(
+    LLVMBackend* compiler, antlr4::ParserRuleContext* useCtx,
+    const LLVMBackend::NamedVariable& source)
+{
+    if (compiler == nullptr || useCtx == nullptr || source.FieldName.size() != 0
+        || source.TypeAndValue.Pointer || source.TypeAndValue.IsAlias || source.Storage == nullptr
+        || source.IsElementAccess || !compiler->HasCxxRecords())
+        return false;
+    // A C++ class counts only as a forwarded by-value parameter (a local keeps clang's refusal).
+    const bool cxxClass = compiler->CxxTrivialCopyCtorRefusal(source.TypeAndValue.TypeName, false, false)
+        != LLVMBackend::CxxCopyCtorFault::None;
+    std::string fieldPath, fieldType;
+    LLVMBackend::CxxCopyCtorFault fault = LLVMBackend::CxxCopyCtorFault::None;
+    if (!cxxClass && !compiler->FindUncopyableCxxField(source.TypeAndValue.TypeName, false, fieldPath,
+                                                       fieldType, fault))
+        return false;
+    const std::string name = source.CallerName.empty()
+        ? source.TypeAndValue.VariableName : source.CallerName;
+    if (name.empty() || useCtx->getText() != name) return false;
+    if (cxxClass && !compiler->IsFunctionParameter(name)) return false;
+    if (compiler->IsFunctionParameter(name))
+    {
+        const auto parameter = compiler->GetFunctionArgument(name);
+        if (parameter.Storage == nullptr || source.Storage != parameter.Storage) return false;
+        return IsLastBareUseInScope(useCtx, name, nullptr, true);
+    }
+    // A local slot (never a global); the declaring block below is found lexically.
+    if (!llvm::isa<llvm::AllocaInst>(source.Storage)) return false;
+    // The local's scope: the innermost enclosing block declaring `name` before the use.
+    antlr4::tree::ParseTree* body = EnclosingFunctionBody(useCtx);
+    const size_t useToken = (size_t)useCtx->getStart()->getTokenIndex();
+    for (antlr4::tree::ParseTree* node = useCtx->parent; node != nullptr; node = node->parent)
+    {
+        auto* block = dynamic_cast<CFlatParser::CompoundStatementContext*>(node);
+        if (block != nullptr && block->blockItemList() != nullptr)
+            for (auto* item : block->blockItemList()->blockItem())
+            {
+                auto* declaration = item->declaration();
+                if (item->getStart() == nullptr || (size_t)item->getStart()->getTokenIndex() >= useToken
+                    || declaration == nullptr || declaration->initDeclaratorList() == nullptr)
+                    continue;
+                for (auto* init : declaration->initDeclaratorList()->initDeclarator())
+                {
+                    auto* declarator = init->declarator();
+                    auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
+                    if (direct != nullptr && direct->Identifier() != nullptr
+                        && direct->Identifier()->getText() == name)
+                        return IsLastBareUseInScope(useCtx, name, block, true);
+                }
+            }
+        if (node == body) break;
+    }
+    return false;
+}
+
+bool IsLastBareUseInScope(antlr4::ParserRuleContext* useCtx, const std::string& name,
+                          antlr4::tree::ParseTree* scope, bool returnEndsPath)
+{
+    antlr4::tree::ParseTree* body = EnclosingFunctionBody(useCtx);
     if (body == nullptr) return false;
+    if (scope != nullptr) body = scope;
 
     struct Occurrence
     {
@@ -4553,7 +4619,36 @@ bool IsLastUseOfForeignCxxParam(
     collect(collect, body);
 
     const size_t useToken = (size_t)useCtx->getStart()->getTokenIndex();
+    auto occursIn = [&](antlr4::tree::ParseTree* node) {
+        const auto interval = node->getSourceInterval();
+        for (const auto& occurrence : occurrences)
+            if (occurrence.token > useToken && (ssize_t)occurrence.token >= interval.a
+                && (ssize_t)occurrence.token <= interval.b)
+                return true;
+        return false;
+    };
+    // `returnEndsPath`: a `return` after the use (no use between) makes later uses unreachable.
+    auto returnGuarded = [&]() {
+        for (antlr4::tree::ParseTree* node = useCtx; node != nullptr && node != body->parent;
+             node = node->parent)
+        {
+            auto* item = dynamic_cast<CFlatParser::BlockItemContext*>(node);
+            auto* block = item != nullptr && item->parent != nullptr
+                ? dynamic_cast<CFlatParser::BlockItemListContext*>(item->parent) : nullptr;
+            if (block == nullptr) continue;
+            auto items = block->blockItem();
+            for (size_t i = std::find(items.begin(), items.end(), item) - items.begin(); i < items.size(); ++i)
+            {
+                auto* statement = items[i]->statement();
+                auto* jump = statement != nullptr ? statement->jumpStatement() : nullptr;
+                if (jump != nullptr && jump->Return() != nullptr) return !occursIn(items[i]);
+                if (occursIn(items[i])) return false;
+            }
+        }
+        return false;
+    };
     bool found = false;
+    bool later = false;
     for (const auto& occurrence : occurrences)
     {
         if (occurrence.token == useToken && !found)
@@ -4563,9 +4658,10 @@ bool IsLastUseOfForeignCxxParam(
             continue;
         }
         if (occurrence.inNestedLambda) return false;
-        if (occurrence.token > useToken) return false;
+        if (occurrence.token > useToken) later = true;
     }
-    return found;
+    if (!found) return false;
+    return !later || (returnEndsPath && returnGuarded());
 }
 void CollectOwnReturnExpressions(antlr4::tree::ParseTree* node,
                                         std::vector<CFlatParser::ExpressionContext*>& out,

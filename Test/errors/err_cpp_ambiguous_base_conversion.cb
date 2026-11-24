@@ -1,0 +1,77 @@
+// A C++ base reached through two non-virtual subobjects (AmbC : LC, RC, both from BC) has no
+// single slice: clang refuses every by-value / pointer upcast to it as ambiguous.
+import cpp "cpp_interop_basic.h";
+
+int AmbTake(cppi_etarg.BC b) { return b.how * 10 + b.v; }
+int AmbTakeGeneric<T>(T k, cppi_etarg.BC b) { return b.how * 10 + b.v + (int)k; }
+int AmbTakeP(cppi_etarg.BP b) { return b.v; }
+struct AmbHolder { int z = default; int take(cppi_etarg.BC b) { return b.how * 10 + b.v; } };
+interface IAmbTake { int take(cppi_etarg.BC b); };
+class AmbTakeImpl : IAmbTake
+{
+    int z = default;
+    int take(cppi_etarg.BC b) { return b.how * 10 + b.v; }
+};
+
+extern int main()
+{
+    cppi_etarg.AmbC ambC = default;
+    cppi_etarg.AmbP ambP = default;
+    cppi_etarg.AmbG ambG = default;
+    expect_error("ambiguous conversion from derived class 'cppi_etarg.AmbC' to base class 'cppi_etarg.BC'") {
+        int r = AmbTake(ambC);
+    }
+    expect_error("ambiguous conversion from derived class 'cppi_etarg.AmbC' to base class 'cppi_etarg.BC'") {
+        int r = AmbTake(cppi_etarg.AmbC());
+    }
+    expect_error("ambiguous conversion from derived class 'cppi_etarg.AmbC' to base class 'cppi_etarg.BC'") {
+        int r = AmbTake(move ambC);
+    }
+    expect_error("ambiguous conversion from derived class 'cppi_etarg.AmbC' to base class 'cppi_etarg.BC'") {
+        int r = AmbTakeGeneric(1, ambC);
+    }
+    expect_error("ambiguous conversion from derived class 'cppi_etarg.AmbC' to base class 'cppi_etarg.BC'") {
+        AmbHolder holder = default;
+        int r = holder.take(ambC);
+    }
+    expect_error("ambiguous conversion from derived class 'cppi_etarg.AmbC' to base class 'cppi_etarg.BC'") {
+        AmbTakeImpl impl;
+        IAmbTake iface = impl;
+        int r = iface.take(ambC);
+    }
+    expect_error("ambiguous conversion from derived class 'cppi_etarg.AmbP' to base class 'cppi_etarg.BP'") {
+        int r = AmbTakeP(ambP);
+    }
+    expect_error("ambiguous conversion from derived class 'cppi_etarg.AmbP' to base class 'cppi_etarg.BP'") {
+        int r = cppi_etarg.TakeBP(ambP);
+    }
+    // Assignment binds the copy assignment's `const BG&`: BG's greedy template does not rescue it.
+    expect_error("ambiguous conversion from derived class 'cppi_etarg.AmbG' to base class 'cppi_etarg.BG'") {
+        cppi_etarg.BG target = default;
+        target = ambG;
+    }
+    expect_error("ambiguous conversion from derived class 'cppi_etarg.AmbC' to base class 'cppi_etarg.BC'") {
+        cppi_etarg.BC target = default;
+        target = ambC;
+    }
+    expect_error("ambiguous conversion from derived class 'cppi_etarg.AmbV' to base class 'cppi_etarg.BV'") {
+        unique cppi_etarg.BV* owned = new cppi_etarg.AmbV();
+    }
+    expect_error("ambiguous conversion from derived class 'cppi_etarg.AmbP' to base class 'cppi_etarg.BP'") {
+        cppi_etarg.BP* p = cppi_etarg.RefAmbP();
+    }
+    expect_error("ambiguous conversion from derived class 'cppi_etarg::AmbC' to base class 'cppi_etarg::BC'") {
+        cppi_etarg.BC* p = &ambC;
+    }
+    // SLICEPICK: a trivially copyable base reached twice is refused at init and assignment too.
+    expect_error("ambiguous conversion from derived class 'cppi_etarg.AmbP' to base class 'cppi_etarg.BP'") {
+        cppi_etarg.AmbP source = default;
+        cppi_etarg.BP target = source;
+    }
+    expect_error("ambiguous conversion from derived class 'cppi_etarg.AmbP' to base class 'cppi_etarg.BP'") {
+        cppi_etarg.AmbP source = default;
+        cppi_etarg.BP target = default;
+        target = source;
+    }
+    return 0;
+}

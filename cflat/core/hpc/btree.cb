@@ -397,7 +397,7 @@ struct btree<K, V>
         {
             // Poisoned for a non-copyable V like every other copying entry point. Guarding only the
             // public add()/set()/insert() is NOT enough: this helper is instantiated regardless.
-            if const (!is_copyable(V)) compile_error("this btree value type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (t.add(k, move x) / t.set(k, move x) / t.insert(k, move x)) to transfer ownership instead, or give the type a 'copy()' method");
+            if const (!is_copyable(V)) compile_error("this btree value type is not copyable; write 'move' at the call site (t.add(k, move x) / t.set(k, move x) / t.insert(k, move x)) to transfer ownership instead, or give the type a 'copy()' method");
             else
             {
                 int i = _leafOpenSlot(n, key);
@@ -474,7 +474,7 @@ struct btree<K, V>
         {
             // Poison the copying overload for a non-copyable V so the class still instantiates and
             // `add(k, move x)` stays usable; the dead arm emits no store of a non-copyable value.
-            if const (!is_copyable(V)) compile_error("this btree value type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (t.add(k, move x) / t.set(k, move x) / t.insert(k, move x)) to transfer ownership instead, or give the type a 'copy()' method");
+            if const (!is_copyable(V)) compile_error("this btree value type is not copyable; write 'move' at the call site (t.add(k, move x) / t.set(k, move x) / t.insert(k, move x)) to transfer ownership instead, or give the type a 'copy()' method");
             else
             {
                 btree_node<K, V>* n = _descendSplitting(key);
@@ -509,7 +509,7 @@ struct btree<K, V>
     {
         if const (is_assignable(V) && is_assignable(K))
         {
-            if const (!is_copyable(V)) compile_error("this btree value type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (t.add(k, move x) / t.set(k, move x) / t.insert(k, move x)) to transfer ownership instead, or give the type a 'copy()' method");
+            if const (!is_copyable(V)) compile_error("this btree value type is not copyable; write 'move' at the call site (t.add(k, move x) / t.set(k, move x) / t.insert(k, move x)) to transfer ownership instead, or give the type a 'copy()' method");
             else
             {
                 btree_node<K, V>* n = _descendSplitting(key);
@@ -801,7 +801,7 @@ struct btree<K, V>
     {
         if const (is_assignable(V) && is_assignable(K))
         {
-            if const (!is_copyable(V)) compile_error("this btree value type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (t.add(k, move x) / t.set(k, move x) / t.insert(k, move x)) to transfer ownership instead, or give the type a 'copy()' method");
+            if const (!is_copyable(V)) compile_error("this btree value type is not copyable; write 'move' at the call site (t.add(k, move x) / t.set(k, move x) / t.insert(k, move x)) to transfer ownership instead, or give the type a 'copy()' method");
             else
             {
                 btree_node<K, V>* leaf = _lockLeafForInsert(key);

@@ -1,0 +1,22 @@
+// LITPTR: `*"xyz"` and `"xyz" + n` are `(const char)*` reads (C pointer arithmetic on the literal);
+// a write through them, or binding the result to a mutable `char*`, is refused as for `"xyz"[0]`.
+extern int main()
+{
+    int c = 1;
+    expect_error("cannot assign to '*\"xyz\"': it is reached through a pointer to const") {
+        *"xyz" = 'A';
+    }
+    expect_error("it is reached through a pointer to const") {
+        *("xyz" + 1) = 'A';
+    }
+    expect_error("it is reached through a pointer to const") {
+        *(c ? "ab" : "cd") = 'A';
+    }
+    expect_error("it is reached through a pointer to const") {
+        ("xyz" + 1)[1] = 'A';
+    }
+    expect_error("cannot convert '(const char)*' to 'char*': the conversion discards const") {
+        char* p = "xyz" + 1;
+    }
+    return 0;
+}

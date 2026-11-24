@@ -330,6 +330,45 @@ void MainListener::LowerInterfaceNullCompare(antlr4::ParserRuleContext* ctx,
             lv.value = compiler->builder->CreateExtractValue(lv.value, { 1u }, "iface_data");
         else if (isFat(rv) && isNull(lv))
             rv.value = compiler->builder->CreateExtractValue(rv.value, { 1u }, "iface_data");
+        else if (isFat(lv) != isFat(rv))
+        {
+            // Interface value vs object pointer: object identity, like fat-vs-fat. A pointer that
+            // can never address a CFlat interface object (primitive, C++ class, T**) is refused.
+            LLVMBackend::TypedValue& fat = isFat(lv) ? lv : rv;
+            const LLVMBackend::TypedValue& other = isFat(lv) ? rv : lv;
+            if (other.value == nullptr || !other.value->getType()->isPointerTy()) return;
+            const LLVMBackend::TypeAndValue otherType = InferTernaryArmType(other);
+            if (otherType.Pointer && !otherType.IsFunctionPointer && !otherType.TypeName.empty())
+            {
+                const std::string ifaceSpelling = SpellType(*compiler, InferTernaryArmType(fat));
+                const std::string otherSpelling = SpellType(*compiler, otherType);
+                if (otherType.ValuePointerDepth() >= 2 || otherType.IsInterfacePointer)
+                {
+                    LogErrorContext(ctx, std::format(
+                        "cannot compare interface '{}' with '{}': a multi-level pointer is never "
+                        "an interface object; dereference it or cast it to 'void*'",
+                        ifaceSpelling, otherSpelling));
+                    return;
+                }
+                if (compiler->IsPrimitiveTypeName(otherType.TypeName) && otherType.TypeName != "void")
+                {
+                    LogErrorContext(ctx, std::format(
+                        "cannot compare interface '{}' with '{}': a primitive pointee is never an "
+                        "interface object; cast it to 'void*' to compare addresses",
+                        ifaceSpelling, otherSpelling));
+                    return;
+                }
+                if (compiler->IsCxxRecord(otherType.TypeName))
+                {
+                    LogErrorContext(ctx, std::format(
+                        "cannot compare interface '{}' with '{}': a C++ class pointee is never a "
+                        "CFlat interface object; cast it to 'void*' to compare addresses",
+                        ifaceSpelling, otherSpelling));
+                    return;
+                }
+            }
+            fat.value = compiler->builder->CreateExtractValue(fat.value, { 1u }, "iface_data");
+        }
     }
 
 // A C++ comparison category value (`std::strong_ordering` and friends), by its spelled type.
@@ -392,6 +431,23 @@ static llvm::Value* WrapOrderingCodeLike(llvm::IRBuilderBase& builder, llvm::Val
         }
         return nullptr;
 }
+
+/*
+ * A compare operand's type for the C++ class-pointer rules. A `?:` / `??` join names its class
+ * and depth only on the TypedValue (JoinTernaryClassPointee), so a bare joined pointer takes it.
+ */
+LLVMBackend::TypeAndValue MainListener::CxxCompareOperandType(const LLVMBackend::TypedValue& value) {
+        LLVMBackend::TypeAndValue type = InferTernaryArmType(value);
+        if ((type.Pointer && !type.TypeName.empty()) || value.joinClassPointee.empty()
+            || value.joinClassPointeeDepth < 1 || !compilerLLVM->IsCxxRecord(value.joinClassPointee))
+            return type;
+        LLVMBackend::TypeAndValue joined;
+        joined.TypeName = value.joinClassPointee;
+        joined.Pointer = true;
+        joined.PointerDepth = value.joinClassPointeeDepth;
+        joined.ElemPointer = value.joinClassPointeeDepth > 1;
+        return joined;
+    }
 
 LLVMBackend::TypedValue MainListener::ParseEqualityExpression(CFlatParser::EqualityExpressionContext* ctx, ResultUse use) {
         CallPostfixScope operatorPostfix(this);
@@ -488,8 +544,13 @@ LLVMBackend::TypedValue MainListener::ParseEqualityExpression(CFlatParser::Equal
                 }
             }
 
-            Compiler(ctx)->RejectImplicitIntegerPointeePointerConversion(
+            // Distinct struct pointees compare only through a cast, like a store (C++: an error).
+            Compiler(ctx)->RejectImplicitPointeePointerStore(
                 InferTernaryArmType(lv), InferTernaryArmType(rv));
+            Compiler(ctx)->RejectCxxClassPointerCompare(CxxCompareOperandType(lv),
+                                                        CxxCompareOperandType(rv));
+            Compiler(ctx)->AdjustCxxClassPointerCompare(CxxCompareOperandType(lv), lv.value,
+                                                        CxxCompareOperandType(rv), rv.value);
 
             // Interface comparisons use the DATA pointer (fat-ptr field 1): a failed `as <Interface>`
             // yields a zeroed fat pointer, while fat-vs-fat compares test object identity.
@@ -680,6 +741,8 @@ LLVMBackend::TypedValue MainListener::TypedValueOfNamedOperand(LLVMBackend::Name
         if (result.isAlias) Compiler(ctx)->RegisterAliasValue(result.value);
         if (namedVar.FromOwningTempField && !namedVar.OwningTempParent)
             Compiler(ctx)->RegisterTempFieldValue(result.value);
+        // `c ? h.p : new T()` after `h.p = &x;`: the arm value keeps the slot's may-borrow fact.
+        Compiler(ctx)->NoteSlotReadBorrowValue(namedVar, result.value);
         result.elemType = elemType;
         result.isArrayView = namedVar.TypeAndValue.IsArrayView;
         result.sourceTypeName = namedVar.TypeAndValue.TypeName;
@@ -1431,8 +1494,25 @@ LLVMBackend::TypedValue MainListener::ParseRelationalExpression(CFlatParser::Rel
                 return {};
             }
 
-            Compiler(ctx)->RejectImplicitIntegerPointeePointerConversion(
+            // An interface value has no address order (only == / != test its object identity);
+            // relational lowering on the fat value failed LLVM verification.
+            if (auto* fatTy = Compiler(ctx)->GetFatPtrType();
+                (lv.value != nullptr && lv.value->getType() == fatTy)
+                || (rv.value != nullptr && rv.value->getType() == fatTy))
+            {
+                LogErrorContext(ctx, std::format(
+                    "operator '{}' cannot compare an interface value: interface values compare "
+                    "only with '==' and '!='", op));
+                return {};
+            }
+
+            // Distinct struct pointees compare only through a cast, like a store (C++: an error).
+            Compiler(ctx)->RejectImplicitPointeePointerStore(
                 InferTernaryArmType(lv), InferTernaryArmType(rv));
+            Compiler(ctx)->RejectCxxClassPointerCompare(CxxCompareOperandType(lv),
+                                                        CxxCompareOperandType(rv));
+            Compiler(ctx)->AdjustCxxClassPointerCompare(CxxCompareOperandType(lv), lv.value,
+                                                        CxxCompareOperandType(rv), rv.value);
 
             auto* overload = TryBinaryOperatorOverload(lv, op, rv, ctx, lv.elemType,
                                                        rv.pointerDepth, rv.elemPointer,
@@ -2817,6 +2897,34 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                 leftLiteralIdentity.clear();
                 lhsArithIdentity.clear();
 
+                // `"xyz" + n` / `n + "xyz"` / `"xyz" - n`: an untyped narrow literal (or a join of
+                // them) beside an integer is C pointer arithmetic on a `(const char)*`.
+                auto typeLiteralPointer = [&](LLVMBackend::TypedValue& operand, llvm::Value* value,
+                                              llvm::Value* other) {
+                    if (operand.elemType != nullptr || !operand.sourceType.TypeName.empty()
+                        || !operand.sourceTypeName.empty() || value == nullptr || other == nullptr
+                        || !value->getType()->isPointerTy() || !other->getType()->isIntegerTy()
+                        || (!Compiler(ctx)->IsStringLiteralGlobal(value)
+                            && !Compiler(ctx)->JoinIsCharPointer(value, true)))
+                        return false;
+                    operand.elemType = Compiler(ctx)->builder->getInt8Ty();
+                    operand.sourceType = {};
+                    operand.sourceType.TypeName = "char";
+                    operand.sourceType.Pointer = true;
+                    operand.sourceType.ConstMask = 1;
+                    operand.hasSourceType = true;
+                    operand.pointerDepth = 1;
+                    return true;
+                };
+                if (i == 1 && !hasPointerArithmeticResultType && (op == "+" || op == "-")
+                    && typeLiteralPointer(lv, lvalue, rvalue))
+                {
+                    elemType = lv.elemType;
+                    pointerArithmeticSourceType = lv.sourceType;
+                    pointerArithmeticDepth = 1;
+                }
+                if (op == "+") typeLiteralPointer(rv, rvalue, lvalue);
+
                 if (lvalue->getType()->isPointerTy() && rvalue->getType()->isPointerTy() && op == "-")
                 {
                     isPointerDifference = true;
@@ -3597,6 +3705,10 @@ llvm::Value* MainListener::LoadNamedVariableImpl(LLVMBackend::NamedVariable& nam
                     && !llvm::isa<llvm::AllocaInst>(namedVar.Storage)
                     && !llvm::isa<llvm::GlobalVariable>(namedVar.Storage)
                     && !llvm::isa<llvm::GetElementPtrInst>(namedVar.Storage))
+                    return TagViewElementAccess(compiler->CreateLoad(namedVar.BaseType, namedVar.Storage), namedVar);
+                // `"xyz"[0]`: the element GEP folds to the literal global itself; read the element.
+                if (namedVar.BaseType && namedVar.BaseType->isIntegerTy()
+                    && compiler->IsStringLiteralGlobal(namedVar.Storage))
                     return TagViewElementAccess(compiler->CreateLoad(namedVar.BaseType, namedVar.Storage), namedVar);
                 return TagViewElementAccess(compiler->CreateLoad(namedVar.Storage), namedVar);
             }
