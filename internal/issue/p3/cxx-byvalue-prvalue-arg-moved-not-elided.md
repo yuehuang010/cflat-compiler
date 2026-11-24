@@ -78,14 +78,6 @@ Repro (free template, master exe moves once; clang++ moves zero):
 Previously recorded (still measured against the master exe): three approaches to the forwarding
 wrapper did not change the count; the direct-ABI route above is the one that did.
 
-The following extra copies are pre-existing; current counts match master and remain balanced
-(dead == born), but clang++ -std=c++20 elides one copy in each case:
-
-- A non-direct callee returning a conditional: 2,2,0,3 (clang 2,1,0,2).
-- A non-direct callee returning a field: 1,2,0,2 (clang 1,1,0,1).
-- A recursive callee: 3,2,0,4 (clang 3,0,1,3).
-- `mk2(make(1))`: 2,1,0,2 (clang 2,0,0,1).
-
 ## Left after TERNELIDE (daa3a99f, 2026-10-30 box 7; Opus reviews, repros scratch/repro_keep/ternelide/ w/x/y/z .cb + .cpp twins, w.hpp)
 - Same-class prvalue conditional (and plain prvalue) into `gen<T>(...)`, `function<>` and `Lambda<>` calls: one extra move (indirect /
   generic call path has no elision). Counts balanced.

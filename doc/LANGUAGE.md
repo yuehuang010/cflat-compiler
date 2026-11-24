@@ -700,7 +700,9 @@ A call through the value returns the declared pointee const and checks its argum
 declared parameters. C++ function types are not covered yet.
 
 **`is_assignable(T)`** is a compile-time intrinsic that is false when `T` is a CFlat struct holding
-a `const` field anywhere in its by-value layout. Core containers relocate elements by construction
+a `const` field anywhere in its by-value layout, or an imported C++ class clang refuses to assign
+from both a non-const lvalue and a non-const rvalue (deleted, inaccessible or ambiguous `operator=`;
+a move-only class stays assignable). Core containers relocate elements by construction
 and guard only in-place reassignment (`list<T>.sort()`), so `list<S>` works for a const-field `S`
 until an assigning method is called. It sits with `is_unique(T)` and
 `is_copyable(T)` under Generics.
@@ -2166,7 +2168,8 @@ if const (is_cpp_class(T) && !is_copyable(T))
 ```
 
 `is_assignable(T)` is false when `T` is a CFlat struct holding a `const` field anywhere in its
-by-value layout (such a value can be constructed but never reassigned), true otherwise. Core
+by-value layout (such a value can be constructed but never reassigned), or an imported C++ class
+whose same-class assignment clang refuses from both an lvalue and an rvalue, true otherwise. Core
 containers relocate with `construct_at`, and only guard in-place reassignment (`list<T>.sort()`,
 `channel<T>` / `spsc_queue<T>` slot writes, `view<T>.set()`) with it.
 

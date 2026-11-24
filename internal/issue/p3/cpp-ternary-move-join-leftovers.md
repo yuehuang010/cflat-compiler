@@ -1,22 +1,44 @@
-# Ternary move-join leftovers after T249 and T263 (lowered-struct and C++ shapes)
+# Ternary move-join leftovers (lowered-struct, [cpp] struct and C++ class shapes)
 
-## Lowered-struct ternary leftovers after T249 (repros scratch/repro_keep/t249_rev/cases3/, clang twins .cpp)
-- (counts differ from clang; no leak on current binaries) `take2T(h2, k ? mkHT() : move h1)` with a later sibling copy throwing (e3.cb): worktree/master construct the `mkHT()` join before copying `h2` (rv.C 4/4, th.T 3/3); clang copies `h2` first, throws, and never evaluates `mkHT()` (rv.C 3/3, th.T 2/2). The join owner is already registered in the resume block. Root cause is delayed by-value argument materialization after later arguments; preserve clang's evaluated order.
-- (pre-existing) `k ? move h1 : h2;` as an expression statement does no move/copy and zeroes h1 (disc.cb).
-- (pre-existing) by-value first-argument unwind leak (e2b.cb, e2c.cb), master the same.
+Re-measured 2026-11-19 (TERNLEFT) against clang++ -std=c++20. Types: `cppbv.CntA` / `cppbv.TernaryCnt`
+(Test/library/cpp_t231_byvalue.hpp, counted ctors/copies/moves/dtors), `struct H { cppbv.CntA c = cppbv.CntA(0); }`
+(a lowered CFlat struct), `[cpp] struct LU { int x = 0; cppbv.CntA item; LU(int v) { x = v; } ~LU() { lu_d++; } }`.
+Closed by TERNLEFT (legs 99600-99625, 8306-8313): lowered `z = k ? move a : move b` (was +1 move/dtor, the
+flat_host shape), by-value parameters moved by a `?:` arm (were never destroyed), discarded mixed joins of a
+lowered host or an imported class (no temp; `h1` kept 21 instead of clang's -1), lowered [cpp] `auto r = k ? LU(4) :
+LU(5)` (+1 move/dtor) and `return k ? LU(4) : LU(5)` (refused). `b4_r_c1_rev` (`C h(bool k) { const C a; C b;
+C c = k ? move b : move a; return c; }`, `z = h(k)`) now matches clang (z=22, 1 copy, 0 moves, 1 move-assign).
 
-## From T263 review 1 (pre-existing on master; Host = CFlat struct with a C++ field; repros scratch/repro_keep/t263_rev/)
-- (T264 review 2) `rq.cref(k ? mkC(1) : mkC(2))` does one extra move+destroy vs clang, but the direct sibling `rq.cref(mkC(1))` has the same mismatch; this is CFlat-return materialization, not a ternary-only failure.
-  Repros scratch/repro_keep/t264_rev/.
+## Open
+Re-measured 2026-11-19 (TERNREST, probes scratch/ternrest_tmp/ in the ternrest worktree). Closed by TERNREST
+(legs 99653-99704): nested discarded joins of an imported class (`k ? move h1 : (k ? h2 : move h3);`, any depth),
+nested all-move lowered assignments and discards (`z = k ? move h1 : (k ? move h2 : move h3)`, no inner temp),
+discarded unmoved place arms that are no named variable (`*pc`, `p->f`, `a[i]`, implicit-this field; lowered and
+imported), [cpp] struct `auto r = k ? move a : LU(5)` (was refused) and the discarded `k ? move a : LU(5);` (was a
+byte move). Oracle for the [cpp] struct cells: the class as CFlat declares it to clang (deleted copy, member-wise
+move ctor, user dtor; [cpp] struct ruling: no implicit copy), not a plain C++ struct with an implicit copy.
+- Argument order (counts only, no leak): `int Take2(HT a, HT b)`, `struct HT { cppbv.CntA c; cppbv.TCopy t; }`,
+  `h2.t.v = -2000` (its copy throws), `Take2(h2, k ? MkHT() : move h1)` under a C++ catch. CFlat evaluates the join
+  (k=1: builds `MkHT()`, CntA c=3 d=4; k=0: moves `h1`, mv=1) before copying `h2`; clang copies `h2` first, throws,
+  never evaluates arg 2 (c=2 d=3, mv=0). Root cause: by-value argument materialization runs after later arguments.
+- Const leaf across a nested prvalue join: `const cppbv.TernaryCnt* pc = &h2; k ? move h1 : (k ? *pc : move h3);`
+  k=1 copies `h1` (cp=1, h1=21); clang moves it (mv=1, h1=-1): the const leaf makes only the INNER join const, the
+  outer converts the xvalue to the const prvalue by the move ctor. k=0 matches. Same on master. Root cause:
+  JoinMoveLeafConst climbs to the outermost join and reads every leaf.
+- [cpp] struct mixed return refused: `LU f(bool k) { LU a = LU(7); return k ? move a : LU(5); }` is refused ("the
+  '?:' arms handle ownership differently"); with `a` a by-value parameter it is refused as a deleted copy. clang
+  (class as declared) moves `a` / builds `LU(5)` in the return slot. Same on master. Root cause not investigated.
+- Source reads after a join stay as master: imported classes allow `a.v` after `z = k ? move a : b` (frozen T263/T288
+  legs read it, clang allows it); a lowered host refuses it like a direct move.
+- Const by-value parameter (`void f(const rv.C a)`): CFlat keeps no const on by-value params, so `z = k ? move a :
+  move b` moves `a`; clang copies. Needs const carried on parameter signatures.
+- Discarded join with NO move leaf, an unmoved place arm and a prvalue arm: `k ? x : rv.C(9);` / `k ? *px : rv.C(9);`
+  (also as a for-increment) k=1 makes no copy; clang copies into a temp (cp=1, +1 dtor). Same on master.
+  armMoveLeaves returns 2|2, so discardedPrvalueJoin stays false (MainListener_Conditional.cpp ~3285). TERNREST review.
+- `_ = move w.lu` on a [cpp] struct FIELD (as for a [cpp] local) destroys in place, no move ctor (item.v 0); clang moves
+  into a temp. movedCxxPlace excludes IsCppStructName on purpose (CFlat release design). Same on master.
 
-## T288 review 1 leftovers (pre-existing on master, not fixed by T288)
-- Source reads stay allowed after a ternary move join (onearm_read.cb, bare.cb), while a direct move refuses them (direct.cb).
-- `flat_host.cb` does one extra move/dtor versus clang; its Host aggregate/native unique-field path is owned by another run.
-- `derived.cb`'s D/C xvalue join is accepted (derived/base reference join, C&& move-assignment).
-- Declaration `T z2 = k ? move a : move b;` with const arms now copy-constructs the selected source, which remains unchanged, matching clang++ -std=c++20.
-- `nested_outer.cb` now joins directly without the extra move/dtor and matches clang++ -std=c++20.
-- Const by-value parameter (`void f(const rv.C a)`): CFlat keeps no const on by-value params, so `z = k ? move a : move b` with `a` such a parameter moves on T288 (master copied); master's explicit `z = move a` already moves it. Needs const carried on parameter signatures.
-- Const-host field join `z = k ? move s.a : move s.b` (s const): clang and master copy-assign and keep both sources; T288 r3 falls back to master's path (leg 99015/99016).
-
-## Ternary move-join open items after the ternmv round 3-4 review (fix/ternmv)
-- OPEN: `b4_r_c1_rev` (`C h(bool k) { const C a; C b; C c = k ? move b : move a; return c; }`, then `z = h(k)`): the const-arm value matches clang (z=22), but the return of local `c` moves once more and dtor +1 (clang: copy, no move; move-assign into z). Master differs too (r=-1). Return-of-local count only; not in the decl path.
+## Out of scope here (unchanged, not re-measured)
+- By-value first-argument unwind leak (`take2T` with the FIRST argument's copy throwing), master the same.
+- `rq.cref(k ? mkC(1) : mkC(2))` one extra move+destroy vs clang; the direct `rq.cref(mkC(1))` has the same
+  mismatch (CFlat-return materialization, not ternary-only).

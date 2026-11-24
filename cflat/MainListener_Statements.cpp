@@ -1260,6 +1260,7 @@ void MainListener::ParseBlockItemList(CFlatParser::BlockItemListContext* ctx) {
             // free owned temps no named local or move param claimed (e.g. a chained concat's `a + b`).
             ProcessPlusPlus();
             compiler->FlushOwnedTemps();
+            compiler->FlushIndirectNullSets();
             // A guarded temp destructor may move insertion to its unconditional continuation block.
             // Keep same-block alias rebind proofs aligned with that completed block item.
             if (!compiler->stackNamedVariable.empty())
@@ -2641,6 +2642,16 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     finishLoweredReturn();
                     return;
                 }
+            // `return c ? T(1) : T(2)`: the join's owned arm temps become the return slot.
+            if (!defaultValue && returnNV.IsRvalue && cxxSretDest != nullptr
+                && returnNV.Primary != nullptr && !returnNV.TypeAndValue.Pointer
+                && returnNV.TypeAndValue.TypeName == returnTypeName
+                && compiler->BuildJoinedOwnedTempsInPlace(returnNV.Storage, cxxSretDest,
+                    returnNV.Primary->getType()))
+            {
+                finishLoweredReturn();
+                return;
+            }
             if (defaultValue)
             {
                 LLVMBackend::DeclTypeAndValue dtv;
@@ -3104,9 +3115,14 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                         && compiler->ResolveTypeAlias(castType.TypeName)
                             == compiler->ResolveTypeAlias(typeName);
                 }
+                // A forwarding constructor template can beat the copy constructors for the
+                // rvalue source (clang's implicit-move pick): ask clang for that class.
+                const auto* returnClass = useMove ? compiler->GetCxxClassInfo(typeName) : nullptr;
                 compiler->EmitCxxCopyOrMoveConstruct(typeName, cxxSretDest, source.Storage,
                                                      useMove, "into the return slot", {}, false,
-                                                     directInit, /*forceClangPick*/ false,
+                                                     directInit,
+                                                     returnClass != nullptr
+                                                         && returnClass->hasCtorTemplate,
                                                      /*rvaluePickFallback*/ true);
             }
             if (useMove && !sourceName.empty()) compiler->MarkVariableMoved(sourceName);
@@ -5028,12 +5044,19 @@ struct DeferredLoopScope
 };
 
 void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
+        auto* compiler = Compiler(statement);
+        // A consume in an enclosing condition lands where this statement starts; its own at its end.
+        compiler->FlushIndirectNullSets();
+        struct FlushAtEnd
+        {
+            LLVMBackend* backend;
+            ~FlushAtEnd() { backend->FlushIndirectNullSets(); }
+        } flushAtEnd{ compiler };
         if (statement->iterationStatement() == nullptr && statement->vectorizeStatement() == nullptr)
         {
             ParseStatementBody(statement);
             return;
         }
-        auto* compiler = Compiler(statement);
         // A for-init typedef stays visible through the loop, then ends with the statement.
         LLVMBackend::AliasScopeGuard aliasScope(compiler);
         DeferredLoopScope loop{ compiler, compiler->BeginDeferredLoop() };
@@ -5404,6 +5427,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                 // (s.toString() != "x")`) here, in the condition block. The block-item flush runs
                 // in the post-loop block, where the dominance guard would drop them and leak.
                 compiler->FlushOwnedTemps();
+                compiler->FlushIndirectNullSets(); // a condition / for-clause ends its consumes here
                 const auto* constantCondition = llvm::dyn_cast<llvm::ConstantInt>(condition);
                 if ((constantCondition == nullptr || !constantCondition->isZero())
                     && compiler->IsInsertBlockLive() && !compiler->IsCurrentBlockUnreachable())
@@ -5438,6 +5462,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                 // Free owned-string temps from the condition in the condition block (see do-while).
                 // Runs each iteration after the guard is evaluated.
                 compiler->FlushOwnedTemps();
+                compiler->FlushIndirectNullSets(); // a condition / for-clause ends its consumes here
 
                 // A constant-true guard (`while (true)` / `while (1)`) can only be
                 // left via `break`. Branch unconditionally into the body so the
@@ -5532,6 +5557,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                         ProcessPlusPlus();
                         RegisterDiscardedOwningStructTemp(nv, bareExpr);
                         compiler->FlushOwnedTemps();
+                        compiler->FlushIndirectNullSets(); // a condition / for-clause ends its consumes here
                     }
 
                     OwnershipControlScope loopControlScope(
@@ -5551,6 +5577,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                     condition = compiler->CoerceToBoolCondition(condition);
                     // Free owned-string temps from the condition in the condition block (see do-while).
                     compiler->FlushOwnedTemps();
+                    compiler->FlushIndirectNullSets(); // a condition / for-clause ends its consumes here
                     compiler->CreateConditionJump(condition, blockInner, blockExit);
 
                     // Inner statement
@@ -5587,6 +5614,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                     // Flush HERE, not in the condition block: the increment block does not
                     // dominate the condition, so a temp registered here would never be freed.
                     compiler->FlushOwnedTemps();
+                    compiler->FlushIndirectNullSets(); // a condition / for-clause ends its consumes here
                     compiler->CheckOwnFlagLoopBackEdge();
 
                     compiler->CreateBlockBreak(blockCondition, false);
@@ -6737,6 +6765,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                 // == x)`) here, while still in the condition block. The block-item flush runs in
                 // the post-if merge block, where the dominance guard would drop them and leak.
                 compiler->FlushOwnedTemps();
+                compiler->FlushIndirectNullSets(); // a condition / for-clause ends its consumes here
                 compiler->CreateConditionJump(condition, blockTrue, blockFalse);
 
                 auto preIfMovedState = compiler->SaveMovedState();

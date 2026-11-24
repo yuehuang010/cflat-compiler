@@ -652,3 +652,48 @@ public:
 using CastAssignBoxAlias = CastAssignBox;
 inline CastAssignBox make_cast_assign_box()
 { castasg_test::Record(1); return CastAssignBox(42); }
+
+// CPPOPEQ: same-class `a = b` follows clang's operator= pick, refusals included. Each usable
+// operator= adds its own offset so the selected member is visible in the value.
+namespace cppopeq {
+struct Del { int v = 1; Del() {} Del(const Del&) = default; Del& operator=(const Del&) = delete; };
+struct DelMove { int v = 1; DelMove() {} DelMove(const DelMove&) = default;
+    DelMove& operator=(const DelMove& o) { v = o.v + 100; return *this; }
+    DelMove& operator=(DelMove&&) = delete; };
+struct Prot { int v = 1; Prot() {} Prot(const Prot&) = default;
+protected:
+    Prot& operator=(const Prot& o) { v = o.v + 100; return *this; } };
+struct Priv { int v = 1; Priv() {} Priv(const Priv&) = default;
+private:
+    Priv& operator=(const Priv& o) { v = o.v + 100; return *this; } };
+struct Amb { int v = 1; Amb() {} Amb(const Amb&) = default;
+    Amb& operator=(const Amb& o) { v = o.v + 100; return *this; }
+    Amb& operator=(Amb o) { v = o.v + 200; return *this; } };
+struct ConstMem { const int c = 1; int v = 1; ConstMem() {} };
+struct DelBase { DelBase() {} DelBase(const DelBase&) = default;
+    DelBase& operator=(const DelBase&) = delete; };
+struct DelDerived : DelBase { int v = 1; DelDerived() {} };
+struct Pub { int v = 1; Pub() {} Pub(const Pub&) = default;
+    Pub& operator=(const Pub& o) { v = o.v + 100; return *this; } };
+struct PubMove { int v = 1; PubMove() {} PubMove(const PubMove&) = default;
+    PubMove& operator=(const PubMove& o) { v = o.v + 100; return *this; }
+    PubMove& operator=(PubMove&& o) { v = o.v + 50; return *this; } };
+struct Dflt { int v = 1; Dflt() {} Dflt(const Dflt&) = default; Dflt& operator=(const Dflt&) = default; };
+struct Tmpl { int v = 1; Tmpl() {}
+    template <class U> Tmpl& operator=(const U& o) { v = o.v + 300; return *this; } };
+struct ProtMove { int v = 1; ProtMove() {} ProtMove(const ProtMove&) = default;
+    ProtMove& operator=(const ProtMove& o) { v = o.v + 100; return *this; }
+protected:
+    ProtMove& operator=(ProtMove&& o) { v = o.v + 50; return *this; } };
+struct MoveOnly { int v = 1; MoveOnly() {} MoveOnly(MoveOnly&& o) : v(o.v) {}
+    MoveOnly& operator=(MoveOnly&& o) { v = o.v + 50; return *this; }
+private:
+    MoveOnly& operator=(const MoveOnly&); };
+struct NcCopy { int v = 1; NcCopy() {} NcCopy(const NcCopy&) = default;
+    NcCopy& operator=(NcCopy& o) { v = o.v + 100; return *this; } };
+struct TrivDelMove { int v = 1; TrivDelMove() {} TrivDelMove(const TrivDelMove&) = default;
+    TrivDelMove& operator=(const TrivDelMove&) = default;
+    TrivDelMove& operator=(TrivDelMove&&) = delete; };
+inline Del mkDel() { Del t; t.v = 9; return t; }
+inline TrivDelMove mkTrivDelMove() { TrivDelMove t; t.v = 9; return t; }
+} // namespace cppopeq

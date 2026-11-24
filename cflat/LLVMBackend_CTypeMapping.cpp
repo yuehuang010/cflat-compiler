@@ -801,7 +801,7 @@ bool LLVMBackend::EmitMacDebugInfo(const std::string& exePath) const
         std::vector<llvm::StringRef> args;
         for (auto& arg : argStrs) args.push_back(arg);
         std::string dsymErr;
-        int rc = llvm::sys::ExecuteAndWait(dsymutil, args, std::nullopt, {}, 0, 0, &dsymErr);
+        int rc = RunToolRelayingStderr(dsymutil, args, dsymErr);
         if (rc != 0 || !llvm::sys::fs::exists(dsymPath))
         {
             if (verbose)

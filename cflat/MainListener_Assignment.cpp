@@ -4251,6 +4251,68 @@ bool MainListener::RefuseImmovableAssignSource(LLVMBackend* compiler, antlr4::Pa
         return true;
 }
 
+/*
+ * A same-class source of a C++ class the extractor saw clang refuse (`T& operator=(const T&) =
+ * delete`, a protected / private or ambiguous pick, an implicitly deleted one): refused here with
+ * clang's reason, before any byte copy or member call. Only a kind that may be the source counts;
+ * an unproven value category needs every kind refused, so a usable pick is never refused.
+ */
+bool MainListener::RefuseUnassignableCxxSource(LLVMBackend* compiler, antlr4::ParserRuleContext* ctx,
+        const std::string& operatorText, const LLVMBackend::NamedVariable& leftNV,
+        const LLVMBackend::NamedVariable& rightNV, int rvalue)
+{
+        if (operatorText != "=" || leftNV.TypeAndValue.Pointer || rightNV.TypeAndValue.Pointer)
+            return false;
+        const std::string typeName = compiler->ResolveTypeAlias(leftNV.TypeAndValue.TypeName);
+        if (compiler->ResolveTypeAlias(rightNV.TypeAndValue.TypeName) != typeName) return false;
+        const bool cxxClass = compiler->IsCxxRecord(typeName);
+        if (!cxxClass && compiler->dataStructures.find(typeName) == compiler->dataStructures.end())
+            return false;
+        auto* assign = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(ctx);
+        auto* source = assign != nullptr ? assign->assignmentExpression() : nullptr;
+        if (source == nullptr || IsDefaultOnlyExpression(source)) return false;
+        if (rvalue == -2)
+        {
+            if (SoleTernaryExpression(source) != nullptr) rvalue = -1;
+            else if (TopLevelMoveExpression(source) != nullptr || rightNV.IsExplicitMove
+                     || rightNV.IsRvalue || compiler->IsCxxRvalueRefClassResult(rightNV))
+                rvalue = 1;
+            else rvalue = rightNV.Storage != nullptr ? 0 : -1;
+        }
+        const bool constSource = rightNV.TypeAndValue.IsConstObject()
+            || compiler->CxxConstReceiverKind(rightNV) != 0;
+        const uint8_t lvalueKind = constSource ? cflat_cinterop::CxxAssignRefusedConstLvalue
+                                               : cflat_cinterop::CxxAssignRefusedLvalue;
+        const uint8_t rvalueKind = constSource ? cflat_cinterop::CxxAssignRefusedConstRvalue
+                                               : cflat_cinterop::CxxAssignRefusedRvalue;
+        const uint8_t kinds = rvalue > 0 ? rvalueKind
+            : rvalue == 0 ? lvalueKind : static_cast<uint8_t>(lvalueKind | rvalueKind);
+        if (!cxxClass)
+        {
+            // A CFlat struct assigns member-wise as C++ does: an rvalue whose field move is refused
+            // falls back to the copy, so only every refused kind refuses it.
+            const uint8_t fieldKinds = rvalue == 0
+                ? static_cast<uint8_t>(cflat_cinterop::CxxAssignRefusedLvalue
+                                       | cflat_cinterop::CxxAssignRefusedConstLvalue)
+                : static_cast<uint8_t>(0x0F);
+            std::string fieldPath, fieldType;
+            if (!compiler->FindUnassignableCxxField(typeName, fieldKinds, fieldPath, fieldType))
+                return false;
+            const std::string fieldRefusal = compiler->CxxSameClassAssignmentRefusal(
+                fieldType, cflat_cinterop::CxxAssignRefusedConstLvalue);
+            if (fieldRefusal.empty()) return false;
+            LogErrorContext(ctx, std::format("cannot {}-assign struct '{}': field '{}' of C++ class "
+                "'{}' cannot be assigned ({})", rvalue == 0 ? "copy" : "move",
+                SpellDiagnosticType(*compiler, leftNV.TypeAndValue), fieldPath,
+                compiler->DisplayCxxClassName(fieldType), fieldRefusal));
+            return true;
+        }
+        const std::string refusal = compiler->CxxSameClassAssignmentRefusal(typeName, kinds);
+        if (refusal.empty()) return false;
+        LogErrorContext(ctx, refusal);
+        return true;
+}
+
 // T250: true when every value arm of an assignment RHS is a direct `new` or a `nullptr` constant,
 // with at least one `new` (`c ? new T() : nullptr`). Parse-tree shape only; any other arm keeps
 // the borrow. Recurses through the ?: chain and parentheses, as RawNewArrayValueOf does.
@@ -4997,14 +5059,21 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                  * and destroys it, leaving a valid moved-from slot (R3); a plain `_ = arr[i]` is
                  * clang's `(void)arr[i]`. A container's raw slot discard is the release itself.
                  */
-                if (rhsNV.IsElementAccess && !rhsNV.TypeAndValue.Pointer
+                // `_ = move s.f` / `move p->f` / `move *p` of an imported class: clang's
+                // `{ T t = std::move(s.f); }` moves into a temp and destroys it, the source stays.
+                const bool movedCxxPlace = explicitMoveDiscard && !rhsNV.IsElementAccess
+                    && !rhsNV.TypeAndValue.Pointer && rhsNV.Storage != nullptr
+                    && !llvm::isa<llvm::GlobalVariable>(rhsNV.Storage)
+                    && compiler->IsForeignNontrivialCxxClass(rhsNV.TypeAndValue.TypeName)
+                    && !compiler->IsCppStructName(rhsNV.TypeAndValue.TypeName);
+                if ((rhsNV.IsElementAccess || movedCxxPlace) && !rhsNV.TypeAndValue.Pointer
                     && rhsNV.Storage != nullptr
                     && compiler->IsForeignNontrivialCxxClass(rhsNV.TypeAndValue.TypeName))
                 {
                     llvm::Type* elementType = rhsNV.BaseType != nullptr
                         ? rhsNV.BaseType : compiler->GetType(rhsNV.TypeAndValue);
                     if ((explicitMoveDiscard || rhsNV.IsExplicitMove) && elementType != nullptr
-                        && isLiveArraySlot(rhsNV.Storage, rhsNV.IsViewElement))
+                        && (movedCxxPlace || isLiveArraySlot(rhsNV.Storage, rhsNV.IsViewElement)))
                     {
                         // Clang's pick for the xvalue: a const element copies, a deleted move
                         // ctor is refused, as for `T x = move a[i]`.
@@ -5460,6 +5529,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     return ParseAssignmentExpressionNamed(assignCtx);
                 }();
                 if (RefuseImmovableAssignSource(compiler, ctx, operatorText, rightNV)) return nullptr;
+                if (RefuseUnassignableCxxSource(compiler, ctx, operatorText, namedVar, rightNV))
+                    return nullptr;
                 // An overloaded assignment expression returns the C++ operator's declared
                 // result. When that is T&, the ABI value is a pointer to the proxy object;
                 // expose it as an lvalue T so a chained assignment can bind operator=(const T&).
@@ -6135,6 +6206,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     // conversion temp (`t = 5`) keeps the copy-assign pick its own path reports.
                     const bool sameTypeSource = !rhsNV.TypeAndValue.Pointer
                         && !rhsNV.TypeAndValue.IsRvalueRef && rhsNV.TypeAndValue.TypeName == tn;
+                    // A ?: join's own category is unproven here (its temp may hold an lvalue join).
+                    const int sameTypeRvalue = assignTernaryArms != nullptr ? -1
+                        : (useMove || rhsTemp != nullptr || xvalueSource || rhsNV.IsRvalue) ? 1
+                        : rhsNV.Storage != nullptr ? 0 : -1;
                     // One explicit move arm joins into a prvalue temp (`z = k ? move a : b;`): the
                     // join's own type is unset, so the forced temp stands for the destination type.
                     antlr4::tree::ParseTree* ternaryFirst = assignTernaryArms != nullptr
@@ -6189,6 +6264,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     if (!compiler->IsForeignNontrivialCxxClass(tn) && !rhsDefault && !adoptedRaw
                         && !joinMoveTransfer && !(useMove && compiler->CxxCopyAssignImplicitlyDeleted(tn)))
                     {
+                        if (sameTypeSource && !xvalueSource
+                            && RefuseUnassignableCxxSource(compiler, ctx, operatorText, namedVar,
+                                   rhsNV, sameTypeRvalue))
+                            return nullptr;
                         auto* classType = compiler->GetType(tempType);
                         llvm::Value* trivialCopy = nullptr;
                         if (rhsNV.Primary != nullptr && rhsNV.Primary->getType() == classType)
@@ -6628,9 +6707,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     const bool nonConstPrvalue = sameTypeSource && sourceIsTemporary
                         && !rhsNV.TypeAndValue.IsConstObject()
                         && compiler->CxxConstReceiverKind(rhsNV) == 0;
-                    if (!useMove && !xvalueSource && !joinMoveTransfer
+                    const bool deletedRvalueRefused = !useMove && !xvalueSource && !joinMoveTransfer
                         && (nonConstPrvalue || mixedMoveJoinNonConst)
-                        && compiler->CxxHasDeletedRvalueAssignment(tn))
+                        && compiler->CxxHasDeletedRvalueAssignment(tn);
+                    if (deletedRvalueRefused)
                     {
                         // A by-value operator=(T) ties with the T&& one for a prvalue: clang's ambiguity.
                         const std::string spelling = compiler->CxxRecordCanonicalSpelling(tn);
@@ -6651,15 +6731,27 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                                     && info->hasTrivialConstCopyAssign)))
                         && (isConstLvalueSource || !info->hasAssignTemplate);
                     const bool trivialLvalueCopy = sourceIsLvalue && hasAccessibleTrivialCopy;
-                    if (op == nullptr && sourceIsLvalue && !trivialLvalueCopy && !joinMoveTransfer
-                        && info != nullptr && info->hasMoveAssign
+                    const bool lvalueMoveRefused = op == nullptr && sourceIsLvalue && !trivialLvalueCopy
+                        && !joinMoveTransfer && info != nullptr && info->hasMoveAssign
                         && !destinationReleased && !destinationConditional
-                        && !destinationGlobalConditional)
+                        && !destinationGlobalConditional;
+                    if (lvalueMoveRefused)
                         LogErrorContext(ctx, std::format(
                             "cannot copy-assign C++ class '{}': it has no copy assignment operator "
                             "cflat can call, and assigning from an lvalue would silently move from "
                             "it; write 'move <variable>' or assign a temporary",
                             compiler->DisplayCxxClassName(tn)));
+
+                    // Members the paths above already refuse, or that clang selects itself (a
+                    // `[const] T&&` source, an explicit-move transfer), keep their own diagnostics.
+                    const bool clangSelectedTransfer = joinMoveTransfer || xvalueSource
+                        || (moveTransfer
+                            && compiler->CxxExplicitMoveNeedsTransfer(tn, moveConstSource, true));
+                    if (sameTypeSource && !rhsDefault && !adoptedRaw && !clangSelectedTransfer
+                        && !lvalueMoveRefused && !deletedRvalueRefused
+                        && RefuseUnassignableCxxSource(compiler, ctx, operatorText, namedVar, rhsNV,
+                               sameTypeRvalue))
+                        return nullptr;
 
                     auto emitMoveTransfer = [&](bool assignment) {
                         std::string refusal;
@@ -7305,9 +7397,18 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 llvm::Value* resultValue = v;
                 // A '=' store re-initializes a destination field path AFTER any source consume, so
                 // a self-assign (`a.p = a.p`) cancels; a struct path clears every field under it.
-                if (operatorText == "=" && !namedVar.FieldName.empty() && !namedVar.FieldPathText.empty()
-                    && !namedVar.IsElementAccess)
-                    compiler->RecordNullClear(namedVar.FieldPathText);
+                // An indirect `unique` path (`ps->p`, `this->p`, `a[0].p`) clears under its null key.
+                if (operatorText == "=" && namedVar.FieldName.empty())
+                    if (std::string key = compiler->UniqueFieldNullKey(namedVar); !key.empty())
+                        compiler->RecordNullClear(key); // bare receiver field `p = ...`
+                if (operatorText == "=" && !namedVar.FieldName.empty() && !namedVar.FieldPathText.empty())
+                {
+                    if (std::string key = compiler->UniqueFieldNullKey(namedVar); !key.empty())
+                        compiler->RecordNullClear(key);
+                    else if (!namedVar.IsElementAccess)
+                        compiler->RecordNullClear(namedVar.FieldPathText);
+                    compiler->NoteIndirectConsumeDestination(namedVar);
+                }
                 reviveStoredField();
                 if (coalesceResume == nullptr)
                 {
@@ -7657,6 +7758,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 rightNV.IsRvalue = true;
             }
             if (RefuseImmovableAssignSource(compiler, ctx, operatorText, rightNV)) return nullptr;
+            if (RefuseUnassignableCxxSource(compiler, ctx, operatorText, namedVar, rightNV))
+                return nullptr;
             // A '?:' or '??' arm that is a chain through such a middle is a borrow of e, as `a = p;` is.
             if (operatorText == "=" && rightNV.ChainedAssignSlot == nullptr
                 && (namedVar.TypeAndValue.IsUnique
@@ -8032,6 +8135,36 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     && (llvm::isa<llvm::AllocaInst>(namedVar.Storage)
                         || llvm::isa<llvm::GlobalVariable>(namedVar.Storage)))
                     compiler->SetViewOfFixedArrayStorage(namedVar.CallerName, false);
+                // Field door of the address-of provenance (`h.p = &x;`), on the root binding so a
+                // later `move h.p` into a sink is refused; any other store to the path retires it.
+                if (!namedVar.FieldName.empty() && !namedVar.CallerName.empty()
+                    && !namedVar.MovePathHasDynamicIndex)
+                {
+                    const std::string fieldPath = LLVMBackend::FieldMoveKey(namedVar);
+                    if (!fieldPath.empty())
+                        compiler->SetFieldBorrowedAddress(namedVar.CallerName, fieldPath,
+                            namedVar.TypeAndValue.Pointer && !namedVar.TypeAndValue.IsArrayView
+                            && (compiler->IsBorrowedAddressValue(rightNV.Primary)
+                                || LLVMBackend::IsProvableNonHeapAddressSource(rightNV)
+                                || rightNV.PointsToBorrowedAddress
+                                || rightNV.MayPointToBorrowedAddress));
+                    // `o.h = h` of a whole named struct carries h's facts under the `h` path.
+                    if (!fieldPath.empty() && !namedVar.TypeAndValue.Pointer
+                        && rightNV.FieldName.empty() && !rightNV.IsElementAccess
+                        && !rightNV.CallerName.empty() && !rightNV.TypeAndValue.Pointer)
+                        compiler->CopyFieldBorrowedAddressesUnder(namedVar.CallerName, fieldPath,
+                            rightNV.CallerName);
+                }
+                else if (namedVar.FieldName.empty() && !namedVar.CallerName.empty()
+                    && !namedVar.TypeAndValue.Pointer)
+                {
+                    // `g = h` of a whole named struct carries h's facts; any other RHS retires g's.
+                    if (rightNV.FieldName.empty() && !rightNV.IsElementAccess
+                        && !rightNV.CallerName.empty() && !rightNV.TypeAndValue.Pointer)
+                        compiler->CopyFieldBorrowedAddresses(namedVar.CallerName, rightNV.CallerName);
+                    else
+                        compiler->SetFieldBorrowedAddress(namedVar.CallerName, std::string(), false);
+                }
                 /*
                  * q11: a GLOBAL pointer destination (`g = p;`). The block below is gated on
                  * alloca storage and its ledger only walks stackNamedVariable, so a global has
@@ -8152,7 +8285,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     compiler->SetPointsToBorrowedAddress(
                         namedVar.CallerName,
                         compiler->IsBorrowedAddressValue(rightNV.Primary)
-                            || rightNV.PointsToBorrowedAddress);
+                            || rightNV.PointsToBorrowedAddress,
+                        rightNV.MayPointToBorrowedAddress);
                     compiler->SetStackCharBufferBorrow(
                         namedVar.CallerName,
                         rightNV.StackCharBufferBorrow,

@@ -634,3 +634,125 @@ extern int main()
 {
     return 0;
 }
+
+// MOVESINK: the consume is tracked through any root, not only a struct value local. A path another
+// name may reach (pointer, parameter, `this`, static, global, element) stays moved until a call or a
+// possibly-aliasing store; with none in between, the dereference is refused.
+expect_error("dereference of moved variable 'ps.p'") {
+    int pointerRootExplicitMoveThenRead()
+    {
+        S s = default; S* ps = &s; ps->p = new P();
+        S t = default;
+        t.p = move ps->p;
+        return ps->p->v;
+    }
+}
+
+expect_error("dereference of moved variable 'ps.p'") {
+    int pointerRootImplicitMoveThenRead()
+    {
+        S s = default; S* ps = &s; ps->p = new P();
+        S t = default;
+        t.p = ps->p;
+        return ps->p->v;
+    }
+}
+
+expect_error("dereference of moved variable 'ps.p'") {
+    int pointerRootBranchMoveThenRead(bool c)
+    {
+        S s = default; S* ps = &s; ps->p = new P();
+        S t = default;
+        if (c) { t.p = move ps->p; }
+        return ps->p->v;
+    }
+}
+
+expect_error("dereference of moved variable 'ps.p'") {
+    int pointerRootLoopMoveThenRead(int n)
+    {
+        S s = default; S* ps = &s; ps->p = new P();
+        S t = default;
+        int r = 0;
+        for (int i = 0; i < n; i++) { r += ps->p->v; t.p = move ps->p; }
+        return r;
+    }
+}
+
+expect_error("dereference of moved variable 'ps.p'") {
+    int pointerRootForUpdateMoveThenRead(int n)
+    {
+        S s = default; S* ps = &s; ps->p = new P();
+        S t = default;
+        int r = 0;
+        for (int i = 0; i < n; t.p = move ps->p) { r += ps->p->v; }
+        return r;
+    }
+}
+
+expect_error("dereference of moved variable 'ps.p'") {
+    int pointerParamMoveThenRead(S* ps)
+    {
+        S t = default;
+        t.p = move ps->p;
+        return ps->p->v;
+    }
+}
+
+struct MsOuter { S inner = default; };
+expect_error("dereference of moved variable 'o.inner.p'") {
+    int nestedPointerParamMoveThenRead(MsOuter* o)
+    {
+        S t = default;
+        t.p = move o->inner.p;
+        return o->inner.p->v;
+    }
+}
+
+expect_error("dereference of moved variable 'this.p'") {
+    struct MsRecvArrow
+    {
+        unique P* p = nullptr;
+        int thisArrowMoveThenRead() { S t = default; t.p = move this->p; return this->p->v; }
+    };
+}
+
+expect_error("dereference of moved variable 'this.p'") {
+    struct MsRecvBare
+    {
+        unique P* p = nullptr;
+        int bareFieldMoveThenRead() { S t = default; t.p = move p; return p->v; }
+    };
+}
+
+expect_error("dereference of moved variable 's.p'") {
+    int staticRootMoveThenRead()
+    {
+        static S s;
+        s.p = new P();
+        S t = default;
+        t.p = move s.p;
+        return s.p->v;
+    }
+}
+
+S msGlobalRoot;
+expect_error("dereference of moved variable 'msGlobalRoot.p'") {
+    int globalRootMoveThenRead()
+    {
+        msGlobalRoot.p = new P();
+        S t = default;
+        t.p = move msGlobalRoot.p;
+        return msGlobalRoot.p->v;
+    }
+}
+
+expect_error("dereference of moved variable 'arr[0].p'") {
+    int elementImplicitMoveThenRead()
+    {
+        S[2] arr; arr[0].p = new P();
+        S t = default;
+        t.p = arr[0].p;
+        return arr[0].p->v;
+    }
+}

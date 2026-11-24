@@ -1,0 +1,9 @@
+// A link failure relays the linker's stderr with a "linker: " prefix on every line (ruling
+// 2026-11-18): the text is neither cflat's nor clang's. Pre-fix the tool line went out bare.
+// The sidecar links (link=1) and expects a nonzero exit plus the prefix.
+extern int linkpfx_no_such_symbol(int x);
+
+extern int main()
+{
+    return linkpfx_no_such_symbol(3);
+}

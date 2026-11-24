@@ -1568,6 +1568,12 @@ bool ReturnsOnlyMovedByValueParam(
     const LLVMBackend::DeclTypeAndValue& returnType,
     const std::vector<LLVMBackend::TypeAndValue>& allParams);
 
+// True when a lambda in the body names a by-value parameter of the return type (a capture).
+// Any Identifier token spelling that parameter counts: shadowing is treated as a capture.
+bool LambdaNamesReturnTypeParam(CFlatParser::FunctionDefinitionContext* func,
+    const LLVMBackend::DeclTypeAndValue& returnType,
+    const std::vector<LLVMBackend::TypeAndValue>& allParams);
+
 // Nodes that open a declaration scope: a name declared under one is visible only inside it.
 bool IsDeclScopeNode(antlr4::tree::ParseTree* node);
 
@@ -5104,12 +5110,13 @@ public:
     // True when a move leaf of the join (ctx, climbed to its outermost ternary) is const: a
     // const field, deref or bare name root. clang's composite is then const and never moves.
     // inspectMemberLeaves also reads the resolved type of an unmoved member leaf (`mkH(1).cd`).
+    // inspectNamedLeaves reads every unmoved leaf (`k ? move a : c` with c const).
     bool JoinMoveLeafConst(CFlatParser::ConditionalExpressionContext* ctx,
-                           bool inspectMemberLeaves = false);
+                           bool inspectMemberLeaves = false, bool inspectNamedLeaves = false);
     // Const-ness of the object a move operand moves, from its unevaluated resolved type.
     bool MoveOperandConst(CFlatParser::MoveExpressionContext* mv);
     // Const-ness of an unmoved member leaf's resolved type (see JoinMoveLeafConst).
-    bool MemberLeafConst(antlr4::tree::ParseTree* arm);
+    bool MemberLeafConst(antlr4::tree::ParseTree* arm, bool anyLvalueLeaf = false);
     // Signature of one arm of a bare `function f = c ? a : b;`: a plain local/argument name (its
     // declared function type) or a plain function name with exactly one overload. False otherwise.
     bool ResolveBareFunctionArmSignature(antlr4::ParserRuleContext* arm,
@@ -7900,6 +7907,12 @@ public:
     // [immovable] assignment source refusal; true after logging. Shared by the assignment sites.
     bool RefuseImmovableAssignSource(LLVMBackend* compiler, antlr4::ParserRuleContext* ctx,
                                      const std::string& operatorText, const LLVMBackend::NamedVariable& rightNV);
+    // Same-class `dst = src` of a C++ class clang refuses for that source kind; true after logging
+    // clang's reason. `rvalue`: 1 proven rvalue, 0 proven lvalue, -1 unknown, -2 derive here.
+    bool RefuseUnassignableCxxSource(LLVMBackend* compiler, antlr4::ParserRuleContext* ctx,
+                                     const std::string& operatorText,
+                                     const LLVMBackend::NamedVariable& leftNV,
+                                     const LLVMBackend::NamedVariable& rightNV, int rvalue = -2);
 
     LLVMBackend::NamedVariable ParseOperatorStringExpression(CFlatParser::OperatorStringExpressionContext* ctx);
 

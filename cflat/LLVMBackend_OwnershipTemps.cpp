@@ -4115,6 +4115,56 @@ void LLVMBackend::HandOverJoinedOwnedTemps(llvm::Value* valueJoin)
     }
 }
 
+bool LLVMBackend::BuildJoinedOwnedTempsInPlace(llvm::Value* storageJoin, llvm::Value* slotValue,
+                                               llvm::Type* objectType)
+{
+    auto* root = llvm::dyn_cast_or_null<llvm::PHINode>(storageJoin);
+    auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(slotValue);
+    // An sret argument dominates the whole body; a local slot must sit in the entry block.
+    if (root == nullptr || objectType == nullptr
+        || (slot == nullptr && !llvm::isa_and_nonnull<llvm::Argument>(slotValue)))
+        return false;
+    if (slot != nullptr
+        && (slot->getParent() != &slot->getFunction()->getEntryBlock()
+            || slot->getAllocatedType() != objectType))
+        return false;
+    llvm::SmallVector<llvm::PHINode*, 4> joins{ root };
+    llvm::SmallPtrSet<llvm::PHINode*, 4> seen;
+    llvm::SmallVector<llvm::AllocaInst*, 4> temps;
+    while (!joins.empty())
+    {
+        llvm::PHINode* join = joins.pop_back_val();
+        if (!seen.insert(join).second) continue;
+        for (llvm::Value* incoming : join->incoming_values())
+        {
+            if (auto* nested = llvm::dyn_cast<llvm::PHINode>(incoming))
+            {
+                joins.push_back(nested);
+                continue;
+            }
+            auto* temp = llvm::dyn_cast<llvm::AllocaInst>(incoming);
+            if (temp == nullptr || temp == slotValue || temp->getAllocatedType() != objectType
+                || std::none_of(pendingOwnedStructTemps.begin(), pendingOwnedStructTemps.end(),
+                    [&](const PendingOwnedStructTemp& e) { return e.Alloca == temp; }))
+                return false;
+            if (std::find(temps.begin(), temps.end(), temp) == temps.end()) temps.push_back(temp);
+        }
+    }
+    if (temps.empty()) return false;
+    // The slot must dominate every use of the temps it replaces.
+    if (slot != nullptr)
+    {
+        llvm::BasicBlock& entry = slot->getFunction()->getEntryBlock();
+        if (&*entry.begin() != slot) slot->moveBefore(entry.begin());
+    }
+    for (llvm::AllocaInst* temp : temps)
+    {
+        UnregisterOwnedStructTemp(temp);
+        temp->replaceAllUsesWith(slotValue);
+    }
+    return true;
+}
+
 bool LLVMBackend::IsProducedTempValue(llvm::Value* value) const
 {
         if (value == nullptr) return false;
@@ -7894,23 +7944,54 @@ bool LLVMBackend::TernaryArmIsProvenBorrow(llvm::Value* armValue, llvm::Value* a
             || nv->PointsToBorrowedAddress;
     }
 
+bool LLVMBackend::FieldHoldsBorrowedAddress(const NamedVariable& field) const
+{
+        // `h.p = &x;` recorded the address-of store on the root binding, per field path.
+        if (field.FieldName.empty() || field.CallerName.empty() || field.MovePathHasDynamicIndex)
+            return false;
+        const std::string fieldPath = FieldMoveKey(field);
+        if (fieldPath.empty()) return false;
+        for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            const NamedVariable* root = nullptr;
+            if (auto it = frame.namedVariable.find(field.CallerName); it != frame.namedVariable.end())
+                root = &it->second;
+            else if (auto it2 = frame.functionArgument.find(field.CallerName);
+                it2 != frame.functionArgument.end())
+                root = &it2->second;
+            if (root != nullptr) return root->BorrowedAddressFields.contains(fieldPath);
+        }
+        return false;
+    }
+
 bool LLVMBackend::MoveSourceIsAddressBorrow(const NamedVariable& source) const
 {
         if (source.TypeAndValue.IsArrayView || source.TypeAndValue.ElemPointer != 0
             || source.TypeAndValue.ConstArraySize > 0
             || source.TypeAndValue.IsFlexibleArrayMember)
             return false;
+        const llvm::Value* storage = source.MoveSourceStorage != nullptr
+            ? source.MoveSourceStorage : source.Storage;
+        const NamedVariable* live = llvm::isa_and_nonnull<llvm::AllocaInst>(storage)
+            ? FindVariableByStorage(storage) : nullptr;
+        /*
+         * May-borrow facts come first: the owning bits follow the LAST store in walk order, so a
+         * branch rebind (`if (c) p = new T();`) leaves them set while the other path still holds
+         * `&x`. Every later store retires the fact, so a binding proven owned never reaches here.
+         */
+        if (source.FieldName.empty() && !source.IsElementAccess && source.MayPointToBorrowedAddress)
+            return true;
+        if (live != nullptr && live->FieldName.empty() && live->MayPointToBorrowedAddress)
+            return true;
+        if (FieldHoldsBorrowedAddress(source)) return true;
         if (source.IsOwning || source.IsNewAllocated || source.IsOwningStruct
             || source.IsOwningString)
             return false;
         if (source.PointsToBorrowedAddress || IsBorrowedAddressValue(source.Primary)
             || IsProvableNonHeapAddress(source.Primary))
             return true;
-        const llvm::Value* storage = source.MoveSourceStorage != nullptr
-            ? source.MoveSourceStorage : source.Storage;
         if (llvm::isa_and_nonnull<llvm::AllocaInst>(storage))
         {
-            const NamedVariable* live = FindVariableByStorage(storage);
             return live != nullptr && !live->IsOwning && !live->IsNewAllocated
                 && !live->IsOwningStruct && !live->IsOwningString
                 && live->PointsToBorrowedAddress;
@@ -7918,6 +7999,46 @@ bool LLVMBackend::MoveSourceIsAddressBorrow(const NamedVariable& source) const
         if (llvm::isa_and_nonnull<llvm::GlobalVariable>(storage))
             return globalAssignBorrowedAddress_.count(storage) != 0;
         return false;
+    }
+
+void LLVMBackend::NullAliasedUniqueByValueArgs(const std::vector<TypeAndValue>& params,
+        const std::vector<NamedVariable>& args, std::vector<llvm::Value*>& operands)
+{
+        // The callee sees the consumes in argument order (`kk5(u, *pu)` with `pu = &u`): the
+        // second operand reads the slot the first consume nulled, so only one owner is built.
+        std::vector<std::pair<size_t, llvm::Value*>> consumed;
+        for (size_t i = 0; i < params.size() && i < args.size() && i < operands.size(); ++i)
+        {
+            const TypeAndValue& param = params[i];
+            if (param.Pointer || param.IsAlias || param.IsRvalueRef
+                || !IsCoreUniqueType(param.TypeName))
+                continue;
+            llvm::Value* storage = args[i].Storage;
+            llvm::Value* operand = operands[i];
+            if (storage == nullptr || operand == nullptr || !storage->getType()->isPointerTy()
+                || !operand->getType()->isStructTy() || args[i].IsBorrowed
+                || args[i].IsAliasBorrow || args[i].MovePathHasDynamicIndex)
+                continue;
+            const llvm::Value* root = llvm::getUnderlyingObject(storage);
+            const bool rootIsSlot = llvm::isa<llvm::AllocaInst>(root)
+                || llvm::isa<llvm::GlobalVariable>(root);
+            llvm::Value* aliasesEarlier = nullptr;
+            for (const auto& [prior, priorStorage] : consumed)
+            {
+                const llvm::Value* priorRoot = llvm::getUnderlyingObject(priorStorage);
+                const bool priorIsSlot = llvm::isa<llvm::AllocaInst>(priorRoot)
+                    || llvm::isa<llvm::GlobalVariable>(priorRoot);
+                // Two named slots: CheckDuplicateMoveParamSources already decided them.
+                if (rootIsSlot && priorIsSlot) continue;
+                llvm::Value* same = builder->CreateICmpEQ(priorStorage, storage, "unique.arg.alias");
+                aliasesEarlier = aliasesEarlier == nullptr ? same
+                    : builder->CreateOr(aliasesEarlier, same);
+            }
+            if (aliasesEarlier != nullptr)
+                operands[i] = builder->CreateSelect(aliasesEarlier,
+                    llvm::Constant::getNullValue(operand->getType()), operand, "unique.arg");
+            consumed.emplace_back(i, storage);
+        }
     }
 
 void LLVMBackend::LogBorrowedMoveSlotError() const

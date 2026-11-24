@@ -3553,6 +3553,9 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(
         result.IsBorrowed     = srcBorrowLive;
         result.IsOwning       = argNV.IsOwning || movedViewGuaranteedOwns;
         result.BorrowedOrigin = srcBorrowLive ? argNV.BorrowedOrigin : std::string();
+        // `move h.p` after `h.p = &x;`: the moved VALUE carries the field's address-of fact, so
+        // every sink door (MoveSourceIsAddressBorrow) refuses it like a whole-binding borrow.
+        if (compiler->FieldHoldsBorrowedAddress(argNV)) result.MayPointToBorrowedAddress = true;
         return result;
     }
 

@@ -6499,6 +6499,17 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         moveTransferConsumedTemps_.clear();
         ApplyMoveParamTransfer(ifaceName + "." + methodName, transferParams, callArgNVs,
             true, false, true);
+        {
+            // Same in-order consume as a direct call, through the slot operand indexes.
+            std::vector<llvm::Value*> paramOperands;
+            for (size_t i = 0; i < paramCallArgIndexes.size(); ++i)
+                paramOperands.push_back(paramCallArgIndexes[i] < callArgs.size()
+                    ? callArgs[paramCallArgIndexes[i]] : nullptr);
+            NullAliasedUniqueByValueArgs(transferParams, callArgNVs, paramOperands);
+            for (size_t i = 0; i < paramCallArgIndexes.size(); ++i)
+                if (paramCallArgIndexes[i] < callArgs.size() && paramOperands[i] != nullptr)
+                    callArgs[paramCallArgIndexes[i]] = paramOperands[i];
+        }
         // The implementation is a CFlat method, so it may throw through: invoke when this frame
         // owes cleanup. Its pad leaves the sink arguments to the callee.
         unwindCallConsumedTemps_ = std::move(moveTransferConsumedTemps_);

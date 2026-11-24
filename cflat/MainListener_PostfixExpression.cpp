@@ -2706,7 +2706,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
         for (auto* argumentList : ctx->argumentExpressionList())
             DiagnoseAssignmentArguments(argumentList);
         const size_t arrowTempMark = arrowOwnedTemps_.size();
+        const uint64_t indirectNullSetMark = Compiler(ctx)->IndirectNullSetSeq();
         auto namedVar = ParsePostfixExpressionInner(ctx, lValue, dropTrailingChildren, use);
+        // A call after a consume earlier in the statement may re-initialize the consumed field.
+        if (!ctx->LeftParen().empty()) Compiler(ctx)->DropIndirectNullSetsBefore(indirectNullSetMark);
         // Direct sret call argument: unowned until its callee adopts it, so register it for a
         // throwing later sibling (as the join does). `move <call>`: the move wrapper is the site.
         antlr4::ParserRuleContext* argumentSite = ctx;
@@ -4296,6 +4299,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 && Compiler(ctx)->IsMovedDerefHere(namedVar))
                                 LogErrorContext(ctx, Compiler(ctx)->MovedDerefDiagnostic(namedVar));
                         }
+                        else if (!namedVar.TypeAndValue.Pointer && !namedVar.FieldName.empty()
+                                 && Compiler(ctx)->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
+                                 && !nullConditionalPending)
+                            // A receiver field (`this->p->v`): null-state only, keyed "this.p".
+                            Compiler(ctx)->RecordNullDerefFor(namedVar,
+                                ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());
                         // [PFX-1b] Unadopted owning-POINTER receiver (`makePtr()->v = 1;`): free it
                         // at end-of-expression. SCALAR member only - see MemberIsScalarField.
                         if ((tokenType == CFlatParser::Dot || tokenType == CFlatParser::Arrow)
@@ -10275,6 +10284,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     std::string constField;
                                     isAssignable = base.empty() || isPointer
                                         || !be->FindNativeConstField(base, constField);
+                                    // A C++ class clang refuses to assign from both a non-const lvalue
+                                    // and a non-const rvalue (a move-only class stays assignable).
+                                    if (isAssignable && !base.empty() && !isPointer
+                                        && be->CxxSameClassAssignmentRefused(be->ResolveTypeAlias(base),
+                                               cflat_cinterop::CxxAssignRefusedLvalue
+                                                   | cflat_cinterop::CxxAssignRefusedRvalue))
+                                        isAssignable = false;
                                 }
                             }
                             namedVar.Primary = llvm::ConstantInt::get(

@@ -4821,6 +4821,33 @@ bool ReturnsOnlyMovedByValueParam(
     }
     return true;
 }
+bool LambdaNamesReturnTypeParam(CFlatParser::FunctionDefinitionContext* func,
+    const LLVMBackend::DeclTypeAndValue& returnType,
+    const std::vector<LLVMBackend::TypeAndValue>& allParams)
+{
+    if (func == nullptr || func->compoundStatement() == nullptr) return false;
+    if (returnType.TypeName.empty() || returnType.Pointer || returnType.ElemPointer) return false;
+    std::vector<std::string> names;
+    for (const auto& p : allParams)
+        if (!p.Pointer && !p.ElemPointer && !p.VariableName.empty()
+            && p.TypeName == returnType.TypeName)
+            names.push_back(p.VariableName);
+    if (names.empty()) return false;
+    std::vector<std::pair<antlr4::tree::ParseTree*, bool>> pending{ { func->compoundStatement(), false } };
+    while (!pending.empty())
+    {
+        auto [node, inLambda] = pending.back();
+        pending.pop_back();
+        inLambda = inLambda || AsRuleCtx<CFlatParser::LambdaExpressionContext>(node) != nullptr;
+        if (inLambda)
+            if (auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(node);
+                terminal != nullptr && terminal->getSymbol()->getType() == CFlatParser::Identifier
+                && std::find(names.begin(), names.end(), terminal->getText()) != names.end())
+                return true;
+        for (antlr4::tree::ParseTree* child : node->children) pending.push_back({ child, inLambda });
+    }
+    return false;
+}
 bool IsDeclScopeNode(antlr4::tree::ParseTree* node)
 {
     return AsRuleCtx<CFlatParser::CompoundStatementContext>(node) != nullptr

@@ -2,6 +2,7 @@
 // stack address at scope exit. Refused; C++ callees keep their own pointer semantics.
 
 void uqrawSnk(move int* q) { }
+struct UqrawHolder { int* p = default; };
 
 extern int main()
 {
@@ -9,6 +10,20 @@ extern int main()
         int x = 5;
         int* p = &x;
         uqrawSnk(move p);
+    }
+    // UNIQARG: borrowed on one path only, and a borrow stored in a field.
+    expect_error("cannot move a borrowed pointer; move from the owning slot") {
+        int c = 0;
+        int x = 5;
+        int* p = &x;
+        if (c) p = new int(1);
+        uqrawSnk(move p);
+    }
+    expect_error("cannot move a borrowed pointer; move from the owning slot") {
+        int x = 5;
+        UqrawHolder h = default;
+        h.p = &x;
+        uqrawSnk(move h.p);
     }
     return 0;
 }

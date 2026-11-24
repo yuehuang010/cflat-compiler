@@ -75,12 +75,6 @@ coverage: find every relay site that forwards clang/tool text without the prefix
 compile/link stderr relays in LLVMBackend_CInterop.cpp and LLVMBackend.cpp are the known ones) and
 prefix it. The cflat sentence around a quoted clause stays localized as today.
 
-## Status 2026-11-10
-
-Clang's own clauses are now marked: the C compiler / clang-cl relays and "clang rejected the call through ..." carry `(clang: ...)`
-(leg Test/errors/err_cpp_relayed_clang_clause_prefix.cb). Linker and dsymutil stderr stay unprefixed because that text is not clang's.
-Still open: the text itself stays English in every locale, and the list of unprefixed clang sinks has not been audited in full.
-
 ## Ruling (maintainer, 2026-11-18) - amends 2026-09-27
 
 Linker and dsymutil stderr carries a `linker: ` prefix, not `clang: ` and not bare: the text is not cflat's and not
@@ -88,3 +82,13 @@ clang's (ld64.lld / lld-link / dsymutil are run by cflat itself). The 2026-09-27
 it drives" is narrowed to text that really comes from clang or clang-cl. Test consequence: an undefined-symbol link
 failure leg expects `linker: ` before the tool's line (extend the closest existing link-error leg); the
 `(clang: ...)` clause legs are unchanged. The audit of unprefixed clang sinks stays open.
+
+## Status 2026-11-19
+
+Clang's own clauses are marked: the C compiler / clang-cl relays and "clang rejected the call through ..." carry `(clang: ...)`
+(leg Test/errors/err_cpp_relayed_clang_clause_prefix.cb). Linker and dsymutil stderr (ld64.lld, lld-link, the cc link
+driver, `lld-link /lib`, dsymutil) is captured and relayed with a `linker: ` prefix on every line, per the 2026-11-18
+ruling, which also narrowed the 2026-09-27 wording "or clang-cl / the linker it drives" to text that really comes from
+clang or clang-cl (leg Test/errors/err_link_undefined_symbol_prefix.cb, sidecar `link=1`).
+A clang link driver's own line (`clang++: error: linker command failed ...`) is clang text and relays as `clang: `, not `linker: ` (main-session decision 2026-11-19).
+Still open: the text itself stays English in every locale, and the list of unprefixed clang sinks has not been audited in full.

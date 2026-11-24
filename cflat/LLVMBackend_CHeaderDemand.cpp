@@ -3261,6 +3261,7 @@ uint64_t LLVMBackend::CxxGroupHeaderHash(const CxxRequestGroup& group) const
         raw.hasAssignTemplate = cached.hasAssignTemplate;
         raw.moveAssignBindsConstRef = cached.moveAssignBindsConstRef;
         raw.moveAssignConstSourceBindsConstRef = cached.moveAssignConstSourceBindsConstRef;
+        raw.assignRefusedMask = cached.assignRefusedMask;
         raw.isAggregate = cached.isAggregate;
         raw.members = cached.members;
         raw.ctorTemplates = cached.ctorTemplates;

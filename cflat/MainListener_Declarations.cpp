@@ -6430,6 +6430,8 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
                     sym.ReturnsAliasOfByValueParam = aliasOfByValueParam;
                     sym.ReturnsDirectByValueParam = returnsDirectByValueParam;
                     sym.ReturnsMovedByValueParam = returnsMovedByValueParam;
+                    sym.LambdaNamesReturnTypeParam =
+                        LambdaNamesReturnTypeParam(func, directReturnProbe, allParams);
                     // Per instance: a generic free function's instances register here, not in ForwardRefScanner.
                     if (!returnType.external && returnType.Pointer)
                     {
@@ -11228,6 +11230,12 @@ bool MainListener::TryDeclareForeignCxxAutoLocal(CFlatParser::DirectDeclaratorCo
             compiler->HandOverJoinedOwnedTemps(sourceNV.Primary);
             return true;
         }
+        // A lowered struct is not relocatable: its arm temps become the slot (built in place).
+        if (rvalueJoin && compiler->IsDataStructure(typeName)
+            && compiler->NeedsCxxLoweringType(typeName) && slotAlloca != nullptr
+            && compiler->BuildJoinedOwnedTempsInPlace(sourceNV.Storage, slotAlloca,
+                slotAlloca->getAllocatedType()))
+            return true;
         // A named source is consumed (still destroyed at its own scope exit, as for the typed
         // `T x = move u;`). An indirect source stays with its owner, as in C++.
         const std::string srcName = !sourceNV.CallerName.empty() ? sourceNV.CallerName
@@ -17102,7 +17110,23 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 || (!typeAndValue.IsArrayView
                                     && LLVMBackend::IsProvableNonHeapAddressSource(initializerSourceNV))
                                 || initializerSourceNV.PointsToBorrowedAddress))
-                            compiler->GetOrCreateStackVariable(name).PointsToBorrowedAddress = true;
+                        {
+                            auto& boundNV = compiler->GetOrCreateStackVariable(name);
+                            boundNV.PointsToBorrowedAddress = true;
+                            boundNV.MayPointToBorrowedAddress = true;
+                        }
+                        // `H g = h;` of a whole named struct inherits h's field facts.
+                        if (!typeAndValue.Pointer && haveInitializerSourceNV
+                            && initializerSourceNV.FieldName.empty()
+                            && !initializerSourceNV.IsElementAccess
+                            && !initializerSourceNV.CallerName.empty()
+                            && !initializerSourceNV.TypeAndValue.Pointer)
+                            compiler->CopyFieldBorrowedAddresses(name, initializerSourceNV.CallerName);
+                        // A copy of a binding borrowed on SOME path is itself maybe-borrowed.
+                        if (typeAndValue.Pointer && haveInitializerSourceNV
+                            && !typeAndValue.IsArrayView
+                            && initializerSourceNV.MayPointToBorrowedAddress)
+                            compiler->GetOrCreateStackVariable(name).MayPointToBorrowedAddress = true;
                         if (haveInitializerSourceNV
                             && (typeAndValue.Pointer || (!typeAndValue.Pointer
                                 && (typeAndValue.TypeName == "string"

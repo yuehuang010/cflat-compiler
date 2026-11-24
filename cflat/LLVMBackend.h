@@ -2296,6 +2296,15 @@ public:
         // it provably borrows - `&x` never yields an owner. Positive provenance recorded where the
         // binding is produced (never re-derived from IR); not part of the --init cache round-trip.
         bool PointsToBorrowedAddress = false;
+        // An address-of value reaches this binding on SOME path (a branch join keeps it while
+        // PointsToBorrowedAddress follows the last store). Read only by MoveSourceIsAddressBorrow.
+        bool MayPointToBorrowedAddress = false;
+        // Field paths (FieldMoveKey) of this binding last stored from an address-of value, on some
+        // path. Same reader and lifetime as MayPointToBorrowedAddress; not cached by --init.
+        std::unordered_set<std::string> BorrowedAddressFields;
+        // `&h` / `&h.f` was taken: a write through that alias is invisible to the field door, so
+        // field facts are no longer recorded on this binding (sticky; unknown = master behaviour).
+        bool FieldFactsEscaped = false;
         // True when this raw char* or string value points into a fixed char buffer in the current
         // stack frame. The source name is retained for escape diagnostics.
         bool StackCharBufferBorrow = false;
@@ -2898,6 +2907,9 @@ public:
         bool ReturnsDirectByValueParam = false;
         // Every 'return' is `move p;` of a by-value parameter of the return type (serialized).
         bool ReturnsMovedByValueParam = false;
+        // A lambda in the body names a by-value parameter of the return type (serialized);
+        // gates call-result elision (the borrow capture skips clang's capture copy).
+        bool LambdaNamesReturnTypeParam = false;
         // Parse-tree summary: every 'return' names a module global (`return gRaw;`). Set by
         // the forward-ref scan so a caller's refusal does not depend on definition order.
         bool ReturnsGlobalBorrow = false;
@@ -4494,6 +4506,18 @@ private:
     // on purpose (see the nulldf namespace comment); consumed per function by
     // RunNullDerefDataflow and swept by RunMoveDataflow. Cleared by ResetForReanalysis.
     std::unordered_map<llvm::Function*, std::vector<nulldf::Event>> nullEventLog_;
+    // Null-state keys of indirect `unique` field paths (UniqueFieldNullKey) -> root storage;
+    // a SetNull on one is cleared by any possibly-aliasing write. Cleared by ResetForReanalysis.
+    mutable std::unordered_map<std::string, const llvm::Value*> indirectNullRoots_;
+    // Indirect SetNull events waiting for their statement to end. Cleared by ResetForReanalysis.
+    struct PendingIndirectNullSet
+    {
+        const llvm::Function* first = nullptr;
+        nulldf::Event second;
+        uint64_t seq = 0;
+    };
+    std::vector<PendingIndirectNullSet> pendingIndirectNullSets_;
+    uint64_t indirectNullSetSeq_ = 0;
     // Functions proven to never return, so a `if (cond) { die(); }` guard suppresses like an
     // inline exit() would. Populated as each body completes; cleared by ResetForReanalysis.
     nulldf::NoReturnSet provenNoReturn_;
@@ -5661,6 +5685,7 @@ private:
         bool hasAssignTemplate = false;
         bool moveAssignBindsConstRef = false;
         bool moveAssignConstSourceBindsConstRef = false;
+        uint8_t assignRefusedMask = 0;   // cflat_cinterop::CxxAssignRefused bits
         bool isAggregate = false;
         std::vector<cflat_cinterop::RawCxxCtorTemplate> ctorTemplates;
         std::vector<cflat_cinterop::RawCxxMember> members;
@@ -6435,6 +6460,11 @@ private:
     // A sink took the bytes of a `?:` value join (nested joins too): every incoming that loads an
     // owned struct temp is handed to that sink, so the temp is not destroyed as well.
     void HandOverJoinedOwnedTemps(llvm::Value* valueJoin);
+    // `auto x = c ? T(1) : T(2)` / `return c ? T(1) : T(2)` of a lowered struct: the owned arm temps
+    // behind `storageJoin` become `slot` (an entry alloca or the sret argument), built in place with
+    // nothing moved or destroyed. False, untouched, unless every leaf is such a temp.
+    bool BuildJoinedOwnedTempsInPlace(llvm::Value* storageJoin, llvm::Value* slot,
+                                      llvm::Type* objectType);
 
     // Carry produced-temp identity through a value join, including nested ternaries.
     void PropagateProducedTempValue(llvm::Value* from, llvm::Value* to);
@@ -7089,6 +7119,12 @@ private:
      * answer false. Borrowed-parameter sources keep their existing per-destination handling.
      */
     bool MoveSourceIsAddressBorrow(const NamedVariable& source) const;
+    // A field path last stored from an address-of value on some path (SetFieldBorrowedAddress).
+    bool FieldHoldsBorrowedAddress(const NamedVariable& field) const;
+    // By-value unique<T> operands are loaded before the transfer nulls their sources; a later
+    // operand whose slot may alias an earlier consumed slot is replaced by null at run time.
+    void NullAliasedUniqueByValueArgs(const std::vector<TypeAndValue>& params,
+        const std::vector<NamedVariable>& args, std::vector<llvm::Value*>& operands);
     void LogBorrowedMoveSlotError() const;
     void LogOwningCallRawBindError(const std::string& destName) const;
     // A call result that owns: declared `unique T*` (TypeName unique$T) or a core unique value.
@@ -11346,6 +11382,8 @@ public:
     enum class CxxArmCategory { Lvalue, Xvalue, Prvalue };
     // ClassifyCxxTernary verdicts, keyed by both arms' names, cv and category.
     std::unordered_map<std::string, CxxTernaryVerdict> cxxTernaryVerdicts_;
+    // CxxSameClassAssignmentRefusal results, keyed "<type>|<kind bit>".
+    std::unordered_map<std::string, std::string> cxxAssignRefusals_;
     std::string cppStructAccessContext_;
 
     /*
@@ -12806,6 +12844,16 @@ public:
                                bool constSource, bool assignment, std::string& refusal);
     std::string CxxXvalueRefusal(const std::string& typeName, bool constSource, bool assignment,
                                  const std::string& cause) const;
+    // Clang's refusal of a same-class `dst = src` on C++ class `typeName` when the source may be
+    // any of `kinds` (cflat_cinterop::CxxAssignRefused bits) and clang refuses every one of them;
+    // empty when clang accepts one, or the record is unknown. Text is clang's, "clang: " prefixed.
+    std::string CxxSameClassAssignmentRefusal(const std::string& typeName, uint8_t kinds);
+    // The extractor's verdict alone: clang refuses a same-class `dst = src` for every one of `kinds`.
+    bool CxxSameClassAssignmentRefused(const std::string& typeName, uint8_t kinds) const;
+    // A by-value C++ class field (nested CFlat structs walked) whose same-class assignment clang
+    // refuses for every one of `kinds`: its dotted path and C++ type, false when there is none.
+    bool FindUnassignableCxxField(const std::string& typeName, uint8_t kinds,
+                                  std::string& fieldPath, std::string& fieldType) const;
     // CFlat `move x` of a C++ class: true when clang must select the member (const source, or no
     // bound move ctor / move assignment); false keeps the direct-member path.
     bool CxxExplicitMoveNeedsTransfer(const std::string& typeName, bool constSource,
@@ -13670,7 +13718,18 @@ public:
 
     void SetPointsToBorrowedByValueParam(const std::string& name, bool value);
     // Record/retire the address-of borrow provenance on a live pointer binding by name.
-    void SetPointsToBorrowedAddress(const std::string& name, bool value);
+    // Innermost frame binding of a name (named local or argument), nullptr when absent.
+    NamedVariable* FindInnermostNamedVariable(const std::string& name);
+    void SetPointsToBorrowedAddress(const std::string& name, bool value, bool mayValue);
+    // Field twin keyed on FieldMoveKey; an empty path retires every field fact of the binding.
+    void SetFieldBorrowedAddress(const std::string& name, const std::string& path, bool value);
+    // `&name` escaped: retire and stop recording its field facts.
+    void MarkFieldFactsEscaped(const std::string& name);
+    // Whole-struct copy `g = h` / `H g = h`: the destination inherits the source's field facts.
+    void CopyFieldBorrowedAddresses(const std::string& destination, const std::string& source);
+    // `o.h = h`: h's facts land on o under `prefix.` (prefix = FieldMoveKey of the stored field).
+    void CopyFieldBorrowedAddressesUnder(const std::string& destination, const std::string& prefix,
+        const std::string& source);
     // Record/retire provenance that a char pointer or string borrows a current-frame buffer.
     void SetStackCharBufferBorrow(const std::string& name, bool value,
                                   const std::string& source, size_t scopeDepth);
@@ -13764,6 +13823,15 @@ public:
     void RecordNullSet(const std::string& name, bool pointeeMove = false,
                        bool joinConsumed = false);
     void RecordNullClear(const std::string& name);
+    // Statement boundary: log the pending indirect SetNull events of the current function here.
+    void FlushIndirectNullSets();
+    void DropIndirectNullSets(const llvm::Function* F);
+    // A user call ending after a consume in the same statement may re-initialize it through another
+    // name: drop the current function's pending sets recorded before `seq` (IndirectNullSetSeq()).
+    uint64_t IndirectNullSetSeq() const { return indirectNullSetSeq_; }
+    void DropIndirectNullSetsBefore(uint64_t seq);
+    // A field store in the consuming statement: a destination that may alias the source drops it.
+    void NoteIndirectConsumeDestination(const NamedVariable& dest);
     void RecordNullEscape(const std::string& name);
     // Any NON-dereference read. Recorded broadly on purpose: an unrecorded read is the only way
     // a guard could slip past the read-kill, and an extra one only costs a diagnostic.
@@ -14018,6 +14086,9 @@ public:
         {
             std::unordered_set<std::string> movedFields;
             StackCharBufferBorrowState stackCharBufferBorrow;
+            // Address-of provenance on some path; joins union both (MoveSourceIsAddressBorrow).
+            bool mayPointToBorrowedAddress = false;
+            std::unordered_set<std::string> borrowedAddressFields;
         };
         std::map<std::string, bool> moved;
         std::map<std::string, bool> pointeeMoved;
@@ -15220,8 +15291,14 @@ public:
     // cost is at link (a symbol the cold compile would have defined), so the link output is held
     // back and a failing link requests the cold retry (RunLinkerProcess).
     bool cxxDemandReplayed_ = false;
+    // driverName: basename of a clang driver running the link; its own lines relay as clang text.
     int RunLinkerProcess(llvm::StringRef program, llvm::ArrayRef<llvm::StringRef> args,
-                         std::string& error);
+                         std::string& error, llvm::StringRef driverName = {});
+    // Runs a tool cflat drives itself (linker, dsymutil) with stderr captured, then relays each
+    // stderr line with the "linker: " prefix (ruling 2026-11-18). stdout is left alone.
+    static int RunToolRelayingStderr(llvm::StringRef program, llvm::ArrayRef<llvm::StringRef> args,
+                                     std::string& error, llvm::StringRef driverName = {});
+    static void RelayLinkerStderr(llvm::StringRef text, llvm::StringRef driverName = {});
     std::function<void()> cxxDemandResume_;
     bool LoadIsolatedPolicy(const std::string& path);
     void SetIsolatedPolicy(const IsolatedPolicy& policy);
@@ -15524,7 +15601,7 @@ public:
     // 354: C++ records carry hasClassDelete / hasUsualClassDelete (unusable class delete refusal).
     // 355: wrapper keys name their types' dependency groups; system-macro lookup-level refusal.
     // 356: a fallback request TU publishes no plain free function of the group's headers.
-    static constexpr int kCHeaderCacheVersion = 356;
+    static constexpr int kCHeaderCacheVersion = 357;
     static std::string CompilerBuildStamp();
     static std::string EffectiveBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request

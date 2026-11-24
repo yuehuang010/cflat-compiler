@@ -1756,6 +1756,7 @@ MainListener::UnevaluatedOperandType MainListener::EvaluateOperandTypeOnly(
             if (tmpFn != nullptr)
             {
                 compiler->nullEventLog_.erase(tmpFn);
+                compiler->DropIndirectNullSets(tmpFn);
                 compiler->pendingReturnDangleChecks_.erase(tmpFn);
                 compiler->pendingNullIfaceDispatch_.erase(tmpFn);
                 compiler->uniqueFieldBorrowReturns_.erase(tmpFn);
@@ -2579,6 +2580,8 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                 // address-of result points at storage some other binding owns, so it can never be
                 // the owning side of a '?:' join.
                 compiler->RegisterBorrowedAddressValue(namedVar.Primary);
+                // The root's fields can now be written through the alias (`reset(&h)`, `hp->p = ...`).
+                if (!namedVar.CallerName.empty()) compiler->MarkFieldFactsEscaped(namedVar.CallerName);
                 // The address of an element (e.g. &a[i]) is a raw pointer to one slot, never a
                 // whole-allocation array-view. Clear the flag so it cannot bind back into a `T[]`
                 // (which would forge an offset view that overlaps the original - the escape hatch

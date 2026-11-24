@@ -1358,7 +1358,8 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
                 == ValueStructReturnKind::AllBorrowedParam;
             const bool returnsMovedByValueParam = ReturnsOnlyMovedByValueParam(
                 func, directReturnProbe, allParams);
-            if (returnsDirectByValueParam || returnsMovedByValueParam)
+            const bool lambdaNamesParam = LambdaNamesReturnTypeParam(func, directReturnProbe, allParams);
+            if (returnsDirectByValueParam || returnsMovedByValueParam || lambdaNamesParam)
                 if (auto it = compiler->functionTable.find(name); it != compiler->functionTable.end())
                     for (auto& sym : it->second)
                         if (sym.Parameters.size() == allParams.size()
@@ -1369,6 +1370,7 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
                         {
                             sym.ReturnsDirectByValueParam = returnsDirectByValueParam;
                             sym.ReturnsMovedByValueParam = returnsMovedByValueParam;
+                            sym.LambdaNamesReturnTypeParam = lambdaNamesParam;
                         }
             if (!returnType.external
                 && ClassifyValueStructReturns(compiler, func, returnType, allParams, &borrowedParam)

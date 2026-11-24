@@ -1,0 +1,95 @@
+import cpp "cpp_interop_assign.h";
+
+// CPPOPEQ: a same-class assignment of a C++ class is refused exactly where clang refuses it,
+// with clang's reason, whether cflat would byte-copy the class or call a member.
+struct CppopeqDelHost { cppopeq.Del f = cppopeq.Del(); int z = 0; };
+struct CppopeqProtHost { cppopeq.Prot f = cppopeq.Prot(); int z = 0; };
+cppopeq.Del CppopeqMakeDel() { cppopeq.Del t = cppopeq.Del(); t.v = 9; return t; }
+cppopeq.TrivDelMove CppopeqMakeTrivDelMove() { cppopeq.TrivDelMove t = cppopeq.TrivDelMove(); return t; }
+
+extern int main()
+{
+    cppopeq.Del del = cppopeq.Del();
+    cppopeq.Del delSrc = cppopeq.Del();
+    // Trivially copyable with a deleted copy assignment: lvalue, xvalue, prvalue, call results.
+    expect_error("clang: overload resolution selected deleted operator '='") { del = delSrc; }
+    expect_error("clang: overload resolution selected deleted operator '='") {
+        cppopeq.Del moved = cppopeq.Del();
+        del = move moved;
+    }
+    expect_error("clang: overload resolution selected deleted operator '='") { del = cppopeq.Del(); }
+    expect_error("clang: overload resolution selected deleted operator '='") { del = CppopeqMakeDel(); }
+    expect_error("clang: overload resolution selected deleted operator '='") { del = cppopeq.mkDel(); }
+    // Every destination shape: field, dereference, array element, ?: source.
+    expect_error("clang: overload resolution selected deleted operator '='") {
+        CppopeqDelHost host = CppopeqDelHost();
+        host.f = delSrc;
+    }
+    expect_error("clang: overload resolution selected deleted operator '='") {
+        cppopeq.Del* p = &del;
+        *p = delSrc;
+    }
+    expect_error("clang: overload resolution selected deleted operator '='") {
+        cppopeq.Del[2] arr = { cppopeq.Del(), cppopeq.Del() };
+        arr[1] = delSrc;
+    }
+    expect_error("clang: overload resolution selected deleted operator '='") {
+        int k = 1;
+        del = k > 0 ? delSrc : del;
+    }
+    // Access, ambiguity and implicit deletion.
+    expect_error("clang: 'operator=' is a protected member of 'cppopeq::Prot'") {
+        cppopeq.Prot prot = cppopeq.Prot();
+        cppopeq.Prot protSrc = cppopeq.Prot();
+        prot = protSrc;
+    }
+    expect_error("clang: 'operator=' is a private member of 'cppopeq::Priv'") {
+        cppopeq.Priv priv = cppopeq.Priv();
+        cppopeq.Priv privSrc = cppopeq.Priv();
+        priv = privSrc;
+    }
+    expect_error("clang: use of overloaded operator '=' is ambiguous (with operand types 'cppopeq::Amb'") {
+        cppopeq.Amb amb = cppopeq.Amb();
+        cppopeq.Amb ambSrc = cppopeq.Amb();
+        amb = ambSrc;
+    }
+    expect_error("cannot be assigned because its copy assignment operator is implicitly deleted") {
+        cppopeq.ConstMem cm = cppopeq.ConstMem();
+        cppopeq.ConstMem cmSrc = cppopeq.ConstMem();
+        cm = cmSrc;
+    }
+    expect_error("cannot be assigned because its copy assignment operator is implicitly deleted") {
+        cppopeq.DelDerived dd = cppopeq.DelDerived();
+        dd = cppopeq.DelDerived();
+    }
+    // Only the rvalue pick is unusable: a protected / deleted move assignment.
+    expect_error("clang: 'operator=' is a protected member of 'cppopeq::ProtMove'") {
+        cppopeq.ProtMove pm = cppopeq.ProtMove();
+        cppopeq.ProtMove pmSrc = cppopeq.ProtMove();
+        pm = move pmSrc;
+    }
+    expect_error("clang: 'operator=' is a protected member of 'cppopeq::ProtMove'") {
+        cppopeq.ProtMove pm = cppopeq.ProtMove();
+        pm = cppopeq.ProtMove();
+    }
+    expect_error("clang: overload resolution selected deleted operator '='") {
+        cppopeq.TrivDelMove td = cppopeq.TrivDelMove();
+        td = cppopeq.mkTrivDelMove();
+    }
+    expect_error("clang: overload resolution selected deleted operator '='") {
+        cppopeq.TrivDelMove td = cppopeq.TrivDelMove();
+        td = CppopeqMakeTrivDelMove();
+    }
+    // A CFlat struct assigns member-wise: an unusable field assignment refuses the whole one.
+    expect_error("cannot copy-assign struct 'CppopeqProtHost': field 'f' of C++ class 'cppopeq.Prot' cannot be assigned (clang: 'operator=' is a protected member") {
+        CppopeqProtHost a = CppopeqProtHost();
+        CppopeqProtHost b = CppopeqProtHost();
+        a = b;
+    }
+    expect_error("cannot move-assign struct 'CppopeqDelHost': field 'f' of C++ class 'cppopeq.Del' cannot be assigned (clang: overload resolution selected deleted operator '=')") {
+        CppopeqDelHost a = CppopeqDelHost();
+        CppopeqDelHost b = CppopeqDelHost();
+        a = move b;
+    }
+    return 0;
+}

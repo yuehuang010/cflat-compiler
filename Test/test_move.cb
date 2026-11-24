@@ -21254,6 +21254,8 @@ extern int main()
     total += 3;
     passed += testChainedAssignFreshNonlocal();
     total += 8;
+    passed += testUniqArgSequencing();
+    total += 19;
     passed += testChainedRawShapes();
     total += 14;
     total += 30;  // +2 r4 legs; +6 r5 field/global raw-outer legs; +6 r6 explicit-field/owner-raw-field legs
@@ -21746,6 +21748,8 @@ extern int main()
     total += 22;
     total += 18; // parameter adoption legs
 
+    total += 24;
+    passed += testMoveSinkIndirect();
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -30377,5 +30381,470 @@ int testChainedAssignFreshNonlocal()
     passed += Test("chain_fresh_global_outer_c1", chainAssignGlobalFresh(true), 20202);
     passed += Test("chain_fresh_deref_outer_c0", chainAssignDerefFresh(false), 10101);
     passed += Test("chain_fresh_deref_outer_c1", chainAssignDerefFresh(true), 20202);
+    return passed;
+}
+
+// UNIQARG: two by-value unique<T> arguments consume in argument order. A later operand that
+// aliases an earlier consumed slot through a pointer reads the nulled slot (one owner, one dtor);
+// distinct slots each transfer. Accept-set for the may-borrow move refusal follows.
+int uqaDtors = 0;
+struct UqaD { int v = 0; ~UqaD() { uqaDtors = uqaDtors + 1; } };
+struct UqaH { UqaD* p = default; };
+int uqaTake2(unique<UqaD> a, unique<UqaD> b)
+{
+    return (a.get() != nullptr ? 1 : 0) * 10 + (b.get() != nullptr ? 1 : 0);
+}
+int uqaAliasSecond()
+{
+    uqaDtors = 0;
+    int seen = 0;
+    {
+        unique<UqaD> u = new UqaD();
+        unique<UqaD>* pu = &u;
+        seen = uqaTake2(u, *pu);
+    }
+    return seen * 100 + uqaDtors;
+}
+int uqaAliasFirst()
+{
+    uqaDtors = 0;
+    int seen = 0;
+    {
+        unique<UqaD> u = new UqaD();
+        unique<UqaD>* pu = &u;
+        seen = uqaTake2(*pu, u);
+    }
+    return seen * 100 + uqaDtors;
+}
+int uqaDistinctDeref()
+{
+    uqaDtors = 0;
+    int seen = 0;
+    {
+        unique<UqaD> u = new UqaD();
+        unique<UqaD> w = new UqaD();
+        unique<UqaD>* pw = &w;
+        seen = uqaTake2(u, *pw);
+    }
+    return seen * 100 + uqaDtors;
+}
+int uqaRebindInBranch(int c)
+{
+    uqaDtors = 0;
+    {
+        UqaD x = default;
+        UqaD* p = &x;
+        if (c) { p = new UqaD(); unique<UqaD> u = move p; }
+    }
+    return uqaDtors;
+}
+int uqaRebindAfterBranch(int c)
+{
+    uqaDtors = 0;
+    {
+        UqaD x = default;
+        UqaD* p = &x;
+        if (c) p = new UqaD();
+        p = new UqaD();
+        unique<UqaD> u = move p;
+    }
+    return uqaDtors;
+}
+int uqaRebindBothArms(int c)
+{
+    uqaDtors = 0;
+    {
+        UqaD x = default;
+        UqaD* p = &x;
+        if (c) p = new UqaD(); else p = new UqaD();
+        unique<UqaD> u = move p;
+    }
+    return uqaDtors;
+}
+int uqaRebindSwitchAllCases(int c)
+{
+    uqaDtors = 0;
+    {
+        UqaD x = default;
+        UqaD* p = &x;
+        switch (c) { case 1: p = new UqaD(); break; default: p = new UqaD(); break; }
+        unique<UqaD> u = move p;
+    }
+    return uqaDtors;
+}
+int uqaRebindElseReturns(int c)
+{
+    uqaDtors = 0;
+    {
+        UqaD x = default;
+        UqaD* p = &x;
+        if (c) { p = new UqaD(); } else { return 7; }
+        unique<UqaD> u = move p;
+    }
+    return uqaDtors;
+}
+int uqaRebindLoopBody(int c)
+{
+    uqaDtors = 0;
+    {
+        UqaD x = default;
+        UqaD* p = &x;
+        for (int i = 0; i < 2; i++) { p = new UqaD(); unique<UqaD> u = move p; }
+    }
+    return uqaDtors;
+}
+void uqaSink(move UqaD* q) { delete q; }
+int uqaRebindSinkInBranch(int c)
+{
+    uqaDtors = 0;
+    {
+        UqaD x = default;
+        UqaD* p = &x;
+        if (c) { p = new UqaD(); uqaSink(move p); }
+    }
+    return uqaDtors;
+}
+int uqaFieldRebound()
+{
+    uqaDtors = 0;
+    {
+        UqaD x = default;
+        UqaH h = default;
+        h.p = &x;
+        h.p = new UqaD();
+        unique<UqaD> u = move h.p;
+    }
+    return uqaDtors;
+}
+int uqaFieldReboundFromLocal()
+{
+    uqaDtors = 0;
+    {
+        UqaD x = default;
+        UqaH h = default;
+        h.p = &x;
+        UqaD* q = new UqaD();
+        h.p = q;
+        unique<UqaD> u = move h.p;
+    }
+    return uqaDtors;
+}
+int uqaFieldWholeReset()
+{
+    uqaDtors = 0;
+    {
+        UqaD x = default;
+        UqaH h = default;
+        h.p = &x;
+        h = default;
+        h.p = new UqaD();
+        unique<UqaD> u = move h.p;
+    }
+    return uqaDtors;
+}
+int uqaFieldOtherRoot()
+{
+    uqaDtors = 0;
+    {
+        UqaD x = default;
+        UqaH h = default;
+        UqaH k = default;
+        h.p = &x;
+        k.p = new UqaD();
+        unique<UqaD> u = move k.p;
+    }
+    return uqaDtors;
+}
+void uqaResetField(UqaH* hp) { hp->p = new UqaD(); }
+int uqaFieldResetThroughCall()
+{
+    uqaDtors = 0;
+    {
+        UqaD x = default;
+        UqaH h = default;
+        h.p = &x;
+        uqaResetField(&h);
+        unique<UqaD> u = move h.p;
+    }
+    return uqaDtors;
+}
+int uqaFieldResetThroughAlias()
+{
+    uqaDtors = 0;
+    {
+        UqaD x = default;
+        UqaH h = default;
+        UqaH* hp = &h;
+        h.p = &x;
+        hp->p = new UqaD();
+        unique<UqaD> u = move h.p;
+    }
+    return uqaDtors;
+}
+struct UqaO { UqaH h = default; };
+int uqaNestedCopyRebound()
+{
+    uqaDtors = 0;
+    {
+        UqaD x = default;
+        UqaH h = default;
+        h.p = &x;
+        UqaO o = default;
+        o.h = h;
+        o.h.p = new UqaD();
+        unique<UqaD> u = move o.h.p;
+    }
+    return uqaDtors;
+}
+interface UqaTaker { int take2(unique<UqaD> a, unique<UqaD> b); };
+class UqaTakerImpl : UqaTaker
+{
+    int tag = 0;
+    int take2(unique<UqaD> a, unique<UqaD> b) { return uqaTake2(move a, move b); }
+};
+int uqaAliasInterface()
+{
+    uqaDtors = 0;
+    int seen = 0;
+    {
+        UqaTakerImpl impl = default;
+        UqaTaker t = impl;
+        unique<UqaD> u = new UqaD();
+        unique<UqaD>* pu = &u;
+        seen = t.take2(u, *pu);
+    }
+    return seen * 100 + uqaDtors;
+}
+int testUniqArgSequencing()
+{
+    int passed = 0;
+    passed += Test("uqa_alias_interface", uqaAliasInterface(), 1001);
+    passed += Test("uqa_field_reset_call", uqaFieldResetThroughCall(), 2);
+    passed += Test("uqa_field_reset_alias", uqaFieldResetThroughAlias(), 2);
+    passed += Test("uqa_nested_copy_rebound", uqaNestedCopyRebound(), 2);
+    passed += Test("uqa_alias_second", uqaAliasSecond(), 1001);
+    passed += Test("uqa_alias_first", uqaAliasFirst(), 1001);
+    passed += Test("uqa_distinct_deref", uqaDistinctDeref(), 1102);
+    passed += Test("uqa_rebind_in_branch_c1", uqaRebindInBranch(1), 2);
+    passed += Test("uqa_rebind_in_branch_c0", uqaRebindInBranch(0), 1);
+    passed += Test("uqa_rebind_after_branch", uqaRebindAfterBranch(0), 2);
+    passed += Test("uqa_rebind_both_arms", uqaRebindBothArms(0), 2);
+    passed += Test("uqa_rebind_switch_all", uqaRebindSwitchAllCases(1), 2);
+    passed += Test("uqa_rebind_else_returns", uqaRebindElseReturns(1), 2);
+    passed += Test("uqa_rebind_loop_body", uqaRebindLoopBody(1), 3);
+    passed += Test("uqa_rebind_sink_in_branch", uqaRebindSinkInBranch(1), 2);
+    passed += Test("uqa_field_rebound", uqaFieldRebound(), 2);
+    passed += Test("uqa_field_rebound_local", uqaFieldReboundFromLocal(), 2);
+    passed += Test("uqa_field_whole_reset", uqaFieldWholeReset(), 2);
+    passed += Test("uqa_field_other_root", uqaFieldOtherRoot(), 2);
+    return passed;
+}
+
+// MOVESINK: a consume of a `unique` field through a pointer, parameter, `this`, static, global or
+// element root marks it moved (err_unique_field_consume_read.cb), but any later write that may
+// reach the same field - same path, alias pointer, call, rebind, loop - makes it live again.
+void msSink(move Resource* r) { delete r; }
+void msRefill(UniqueBox* b) { b->item = new Resource(); b->item->id = 7; }
+UniqueBox* msGlobalBox = nullptr;
+void msRefillGlobal() { msGlobalBox->item = new Resource(); msGlobalBox->item->id = 8; }
+UniqueBox msGlobal;
+struct MsHolder
+{
+    unique Resource* item = nullptr;
+    void refill() { item = new Resource(); item->id = 5; }
+    int takeThenRefill() { UniqueBox t = default; t.item = move this->item; refill(); return this->item->id; }
+    int takeThenOther(MsHolder* o) { UniqueBox t = default; t.item = move this->item; o->item = new Resource(); return this->item->id; }
+    int bareTakeReinit() { UniqueBox t = default; t.item = move item; item = new Resource(); item->id = 6; return item->id; }
+    int bareTakeGuard() { UniqueBox t = default; t.item = move item; if (item == nullptr) return 9; return item->id; }
+};
+int msPointerSamePath()
+{
+    UniqueBox s = default; UniqueBox* ps = &s; ps->item = new Resource();
+    UniqueBox t = default;
+    t.item = move ps->item;
+    ps->item = new Resource(); ps->item->id = 3;
+    return ps->item->id;
+}
+int msPointerRootReinit()
+{
+    UniqueBox s = default; UniqueBox* ps = &s; ps->item = new Resource();
+    UniqueBox t = default;
+    t.item = ps->item;
+    s.item = new Resource(); s.item->id = 4;
+    return ps->item->id;
+}
+int msPointerAliasReinit()
+{
+    UniqueBox s = default; UniqueBox* ps = &s; UniqueBox* q = ps; ps->item = new Resource();
+    UniqueBox t = default;
+    t.item = move ps->item;
+    q->item = new Resource(); q->item->id = 5;
+    return ps->item->id;
+}
+int msPointerCallReinit()
+{
+    UniqueBox s = default; UniqueBox* ps = &s; ps->item = new Resource();
+    UniqueBox t = default;
+    t.item = ps->item;
+    msRefill(&s);
+    return ps->item->id;
+}
+int msPointerRebind()
+{
+    UniqueBox s = default; UniqueBox s2 = default; s2.item = new Resource(); s2.item->id = 2;
+    UniqueBox* ps = &s; ps->item = new Resource();
+    UniqueBox t = default;
+    t.item = move ps->item;
+    ps = &s2;
+    return ps->item->id;
+}
+int msPointerGuard()
+{
+    UniqueBox s = default; UniqueBox* ps = &s; ps->item = new Resource();
+    UniqueBox t = default;
+    t.item = move ps->item;
+    if (ps->item == nullptr) return 9;
+    return ps->item->id;
+}
+int msPointerLoop()
+{
+    UniqueBox s = default; UniqueBox* ps = &s; ps->item = new Resource(); ps->item->id = 1;
+    UniqueBox t = default;
+    int sum = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        sum += ps->item->id;
+        t.item = move ps->item;
+        msRefill(ps);
+    }
+    return sum;
+}
+int msPointerSelfDestination()
+{
+    UniqueBox s = default; UniqueBox* ps = &s; ps->item = new Resource(); ps->item->id = 6;
+    s.item = move ps->item;
+    return ps->item->id;
+}
+int msParamAlias(UniqueBox* a, UniqueBox* b)
+{
+    UniqueBox t = default;
+    t.item = move a->item;
+    b->item = new Resource(); b->item->id = 7;
+    return a->item->id;
+}
+int msParamSelfDestination(UniqueBox* a, UniqueBox* b)
+{
+    b->item = move a->item;
+    return a->item->id;
+}
+int msParamGlobalCall(UniqueBox* a)
+{
+    UniqueBox t = default;
+    t.item = move a->item;
+    msRefillGlobal();
+    return a->item->id;
+}
+int msStaticCall()
+{
+    static UniqueBox s;
+    s.item = new Resource();
+    UniqueBox t = default;
+    t.item = move s.item;
+    msRefill(&s);
+    return s.item->id;
+}
+int msGlobalCall()
+{
+    msGlobal.item = new Resource();
+    UniqueBox t = default;
+    t.item = move msGlobal.item;
+    msRefill(&msGlobal);
+    return msGlobal.item->id;
+}
+int msElementDynamicReinit(int i)
+{
+    UniqueBox[2] a; a[0].item = new Resource();
+    UniqueBox t = default;
+    t.item = a[0].item;
+    a[i].item = new Resource(); a[i].item->id = 4;
+    return a[0].item->id;
+}
+int msElementPointerReinit()
+{
+    UniqueBox[2] a; a[0].item = new Resource();
+    UniqueBox t = default;
+    t.item = a[0].item;
+    UniqueBox* q = &a[0];
+    q->item = new Resource(); q->item->id = 3;
+    return a[0].item->id;
+}
+// Ruling 2026-10-15 item 4: reassigning a field consumed by a call sink makes it live again.
+int msSinkReinit()
+{
+    UniqueBox s = default; s.item = new Resource();
+    msSink(s.item);
+    s.item = new Resource(); s.item->id = 2;
+    return s.item->id;
+}
+int msSinkTernaryReinit(bool c)
+{
+    UniqueBox s = default; UniqueBox o = default; s.item = new Resource(); o.item = new Resource();
+    msSink(c ? s.item : o.item);
+    s.item = new Resource(); s.item->id = 1;
+    o.item = new Resource(); o.item->id = 2;
+    return s.item->id + o.item->id;
+}
+// Review r1: a for-update consume is not live on the `break` exit; a later user call in the SAME
+// statement may re-initialize the field through another name.
+int msForUpdateBreak()
+{
+    UniqueBox s = default; UniqueBox* ps = &s; ps->item = new Resource(); ps->item->id = 5;
+    UniqueBox t = default;
+    for (int i = 0; i < 3; t.item = move ps->item) { break; }
+    return ps->item->id;
+}
+int msRefillCount(UniqueBox* b) { b->item = new Resource(); b->item->id = 5; return 1; }
+int msSameStatementCall()
+{
+    UniqueBox s = default; UniqueBox* ps = &s; ps->item = new Resource();
+    UniqueBox t = default;
+    int r = ((t.item = move ps->item) == nullptr ? 1 : 0) + msRefillCount(ps);
+    return ps->item->id + r;
+}
+int testMoveSinkIndirect()
+{
+    int passed = 0;
+    dtorCount = 0;
+    passed += Test("ms_pointer_same_path", msPointerSamePath(), 3);
+    passed += Test("ms_pointer_root_reinit", msPointerRootReinit(), 4);
+    passed += Test("ms_pointer_alias_reinit", msPointerAliasReinit(), 5);
+    passed += Test("ms_pointer_call_reinit", msPointerCallReinit(), 7);
+    passed += Test("ms_pointer_rebind", msPointerRebind(), 2);
+    passed += Test("ms_pointer_guard", msPointerGuard(), 9);
+    passed += Test("ms_pointer_loop", msPointerLoop(), 15);
+    passed += Test("ms_pointer_self_destination", msPointerSelfDestination(), 6);
+    passed += Test("ms_pointer_freed_once", dtorCount, 16);
+    UniqueBox s = default;
+    s.item = new Resource();
+    passed += Test("ms_param_alias", msParamAlias(&s, &s), 7);
+    s.item->id = 8;
+    passed += Test("ms_param_self_destination", msParamSelfDestination(&s, &s), 8);
+    msGlobalBox = &s;
+    passed += Test("ms_param_global_call", msParamGlobalCall(&s), 8);
+    msGlobalBox = nullptr;
+    passed += Test("ms_static_call", msStaticCall(), 7);
+    passed += Test("ms_global_call", msGlobalCall(), 7);
+    passed += Test("ms_element_dynamic_reinit", msElementDynamicReinit(0), 4);
+    passed += Test("ms_element_pointer_reinit", msElementPointerReinit(), 3);
+    MsHolder h = default;
+    h.item = new Resource();
+    passed += Test("ms_this_call_reinit", h.takeThenRefill(), 5);
+    passed += Test("ms_this_other_pointer_reinit", h.takeThenOther(&h), 0);
+    passed += Test("ms_this_bare_reinit", h.bareTakeReinit(), 6);
+    passed += Test("ms_this_bare_guard", h.bareTakeGuard(), 9);
+    passed += Test("ms_sink_reinit", msSinkReinit(), 2);
+    passed += Test("ms_sink_ternary_reinit", msSinkTernaryReinit(true), 3);
+    passed += Test("ms_for_update_break", msForUpdateBreak(), 5);
+    passed += Test("ms_same_statement_call", msSameStatementCall(), 6);
     return passed;
 }

@@ -166,9 +166,83 @@ void LLVMBackend::RecordNullEvent(nulldf::EventKind kind, const std::string& nam
         if (name.empty() || !builder) return;
         llvm::BasicBlock* bb = builder->GetInsertBlock();
         if (!bb || !bb->getParent()) return;
-        nullEventLog_[bb->getParent()].push_back(
-            nulldf::Event{ bb, kind, name, line, col, pointeeMove, joinConsumed,
-                           readStorage, readValue });
+        nulldf::Event event{ bb, kind, name, line, col, pointeeMove, joinConsumed,
+                             readStorage, readValue };
+        auto ip = builder->GetInsertPoint();
+        if (ip != bb->begin()) event.anchor = &*std::prev(ip);
+        if (kind == nulldf::EventKind::SetNull)
+            if (auto it = indirectNullRoots_.find(name); it != indirectNullRoots_.end())
+            {
+                // Held until the statement ends, so the statement's own drop / store of the moved
+                // value is not taken for a re-initialization (FlushIndirectNullSets).
+                event.indirect = true;
+                event.rootStorage = it->second;
+                pendingIndirectNullSets_.push_back({ bb->getParent(), std::move(event), indirectNullSetSeq_++ });
+                return;
+            }
+        if (kind == nulldf::EventKind::ClearNull)
+            std::erase_if(pendingIndirectNullSets_, [&](const auto& pending) {
+                const std::string& key = pending.second.name;
+                return pending.first == bb->getParent() && key.starts_with(name)
+                    && (key.size() == name.size() || key[name.size()] == '.' || key[name.size()] == '[');
+            });
+        nullEventLog_[bb->getParent()].push_back(std::move(event));
+    }
+
+void LLVMBackend::FlushIndirectNullSets()
+{
+        if (pendingIndirectNullSets_.empty() || !builder) return;
+        llvm::BasicBlock* bb = builder->GetInsertBlock();
+        if (!bb || !bb->getParent()) return;
+        auto ip = builder->GetInsertPoint();
+        const llvm::Instruction* anchor = ip != bb->begin() ? &*std::prev(ip) : nullptr;
+        std::erase_if(pendingIndirectNullSets_, [&](auto& pending) {
+            if (pending.first != bb->getParent()) return false;
+            pending.second.block = bb;
+            pending.second.anchor = anchor;
+            nullEventLog_[bb->getParent()].push_back(std::move(pending.second));
+            return true;
+        });
+    }
+
+void LLVMBackend::NoteIndirectConsumeDestination(const NamedVariable& dest)
+{
+        if (pendingIndirectNullSets_.empty() || !builder || !builder->GetInsertBlock()) return;
+        const llvm::Function* F = builder->GetInsertBlock()->getParent();
+        // Only a field of a plain struct local is provably distinct, unless its address escapes.
+        const NamedVariable* root = nullptr;
+        if (!dest.IsElementAccess && !dest.FieldPathThroughPointer && !dest.FieldPathRoot.empty())
+            for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
+            {
+                if (frame.functionArgument.count(dest.FieldPathRoot)) break;
+                if (auto it = frame.namedVariable.find(dest.FieldPathRoot); it != frame.namedVariable.end())
+                {
+                    root = &it->second;
+                    break;
+                }
+            }
+        const bool distinct = root != nullptr && !root->TypeAndValue.Pointer && !root->IsStaticLocal
+            && !root->IsAliasBorrow && !root->TypeAndValue.IsAlias && !root->AddressEscaped;
+        std::erase_if(pendingIndirectNullSets_, [&](auto& pending) {
+            if (pending.first != F) return false;
+            if (!distinct) return true;
+            pending.second.destinationRoots.push_back(dest.FieldPathRoot);
+            return false;
+        });
+    }
+
+void LLVMBackend::DropIndirectNullSetsBefore(uint64_t seq)
+{
+        if (pendingIndirectNullSets_.empty() || !builder || !builder->GetInsertBlock()) return;
+        const llvm::Function* F = builder->GetInsertBlock()->getParent();
+        std::erase_if(pendingIndirectNullSets_, [&](const auto& pending) {
+            return pending.first == F && pending.seq < seq;
+        });
+    }
+
+void LLVMBackend::DropIndirectNullSets(const llvm::Function* F)
+{
+        std::erase_if(pendingIndirectNullSets_, [&](const auto& pending) { return pending.first == F; });
     }
 
 void LLVMBackend::RecordNullSet(const std::string& name, bool pointeeMove, bool joinConsumed)
@@ -189,6 +263,7 @@ void LLVMBackend::RecordNullDeref(const std::string& name, int line, int col)
 void LLVMBackend::DiscardNullDerefEvents(llvm::Function* F)
 {
         if (F) nullEventLog_.erase(F);
+        DropIndirectNullSets(F);
     }
 
 /*
@@ -210,6 +285,7 @@ bool LLVMBackend::SealAbandonedFunction(llvm::Function* F)
             }
         moveEventLog_.erase(F);
         nullEventLog_.erase(F);
+        DropIndirectNullSets(F);
         pendingReturnDangleChecks_.erase(F);
         pendingNullIfaceDispatch_.erase(F);
         return sealed;
@@ -261,6 +337,7 @@ void LLVMBackend::RewindPendingAnalyses(llvm::Function* F, const PendingAnalysis
             if (it->second.empty()) table.erase(it);
         };
         rewind(nullEventLog_, F, mark.nullEvents);
+        DropIndirectNullSets(F);
         rewind(pendingReturnDangleChecks_, F, mark.returnDangleChecks);
         rewind(pendingNullIfaceDispatch_, F, mark.nullIfaceDispatch);
     }
@@ -273,6 +350,7 @@ void LLVMBackend::RunNullDerefDataflow(llvm::Function* F)
         // Order-dependent, and never in the false-positive direction: proving a wrapper noreturn
         // can only suppress a report or sharpen control dependence into a correct one.
         if (nulldf::FunctionNeverReturns(F, &provenNoReturn_)) provenNoReturn_.insert(F);
+        DropIndirectNullSets(F);
         auto it = nullEventLog_.find(F);
         if (it == nullEventLog_.end()) return;
         std::vector<nulldf::Event> events = std::move(it->second);
@@ -1170,6 +1248,7 @@ void LLVMBackend::RunMoveDataflow()
             for (auto& F : *module)
                 if (!F.isDeclaration() && !F.empty()) RunNullDerefDataflow(&F);
         nullEventLog_.clear();
+        pendingIndirectNullSets_.clear();
 
         // Leftover pending return-dangle checks belong to a function this pass never saw
         // consumed at end-of-body - by module end interfaceBoxRecords_ no longer describes
@@ -1278,6 +1357,8 @@ LLVMBackend::MovedStateSnapshot LLVMBackend::SaveMovedState() const
                 state.pointeeMoveBlocks[name] = nv.PointeeMoveBlock;
                 auto& variableState = state.variableStates[MakeMovedStateKey(nv, name)];
                 variableState.movedFields = nv.MovedFields;
+                variableState.mayPointToBorrowedAddress = nv.MayPointToBorrowedAddress;
+                variableState.borrowedAddressFields = nv.BorrowedAddressFields;
                 if (nv.StackCharBufferBorrow)
                     variableState.stackCharBufferBorrow = {
                         true, nv.StackCharBufferSource, nv.StackCharBufferScopeDepth};
@@ -1289,6 +1370,8 @@ LLVMBackend::MovedStateSnapshot LLVMBackend::SaveMovedState() const
                 state.pointeeMoveBlocks[name] = nv.PointeeMoveBlock;
                 auto& variableState = state.variableStates[MakeMovedStateKey(nv, name)];
                 variableState.movedFields = nv.MovedFields;
+                variableState.mayPointToBorrowedAddress = nv.MayPointToBorrowedAddress;
+                variableState.borrowedAddressFields = nv.BorrowedAddressFields;
                 if (nv.StackCharBufferBorrow)
                     variableState.stackCharBufferBorrow = {
                         true, nv.StackCharBufferSource, nv.StackCharBufferScopeDepth};
@@ -1310,6 +1393,8 @@ void LLVMBackend::RestoreMovedState(const MovedStateSnapshot& state)
                 it != state.variableStates.end())
             {
                 nv.MovedFields = it->second.movedFields;
+                nv.MayPointToBorrowedAddress = it->second.mayPointToBorrowedAddress;
+                nv.BorrowedAddressFields = it->second.borrowedAddressFields;
                 if (it->second.stackCharBufferBorrow.borrowed)
                 {
                     nv.StackCharBufferBorrow = true;
@@ -1363,6 +1448,10 @@ void LLVMBackend::MergeMovedStateInto(const MovedStateSnapshot& state)
             {
                 nv.MovedFields = movedf::MergeFieldPaths(
                     nv.MovedFields, it->second.movedFields);
+                nv.MayPointToBorrowedAddress = nv.MayPointToBorrowedAddress
+                    || it->second.mayPointToBorrowedAddress;
+                nv.BorrowedAddressFields.insert(it->second.borrowedAddressFields.begin(),
+                    it->second.borrowedAddressFields.end());
                 if (it->second.stackCharBufferBorrow.borrowed)
                 {
                     const MovedStateSnapshot::StackCharBufferBorrowState current{
@@ -1446,6 +1535,11 @@ void LLVMBackend::MergeMovedStates(const MovedStateSnapshot& thenState,
             {
                 nv.MovedFields = movedf::MergeFieldPaths(
                     tf->second.movedFields, ef->second.movedFields);
+                nv.MayPointToBorrowedAddress = tf->second.mayPointToBorrowedAddress
+                    || ef->second.mayPointToBorrowedAddress;
+                nv.BorrowedAddressFields = tf->second.borrowedAddressFields;
+                nv.BorrowedAddressFields.insert(ef->second.borrowedAddressFields.begin(),
+                    ef->second.borrowedAddressFields.end());
                 if (tf->second.stackCharBufferBorrow.borrowed
                     || ef->second.stackCharBufferBorrow.borrowed)
                     MergeStackCharBufferBorrowState(

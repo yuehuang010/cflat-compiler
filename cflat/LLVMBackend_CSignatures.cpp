@@ -2507,6 +2507,7 @@ void LLVMBackend::MapRawRecords(const cflat_cinterop::ExtractResult& raw, std::v
             rec.hasAssignTemplate = r.hasAssignTemplate;
             rec.moveAssignBindsConstRef = r.moveAssignBindsConstRef;
             rec.moveAssignConstSourceBindsConstRef = r.moveAssignConstSourceBindsConstRef;
+            rec.assignRefusedMask = r.assignRefusedMask;
             rec.isAggregate = r.isAggregate;
             rec.members = r.members;
             rec.ctorTemplates = r.ctorTemplates;

@@ -1282,6 +1282,92 @@ std::string LLVMBackend::CxxXvalueRefusal(const std::string& typeName, bool cons
 }
 
 /*
+ * The extractor recorded clang's verdict for `dst = src` per source kind (lvalue / rvalue, const
+ * or not). Only when EVERY kind the source may be is refused does this fetch clang's own
+ * diagnostic from a generated `*p0 = src;` wrapper; a wrapper clang accepts refuses nothing.
+ */
+bool LLVMBackend::CxxSameClassAssignmentRefused(const std::string& typeName, uint8_t kinds) const
+{
+        // A `[cpp]` struct's generated record is cflat's own; its assignment rules stay cflat's.
+        if (kinds == 0 || IsCppStructName(typeName)) return false;
+        auto record = cxxRecordEntries_.find(typeName);
+        return record != cxxRecordEntries_.end()
+            && (record->second.assignRefusedMask & kinds) == kinds;
+}
+
+bool LLVMBackend::FindUnassignableCxxField(const std::string& typeName, uint8_t kinds,
+                                           std::string& fieldPath, std::string& fieldType) const
+{
+        std::unordered_set<std::string> seen;
+        std::function<bool(const std::string&, const std::string&)> walk =
+            [&](const std::string& name, const std::string& prefix) {
+            if (!seen.insert(name).second) return false;
+            auto it = dataStructures.find(name);
+            if (it == dataStructures.end()) return false;
+            // A user destructor or `unique` field rebuilds the struct in place instead of assigning
+            // its fields (EmitLoweredMemberwiseAssign), so no field operator= runs.
+            if (it->second.Destructor != nullptr) return false;
+            for (const auto& field : it->second.StructFields)
+                if (field.IsUnique && !field.IsAlias) return false;
+            for (const auto& field : it->second.StructFields)
+            {
+                if (field.Pointer || field.ElemPointer || field.IsArrayView || field.IsAlias
+                    || field.IsSimd || field.IsBitfield || field.IsPadding)
+                    continue;
+                const std::string fieldName = ResolveTypeAlias(field.TypeName);
+                const std::string path = prefix + field.VariableName;
+                if (IsCxxRecord(fieldName))
+                {
+                    if (!CxxSameClassAssignmentRefused(fieldName, kinds)) continue;
+                    fieldPath = path;
+                    fieldType = fieldName;
+                    return true;
+                }
+                if (walk(fieldName, path + ".")) return true;
+            }
+            return false;
+        };
+        return !IsCxxRecord(typeName) && walk(typeName, "");
+}
+
+std::string LLVMBackend::CxxSameClassAssignmentRefusal(const std::string& typeName, uint8_t kinds)
+{
+        if (!CxxSameClassAssignmentRefused(typeName, kinds)) return {};
+        const uint8_t kind = kinds & static_cast<uint8_t>(-kinds);
+        const std::string key = typeName + "|" + std::to_string(kind);
+        if (auto known = cxxAssignRefusals_.find(key); known != cxxAssignRefusals_.end())
+            return known->second;
+        std::string& refusal = cxxAssignRefusals_[key];
+        std::string ownerSpelling;
+        auto groupIt = cxxTypeOwnerGroup_.find(typeName);
+        if (groupIt == cxxTypeOwnerGroup_.end() || !CxxSpellingForCflatType(typeName, ownerSpelling))
+            return refusal;
+        CxxRequestGroup group = MakeCxxClassRequestGroup(groupIt->second, typeName);
+        if (group.headers.empty()) return refusal;
+        const bool constSource = (kind & (cflat_cinterop::CxxAssignRefusedConstLvalue
+                                          | cflat_cinterop::CxxAssignRefusedConstRvalue)) != 0;
+        const bool lvalue = (kind & (cflat_cinterop::CxxAssignRefusedLvalue
+                                     | cflat_cinterop::CxxAssignRefusedConstLvalue)) != 0;
+        const std::string source = (constSource ? "const " : "") + ownerSpelling;
+        const std::string wrapperName = std::format("__cflat_assign_refusal_{:016x}",
+            HashWrapperKey(typeName + "|assign-refusal-" + std::to_string(kind) + "|" + ownerSpelling));
+        const std::string wrapperSource = "extern \"C\" __attribute__((weak)) void " + wrapperName
+            + "(" + ownerSpelling + " * p0, " + source + " * p1) { *p0 = "
+            + (lvalue ? std::string("*p1") : "static_cast<" + source + " &&>(*p1)") + "; }\n";
+        CxxRequestGroupScope groupScope(*this, &group);
+        CSigEntry signature;
+        std::string error;
+        if (RequestGeneratedCxxWrapper(group, wrapperSource, wrapperName, "ASSIGN_REFUSAL",
+                                       signature, error))
+            return refusal;
+        std::string cause = CxxFirstDiagnosticLine(lastCxxWrapperCause_);
+        if (cause.empty()) cause = FirstCxxErrorLine(error);
+        if (cause.empty()) return refusal;
+        refusal = cause.starts_with("clang: ") ? cause : "clang: " + cause;
+        return refusal;
+}
+
+/*
  * Members cflat's direct pick cannot rank against, so clang must select even when the class is
  * trivially copyable (where cflat otherwise byte-copies, which IS the trivial copy / move): a
  * constructor / assignment template (it can win on the exact `T&&` binding), an `explicit` move

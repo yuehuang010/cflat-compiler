@@ -6055,6 +6055,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxImplicitConversionRefusal_.clear();
     cxxXvaluePointerConversions_.clear();
     cxxTernaryVerdicts_.clear();
+    cxxAssignRefusals_.clear();
     cxxTriviallyCopyableRecords_.clear();
     cxxNontrivialRecords_.clear();
     cxxTriviallyRelocatableRecords_.clear();
@@ -6355,6 +6356,8 @@ void LLVMBackend::ResetForReanalysis()
     // Same hazard for the cross-block half: a stale event log from an aborted compile would
     // misattribute the next file's deref diagnostic.
     nullEventLog_.clear();
+    indirectNullRoots_.clear();
+    pendingIndirectNullSets_.clear();
     // Same hazard as nullEventLog_: a pending check from an aborted compile keys off a slot
     // in the module being discarded and must not survive into the next file's analysis.
     pendingReturnDangleChecks_.clear();
@@ -7417,7 +7420,7 @@ static bool SynthesizeImportLib(const std::string& lldLink, const std::string& d
     std::vector<llvm::StringRef> args(argStrs.begin(), argStrs.end());
 
     std::string toolErr;
-    int rc = llvm::sys::ExecuteAndWait(lldLink, args, std::nullopt, {}, 0, 0, &toolErr);
+    int rc = LLVMBackend::RunToolRelayingStderr(lldLink, args, toolErr);
     (void)llvm::sys::fs::remove(defFile);
     if (rc != 0)
     {
@@ -8647,6 +8650,7 @@ static llvm::json::Object SerializeFuncSym(const std::string& key, const FS& s)
     if (s.ReturnsAliasOfByValueParam) o["rabv"] = true;
     if (s.ReturnsDirectByValueParam) o["rdbv"] = true;
     if (s.ReturnsMovedByValueParam) o["rmbv"] = true;
+    if (s.LambdaNamesReturnTypeParam) o["lnrp"] = true;
     if (s.ReturnsGlobalBorrow) o["rgb"] = true;
     if (s.ReturnsParameterBorrow) o["rpb"] = true;
     if (s.ReturnsSingleParameterIndex >= 0) o["rpi"] = s.ReturnsSingleParameterIndex;
@@ -9644,6 +9648,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             if (auto v = fo->getBoolean("rabv")) sym.ReturnsAliasOfByValueParam = *v;
             if (auto v = fo->getBoolean("rdbv")) sym.ReturnsDirectByValueParam = *v;
             if (auto v = fo->getBoolean("rmbv")) sym.ReturnsMovedByValueParam = *v;
+            if (auto v = fo->getBoolean("lnrp")) sym.LambdaNamesReturnTypeParam = *v;
             if (auto v = fo->getBoolean("rgb")) sym.ReturnsGlobalBorrow = *v;
             if (auto v = fo->getBoolean("rpb")) sym.ReturnsParameterBorrow = *v;
             if (auto v = fo->getInteger("rpi"))

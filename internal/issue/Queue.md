@@ -82,7 +82,6 @@ Each ruling is in the issue file, which is the brief's source. One run = one wor
 
 | Run | Issue | Mode | Work | Not concurrent with |
 |-----|-------|------|------|---------------------|
-| LINKPFX | p4/localize-relayed-clang-diagnostics | batch (type F) | linker / dsymutil stderr gets the `linker: ` prefix (RULED 2026-11-18, amends 2026-09-27); 3 relayed-clang legs re-pinned | DIAG-TEXT |
 | CLIBNAME | p3/core-defines-externally-visible-libc-functions | needs ruling | the RULED part (nobuiltin) landed as T444; what remains (a C object / C++ inline calling printf resolves to the core body) is outside that ruling | - |
 | - | p4/three-way-comparison-operator | plan-sized | `<=>` in the CFlat language RULED 2026-10-02; `= default` member-wise `<=>` still needs a ruling | operator runs |
 | P10 phase 1 | plan cpp-import-module-reuse | read-only spike | DONE 2026-11-18: only a modular std works (ruled out); back to the maintainer, see the plan | - |
@@ -118,11 +117,12 @@ Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the pl
 |-----|----------|------|-------|
 | - | p3/cpp-using-declaration-member-access-gaps | virtual base re-exposed by `using` | with P4 virtual-base layout |
 | - | p3/cpp-macro-constant-leftovers-after-t98 | macro identity + brace fold | residue: `auto&&`, anonymous-enum lvalue deduction / joins, comma lvalue category |
-| - | p3/cxx-byvalue-prvalue-arg-moved-not-elided | prvalue C++ class into a by-value param | residue: a later converting argument beside a deleted / private-move prvalue (refused, clang accepts) |
+| - | p3/cxx-byvalue-prvalue-arg-moved-not-elided | prvalue C++ class into a by-value param | conditional / recursive / mk2(mk(1)) callees closed by RETELIDE cc2d19b64; residue: a later converting argument beside a deleted / private-move prvalue (refused, clang accepts) |
 | - | p3/cpp-reference-member-leftovers-after-t47 | ref members | residue: brace-form ctor args / extra copy / non-inert-arg wrapper path, elided-range prvalue/array, REFCTX raw-pointer/self-field refusal, return-gate untracked spots (frame pointer via local, CFlat callee, lambda capture); opaque-fn alias refusal and `&f` element RULED 2026-10-29 (stay as is) |
 | - | p3/auto-local-of-arithmetic-takes-cflat-width-type-at-cpp-calls | auto local at C++ template call | float and native-call residue |
 | - | p3/cpp-wrapper-request-misses-template-argument-headers | `std.unique_ptr<cppon.Cls>` wrappers | open: noinc implicit dtor, unpublished-specialization pointer binding |
-| - | p3/copy-constructor-overload-resolution-parity + p3/cpp-call-overload-and-copy-count-parity-leftovers | C++ copy ctor / copy-assign pick | residue: forwarding template ctor pick, CFlat-callee return elision, leftovers file |
+| - | p3/copy-constructor-overload-resolution-parity + p3/cpp-call-overload-and-copy-count-parity-leftovers | C++ copy ctor / copy-assign pick | template-ctor return pick + CFlat-callee elision landed cc2d19b64 (RETELIDE); residue: lambda-capturing callee keeps the extra copy (NEEDS RULING: drop the gate + re-pin bridge_capture_return to copy 1 / dtor 2), leftovers file (run CALLPAR in flight) |
+| - | p3/cpp-class-assignment-false-refusals | C++ same-class assignment | NEW 2026-11-19 from CPPOPEQ e3eb8921f (deleted / inaccessible / ambiguous operator= now refused like clang): C++ call-result source and target, [cpp] struct assignment, MoveOnly `?:` text; reference-member class still accepted NEEDS RULING |
 | - | p3/cpp-operator-ranking-and-fnptr-ctor-leftovers | C++ operator candidate set | imported enum free operators vs built-in (member templates vs free operators landed d6eeafe54) |
 | - | p3/cpp-null-constant-ctor-leftovers-after-t132 | literal-zero C++ ctor selection | only item 3 (char-only ctor narrowing, by design unless ruled) left |
 | B5b | p3/cpp-constrained-twin-default-argument-ranking | MSVC: same-mangled constrained twins share one emitted body | clang-cl residue only |
@@ -154,8 +154,8 @@ Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the pl
 | E3 | p3/cpp-unwind-cleanup-gaps-ctor-new-temporaries | item 2 landed a2111ce54; item 3 Windows funclet cleanup not exercised |
 | E4 | p3/cpp-new-remaining-allocator-gaps | by-design / out-of-scope residue only (bare `Sx(...)` in a reopened namespace beside a global function), Windows MS-ABI array new / delete names; volatile copy closed by ruling 2026-11-18 |
 | E5 | p3/cflat-default-param-temporaries-leftovers | residue after DEFTMP 9d70b56d0 (call-site native defaults die once): forwarding-wrapper defaults (earlier-param, caller above callee, unique/closure/fn-ptr/C++ holder) leak under a borrow-returning wrapper |
-| E6 | p3/discard-ternary-move-join-and-cxx-field-move | [cpp] struct whole-record move landed 517833bb1 (item 3 no longer reproduces); residue: discard join |
-| E7 | p3/cpp-ternary-move-join-leftovers | ternary move joins over C++ classes; residue: lowered-struct shapes, b4_r_c1_rev return-of-local |
+| E6 | p3/discard-ternary-move-join-and-cxx-field-move | C++ class field `_ = move p->c` landed 3c95a46e2 (TERNREST); residue: native string / dtor-struct join leaks (run STRJOIN in flight) |
+| E7 | p3/cpp-ternary-move-join-leftovers | TERNLEFT 0b6b7e59a + TERNREST 3c95a46e2 closed discarded / nested / place-arm joins and [cpp] mixed decls; residue: argument order, const leaf in nested join, [cpp] mixed return, no-move discard of place + prvalue, const by-value params |
 | E8 | p3/nrvo-leftovers-after-t130 + p3/cpp-paren-aggregate-prvalue-member-move | return / NRVO / paren-aggregate elision vs clang; residue: later non-literal aggregate element, call-argument calls, const above pointee |
 | E9 | p3/cpp-unbound-wrapper-later-write-overloaded-byvalue | residue: same-arity overload sets, later C++ default param, mixed template arity (bound-wrapper divergences recorded) |
 | E11 | p3/lowered-cxx-field-structs-leftovers-after-t528 | with P2 (cflat-struct-nontrivial-cxx-fields) |
@@ -165,7 +165,7 @@ Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the pl
 
 | Run | Issue(s) | Mode |
 |-----|----------|------|
-| F1 | p4/localize-relayed-clang-diagnostics + p3/cpp-sink-refusal-cause-lost-under-harvest-suppression | `linker: ` prefix READY (run LINKPFX) - see Ready to start; open: audit of unprefixed clang sinks (batch), harvest-suppression half (full-mode review) |
+| F1 | p4/localize-relayed-clang-diagnostics + p3/cpp-sink-refusal-cause-lost-under-harvest-suppression | `linker: ` prefix landed 88e7b6def (LINKPFX; clang driver line keeps `clang: `); open: audit of unprefixed clang sinks (batch), translation question, harvest-suppression half (full-mode review) |
 
 ### G - request cache and incremental infrastructure
 
@@ -178,7 +178,7 @@ Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the pl
 
 | Run | Issue(s) | Notes |
 |-----|----------|-------|
-| N-MOVESINK | p3/move-sink-leftovers-after-t128 + p3/unique-field-assign-source-not-marked-moved | ternary / `??` / indirect sinks, unique-field consume gaps |
+| N-MOVESINK | p3/unique-field-assign-source-not-marked-moved | indirect-root consumes landed 0050627c8 (MOVESINK; move-sink-leftovers file closed); residue: sink-path false refusals through pointer roots, global/static implicit consume error, conservative misses, operator-call re-init, do-while condition |
 | N-FOREACH | p3/unique-foreach-element-adoption-leftovers | items 1 (1a / 1b), 4, 5 open: capturing-lambda adoption, other containers; items 2-3 closed by ruling 2026-11-18 |
 | N-RAWOWN | p3/raw-local-owner-bit-leftovers + p3/owning-pointer-release-withheld-when-alias-may-reach + p3/runtime-null-coalesce-new-into-local-leaks | raw owner bit: counter-dependent first-iteration sink, alias-withheld release (leak only), `g ?? new T` leak |
 | N-JOIN | p3/owned-borrowed-ternary-join-rejects-and-misclassifies + p3/moved-raw-heap-array-ternary-destroys-one-element | owned/borrowed `?:` joins; moved raw heap array ternary |
@@ -196,7 +196,7 @@ Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the pl
 
 | Run | Issue(s) | Notes |
 |-----|----------|-------|
-| L-TUPLE | p3/tuple-leftovers-after-tuplit | ruled 2026-11-01; residue: owned unique-element refusals, R133/R134 |
+| L-TUPLE | p3/tuple-leftovers-after-tuplit | ruled 2026-11-01; R133/R134 closed by UNIQARG b04ec5235; residue: owned unique-element refusals, brace-init field borrows |
 | L-GENERIC | p3/generic-instantiation-value-leftovers + p3/generic-literal-deduction-leftovers | C++ template instance as value; ctor deduction `Box(3)` landed 8d05c9344; brace `Box b{3}` NEEDS RULING (aggregate deduction vs designated brace init) |
 
 ### P - plans and staged work

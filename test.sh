@@ -230,6 +230,7 @@ load_err_flags() {
   ERR_FLAGS=()
   ERR_EXPECT_EXIT=""
   ERR_EXPECT_OUTPUT=""
+  ERR_LINK=""
   if [ -f "$sidecar" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
       case "$line" in
@@ -241,6 +242,7 @@ load_err_flags() {
           ;;
         expect_exit=*) ERR_EXPECT_EXIT="${line#expect_exit=}" ;;
         expect_output=*) ERR_EXPECT_OUTPUT="${line#expect_output=}" ;;
+        link=*) ERR_LINK="${line#link=}" ;;
       esac
     done <"$sidecar"
   fi
@@ -256,6 +258,12 @@ check_err_result() {
   [ "$rc" -eq 0 ]
 }
 
+# Mode args for a sidecar fixture: `link=1` compiles and links to $RES/<name>.out (a link-time
+# failure is the leg) instead of --check.
+err_mode_args() {
+  if [ "$ERR_LINK" = "1" ]; then ERR_MODE=(-o "$RES/$1.out"); else ERR_MODE=(--check); fi
+}
+
 # Worker: an err_*.cb passes when expect_error matches, or when its sidecar expects
 # a nonzero exit and an output substring.
 run_err() {
@@ -269,7 +277,8 @@ run_err() {
     tu_check=(--error-on-cpp-reparse)
   fi
   load_err_flags "$f.flags"
-  $TIMEOUT "${compiler_env[@]}" "$CFLAT" "$f" -i "$LIB" --locale pseudo --locale-dir "$LOCALE_DIR" --check \
+  err_mode_args "$n"
+  $TIMEOUT "${compiler_env[@]}" "$CFLAT" "$f" -i "$LIB" --locale pseudo --locale-dir "$LOCALE_DIR" "${ERR_MODE[@]}" \
     ${tu_check[@]+"${tu_check[@]}"} ${ERR_FLAGS[@]+"${ERR_FLAGS[@]}"} >"$log" 2>&1 || rc=$?
   if check_err_result "$rc" "$log"; then
     write_result "$n" "PASS" "$t0"
@@ -289,7 +298,8 @@ run_err_warm() {
     compiler_env=(env CFLAT_CPP_MAX_HEADER_PARSES=0)
   fi
   load_err_flags "$f.flags"
-  $TIMEOUT "${compiler_env[@]}" "$CFLAT" "$f" -i "$LIB" --locale pseudo --locale-dir "$LOCALE_DIR" --check \
+  err_mode_args "$n"
+  $TIMEOUT "${compiler_env[@]}" "$CFLAT" "$f" -i "$LIB" --locale pseudo --locale-dir "$LOCALE_DIR" "${ERR_MODE[@]}" \
     ${ERR_FLAGS[@]+"${ERR_FLAGS[@]}"} >"$log" 2>&1 || rc=$?
   if check_err_result "$rc" "$log"; then
     write_result "$n" "PASS" "$t0"
@@ -298,7 +308,7 @@ run_err_warm() {
   fi
 }
 
-export -f run_cb cb_extra_args cb_twin_args load_err_flags check_err_result run_err run_err_warm \
+export -f run_cb cb_extra_args cb_twin_args load_err_flags check_err_result err_mode_args run_err run_err_warm \
   is_cpp_interop_test cpp_budget_enabled is_skipped \
   now_ms write_result
 export CFLAT LIB LOCALE_DIR RES TIMEOUT RUN_MODE TIMEOUT_SECS HEAVY_TIMEOUT_SECS HEAVY_TESTS

@@ -3402,17 +3402,63 @@ bool LLVMBackend::EmitCxxDemandCompanions()
     return true;
 }
 
+// Basename of a clang link driver (clang, clang++, clang-18, o64-clang); empty for gcc / cc-as-gcc,
+// whose own lines (gcc:, collect2:) stay linker text.
+static llvm::StringRef ClangDriverName(llvm::StringRef driverPath)
+{
+    llvm::StringRef name = llvm::sys::path::filename(driverPath);
+    return name.contains("clang") ? name : llvm::StringRef();
+}
+
+/*
+ * Relays tool stderr that cflat captured from a linker or dsymutil. Every non-empty line gets
+ * the "linker: " prefix, so the text reads as neither cflat's nor clang's (ruling 2026-11-18).
+ * A clang driver's own line ("<driverName>: ...") is clang text and gets "clang: " instead.
+ */
+void LLVMBackend::RelayLinkerStderr(llvm::StringRef text, llvm::StringRef driverName)
+{
+    const std::string driverLead = driverName.empty() ? std::string() : driverName.str() + ": ";
+    while (!text.empty())
+    {
+        auto [line, rest] = text.split('\n');
+        text = rest;
+        line = line.rtrim('\r');
+        if (line.empty()) std::cerr << "\n";
+        else if (!driverLead.empty() && line.starts_with(driverLead))
+            std::cerr << "clang: " << line.str() << "\n";
+        else std::cerr << "linker: " << line.str() << "\n";
+    }
+    std::cerr << std::flush;
+}
+
+int LLVMBackend::RunToolRelayingStderr(llvm::StringRef program, llvm::ArrayRef<llvm::StringRef> args,
+                                       std::string& error, llvm::StringRef driverName)
+{
+    llvm::SmallString<256> errPath;
+    // Without a capture file the tool's stderr goes straight to the console, unprefixed.
+    if (llvm::sys::fs::createTemporaryFile("cflat-tool", "err", errPath))
+        return llvm::sys::ExecuteAndWait(program, args, std::nullopt, {}, 0, 0, &error);
+    const std::optional<llvm::StringRef> redirects[] = {
+        std::nullopt, std::nullopt, llvm::StringRef(errPath) };
+    std::cout.flush();
+    const int rc = llvm::sys::ExecuteAndWait(program, args, std::nullopt, redirects, 0, 0, &error);
+    if (auto err = llvm::MemoryBuffer::getFile(errPath))
+        RelayLinkerStderr((*err)->getBuffer(), driverName);
+    (void)llvm::sys::fs::remove(errPath);
+    return rc;
+}
+
 /*
  * Runs a linker. After a demand replay its output is held back: stdout and stderr go to their
  * own temporary files and reach their streams only when the link succeeds. A failing link then
  * requests the whole-compile cold retry instead of reporting symbols the cold compile defines.
  */
 int LLVMBackend::RunLinkerProcess(llvm::StringRef program, llvm::ArrayRef<llvm::StringRef> args,
-                                  std::string& error)
+                                  std::string& error, llvm::StringRef driverName)
 {
     llvm::TimeTraceScope linkScope("LinkerProcess", program);
     if (!cxxDemandReplayed_ || cxxDemandBypass_)
-        return llvm::sys::ExecuteAndWait(program, args, std::nullopt, {}, 0, 0, &error);
+        return RunToolRelayingStderr(program, args, error, driverName);
     llvm::SmallString<256> outPath, errPath;
     if (llvm::sys::fs::createTemporaryFile("cflat-link", "out", outPath)
         || llvm::sys::fs::createTemporaryFile("cflat-link", "err", errPath))
@@ -3437,7 +3483,7 @@ int LLVMBackend::RunLinkerProcess(llvm::StringRef program, llvm::ArrayRef<llvm::
         if (auto out = llvm::MemoryBuffer::getFile(outPath))
             std::cout << (*out)->getBuffer().str() << std::flush;
         if (auto err = llvm::MemoryBuffer::getFile(errPath))
-            std::cerr << (*err)->getBuffer().str() << std::flush;
+            RelayLinkerStderr((*err)->getBuffer(), driverName);
     }
     else
     {
@@ -3832,7 +3878,7 @@ bool LLVMBackend::EmitExecutableElf(const std::string& exePath, bool debugInfo,
 
         std::cout << std::format("Linking (elf): {}\n", exePath);
         std::string linkErr;
-        int rc = RunLinkerProcess(cc, args, linkErr);
+        int rc = RunLinkerProcess(cc, args, linkErr, ClangDriverName(cc));
         (void)llvm::sys::fs::remove(objPath);
         for (auto& cObj : cObjectFiles_) (void)llvm::sys::fs::remove(cObj);
         if (rc != 0)
@@ -4181,7 +4227,7 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
 
         std::cout << std::format("Linking (mach-o): {}\n", exePath);
         std::string linkErr;
-        int rc = RunLinkerProcess(cc, args, linkErr);
+        int rc = RunLinkerProcess(cc, args, linkErr, ClangDriverName(cc));
         if (rc != 0)
         {
             (void)llvm::sys::fs::remove(objPath);

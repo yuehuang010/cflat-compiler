@@ -1,7 +1,7 @@
-# Discard sink leftovers after T352: `?:` move join leaks, C++ class field move is a no-op
+# Discard sink leftovers after T352: `?:` move join leaks (native strings and dtor structs)
 
 Severity p3. Found by the T352 review (2026-10-20); pre-existing on master (same result before and after T352).
-Cases: scratch/repro_keep/box1021/t352_rev/cases/ (ternary_move.cb, cxx_field.cb + cx.hpp + cxx_oracle.cpp, owning_raw_field.cb).
+Cases: scratch/repro_keep/box1021/t352_rev/cases/ (ternary_move.cb, owning_raw_field.cb).
 
 1. Fixed in MIX19: `_ = c ? move o.s : move q.s;` (and `string r = c ? move o.s : move q.s;`, call arguments, parenthesized
    arms) no longer leaks. Root cause (MIX19): the join deep-copied each moved string arm (AdoptTernaryStringArm) after the move
@@ -10,11 +10,9 @@ Cases: scratch/repro_keep/box1021/t352_rev/cases/ (ternary_move.cb, cxx_field.cb
    Test/test_move.cb testMix19TernaryMoveJoin. Not the discard sink: the sink already returns early on a join that the join owns.
    Still open (same root cause, left as is per the MIX19 brief): a mixed join `_ = c ? move o.s : q.s;` with the move arm
    selected still leaks (scratch/mix19_tmp/p1.cb case 3, c=1). Root cause (MIX19): same deep copy, one arm not a move.
-2. Not fixed in MIX19 (optional item, gated on item 3 being fixed). `_ = move p->c;` on a C++ class field runs no move ctor
-   and leaves the field intact (len 66); clang twin `{ Cx t = std::move(p->c); }` gives move=1 dtor=2, len 0.
-   Root cause (MIX19): the discard branch handles foreign C++ ELEMENTS (IsElementAccess, MainListener_Expressions.cpp
-   ~4760) but a C++ class field falls through to RegisterDiscardedOwningStructTemp, which returns early on a storage-backed
-   value (MainListener_PostfixExpression.cpp ~18253), so no move-ctor temp is built.
+2. Fixed in TERNREST: `_ = move p->c;` (also `move s.f`, `move *p`, `(move s.f)`, nested fields) on an imported C++
+   class runs the move ctor into a temp and destroys it, as clang's `{ Cx t = std::move(p->c); }` (move=1, source
+   moved-from). Legs: Test/test_cpp_interop.cb TrFieldDiscard (99699-99704).
 3. Not fixed in MIX19 (by design, not a fix candidate). `_ = move o.raw;` where the user dtor deletes the raw field leaks.
    Root cause (MIX19): a raw `Val*` owns nothing (raw lifetimes are untracked, memory-safety-function-boundaries-only ruling).
    The move nulls the field, so ~O deletes nothing, and discarding a non-owning pointer has no drop. The owning spelling

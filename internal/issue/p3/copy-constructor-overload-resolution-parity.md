@@ -1,25 +1,36 @@
-# CFlat return into same-type initializer adds a copy
+# CFlat return into same-type initializer: lambda-body callee keeps a copy
 
-Summary: A CFlat-defined function returning a C++ class by value is copied into a same-type
-initializer, where clang++ elides that copy. A named local returned from a CFlat function
-(`CV x(7); return x;`) is likewise copied where clang++ elides it (NRVO).
+Summary: RETELIDE (2026-11-19) builds a CFlat call result straight in a same-type initializer
+when a same-type by-value argument is a temporary (`CV z = f(CV(7));`, clang counts), and routes
+the implicit move of a returned parameter / `move h->m` through clang's pick when the class has a
+forwarding constructor template. NRVO for a single named local already matched clang on master.
+What remains is one deliberately kept gate.
 
-Repro: `CV z = f(CV(7));`, with `CV` imported from a C++ header and CFlat defining
-`CV f(CV a) { return CV(a.v); }`.
+Open: a CFlat callee in which a lambda names (captures) a by-value parameter of the returned
+class type keeps the extra result copy (LLVMBackend_Overloads.cpp, `LambdaNamesReturnTypeParam`
+gate; predicate MainListener_Support.cpp LambdaNamesReturnTypeParam - any Identifier token in a
+lambda subtree spelling such a parameter, shadowing treated as a capture). A capture-less lambda,
+one capturing something else, nested or dead lambdas are elided like clang. Repro
+(Test/test_cpp_interop_bridge.cb `bridge_capture_return`, legs "captured C++ return copy/dtor" at
+about line 6219):
 
-Measured on this worktree: value 7, k=1, b=3 (k = copy-ctor runs, b = ctor runs). clang++ -std=c++20:
-value 7, k=0, b=2. The copy is a non-const lvalue copy (T(T&) pick) on the returned temporary.
-Named-local NRVO repro: `CV local_ret() { CV x(7); return x; }`, `CV z = local_ret();` gives b=2 on
-CFlat, b=1 on clang++ (k=0 on clang++).
+    cppi.Tracked bridge_capture_return(cppi.Tracked source)
+    {
+        Lambda<cppi.Tracked()> captured = () => { return source; };
+        return captured();
+    }
+    cppi.Tracked value = bridge_capture_return(cppi.Tracked(43));
 
-Root cause direction: the initializer's C++ return-slot elision path is not armed for this
-nested CFlat call expression, so the call result is materialized in a return temporary and then
-copy-constructed into the declared object. Fix direction: route the CFlat call's return storage
-directly to the initializer destination without consuming an outer slot for an inner call; a
-named local returned by value should be built in the caller's sret slot (NRVO).
+clang++ -std=c++20: copy 2 (capture copy + return copy), dtor 3. CFlat captures `source` by
+reference (non-escaping lambda, borrow capture), so the callee makes 1 copy; the kept caller-side
+copy brings the total to clang's 2. Same shape with cpcpick.CV: clang v10 b3 k1 c1, CFlat v9 b3 k2
+c0 (gate kept), v8 b2 k1 c0 (gate removed).
 
-Fixed (copypar2): a returned parameter or `return move x;` with no move constructor copies through
-the const copy constructor first (clang's CWG1579 rvalue-first pick), not T(T&).
-Open: a class with no move constructor and a forwarding template constructor. clang's rvalue pick is the
-template, CFlat takes the const copy (`return a;` v=10 cc=1, clang v=13 tc=1; master mc=2, also wrong); same
-for a prvalue argument and `return move h->m;`. Route through the clang pick when classInfo->hasCtorTemplate.
+Needs a maintainer ruling. Principled end state: drop the gate and re-pin the bridge leg to CFlat's
+own counts (copy 1, dtor 2), per the lambda value-capture ruling 2026-09-30 (no implicit copy of
+non-trivial types); the alternative is a capture that copies like clang.
+
+Not this issue (CFlat sink semantics, recorded for reference): an lvalue passed to a CFlat
+`move` parameter (`T f(T a) { return move a; }`, `f(s)`) is consumed by the call, so a class with
+a forwarding template constructor builds the parameter through the template (v=13 t=2); clang
+copies the lvalue (v=11 k=1 t=1).

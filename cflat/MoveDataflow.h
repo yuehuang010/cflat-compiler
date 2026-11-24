@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -24,6 +25,12 @@
 #include <llvm/IR/Function.h>
 #include <llvm/IR/InstrTypes.h>   // llvm::CallBase
 #include <llvm/IR/Instructions.h>  // llvm::ReturnInst
+#include <llvm/IR/IntrinsicInst.h>
+#include <llvm/Analysis/CaptureTracking.h>
+#include <llvm/Analysis/ValueTracking.h>
+#include <llvm/IR/Dominators.h>
+#include <deque>
+#include <climits>
 
 #include "LlvmHelpers.h"   // cflat_llvm::GetTerminatorOrNull
 
@@ -477,6 +484,7 @@ namespace nulldf
         Deref,      // '->' / '.' / '*' / '[]' on x (check-only)
         ClearFields,  // method call on struct path x - every field path under x may be re-initialized
         EscapeFields, // `alias` of struct x - its field paths can be rewritten through the alias
+        Clobber,      // analysis-only: a call or store that may re-initialize an indirect path
     };
 
     struct Event
@@ -490,6 +498,16 @@ namespace nulldf
         bool joinConsumed = false;
         llvm::Value* readStorage = nullptr;
         llvm::Value* readValue = nullptr;
+        // Instruction before the insert point when recorded (null = block was empty); only ever
+        // compared, never dereferenced, so an erased anchor just reads as an unknown position.
+        const llvm::Instruction* anchor = nullptr;
+        // SetNull of a field path another name may reach (pointer / param / this / static /
+        // global / element root): killed by any later call or possibly-aliasing store.
+        bool indirect = false;
+        const llvm::Value* rootStorage = nullptr;
+        // Struct locals the consuming statement stored into: an escaped one may be the source
+        // itself (`s.p = move ps->p` with ps == &s), so the SetNull is then dropped.
+        std::vector<std::string> destinationRoots;
     };
 
     struct Divergence
@@ -766,6 +784,7 @@ namespace nulldf
         case EventKind::Read:      s.erase(e.name);           break;
         case EventKind::EscapeFields:
         case EventKind::Escape:
+        case EventKind::Clobber:
         case EventKind::Deref:                                break;
         }
     }
@@ -777,6 +796,109 @@ namespace nulldf
             into[name].wholeMoves.insert(w.wholeMoves.begin(), w.wholeMoves.end());
             into[name].pointeeMoves.insert(w.pointeeMoves.begin(), w.pointeeMoves.end());
             into[name].joinConsumedMoves.insert(w.joinConsumedMoves.begin(), w.joinConsumedMoves.end());
+        }
+    }
+
+    /*
+     * Indirect paths (Event::indirect): a consumed `ps->p` / `this->p` / `a[0].p` / static or
+     * global field may be re-initialized through another name, so its moved mark is cleared by
+     * any later instruction that could write it - every call except intrinsics and read-only
+     * callees, and every store of a non-null pointer or aggregate. A store into a local alloca
+     * whose address was not captured before it can only re-initialize a path rooted in THAT slot.
+     * Clobbers are interleaved with the block's events by event anchor position.
+     */
+    inline void InterleaveIndirectClobbers(
+        llvm::Function* F,
+        std::unordered_map<llvm::BasicBlock*, std::vector<const Event*>>& byBlock,
+        const std::unordered_set<std::string>& escaped,
+        std::deque<Event>& clobbers)
+    {
+        std::unique_ptr<llvm::DominatorTree> dt;
+        std::unordered_map<const llvm::AllocaInst*, bool> everCaptured;
+        auto storeTarget = [&](const llvm::Instruction& inst, const llvm::Value* dest) -> const llvm::Value* {
+            const llvm::Value* obj = llvm::getUnderlyingObject(dest);
+            auto* slot = llvm::dyn_cast<llvm::AllocaInst>(obj);
+            if (slot == nullptr) return nullptr;
+            auto [memo, fresh] = everCaptured.try_emplace(slot, false);
+            if (fresh) memo->second = llvm::PointerMayBeCaptured(slot, false);
+            if (!memo->second) return slot;
+            if (!dt) dt = std::make_unique<llvm::DominatorTree>(*F);
+            return llvm::PointerMayBeCapturedBefore(slot, false, &inst, dt.get()) ? nullptr : slot;
+        };
+        // Returns false when `inst` cannot re-initialize an indirect path; else sets `target`
+        // (null = may write anywhere).
+        auto isClobber = [&](const llvm::Instruction& inst, const llvm::Value*& target) -> bool {
+            target = nullptr;
+            if (auto* call = llvm::dyn_cast<llvm::CallBase>(&inst))
+            {
+                if (auto* transfer = llvm::dyn_cast<llvm::MemTransferInst>(call))
+                {
+                    target = storeTarget(inst, transfer->getRawDest());
+                    return true;
+                }
+                if (llvm::isa<llvm::IntrinsicInst>(call)) return false;
+                return !call->onlyReadsMemory();
+            }
+            if (auto* store = llvm::dyn_cast<llvm::StoreInst>(&inst))
+            {
+                const llvm::Value* v = store->getValueOperand();
+                if (!v->getType()->isPointerTy() && !v->getType()->isAggregateType()) return false;
+                if (auto* c = llvm::dyn_cast<llvm::Constant>(v); c != nullptr && c->isNullValue())
+                    return false;
+                target = storeTarget(inst, store->getPointerOperand());
+                return true;
+            }
+            return llvm::isa<llvm::AtomicRMWInst>(inst) || llvm::isa<llvm::AtomicCmpXchgInst>(inst);
+        };
+        for (llvm::BasicBlock& BB : *F)
+        {
+            auto listIt = byBlock.find(&BB);
+            std::vector<const Event*> events;
+            if (listIt != byBlock.end()) events = std::move(listIt->second);
+            std::unordered_map<const llvm::Instruction*, int> index;
+            int n = 0;
+            for (const llvm::Instruction& inst : BB) index[&inst] = n++;
+            auto positionOf = [&](const llvm::Instruction* anchor) {
+                if (anchor == nullptr) return -1;
+                auto it = index.find(anchor);
+                return it == index.end() ? INT_MIN : it->second;
+            };
+            // Position = index of the anchor; an event runs before every instruction after it.
+            std::vector<std::pair<int, const Event*>> placed;
+            int running = -1;
+            for (const Event* e : events)
+            {
+                int pos = positionOf(e->anchor);
+                const bool indirectSet = e->kind == EventKind::SetNull && e->indirect;
+                if (indirectSet && (pos == INT_MIN
+                                    || std::ranges::any_of(e->destinationRoots, [&](const std::string& r) {
+                                           return escaped.count(r) > 0; })))
+                    continue;
+                if (pos == INT_MIN) pos = running;
+                running = std::max(running, pos);
+                placed.push_back({ running, e });
+            }
+            std::vector<const Event*> merged;
+            size_t next = 0;
+            n = 0;
+            for (const llvm::Instruction& inst : BB)
+            {
+                while (next < placed.size() && placed[next].first < n) merged.push_back(placed[next++].second);
+                const llvm::Value* target = nullptr;
+                if (isClobber(inst, target))
+                {
+                    Event c;
+                    c.block = &BB;
+                    c.kind = EventKind::Clobber;
+                    c.rootStorage = target;
+                    clobbers.push_back(c);
+                    merged.push_back(&clobbers.back());
+                }
+                n++;
+            }
+            while (next < placed.size()) merged.push_back(placed[next++].second);
+            if (!merged.empty()) byBlock[&BB] = std::move(merged);
+            else if (listIt != byBlock.end()) byBlock.erase(listIt);
         }
     }
 
@@ -811,6 +933,18 @@ namespace nulldf
         }
         if (byBlock.empty()) return out;
 
+        std::unordered_map<std::string, const llvm::Value*> indirectRoots;
+        for (const auto& [bb, list] : byBlock)
+            for (const Event* e : list)
+                if (e->kind == EventKind::SetNull && e->indirect) indirectRoots[e->name] = e->rootStorage;
+        std::deque<Event> clobbers;
+        if (!indirectRoots.empty()) InterleaveIndirectClobbers(F, byBlock, escaped, clobbers);
+        auto apply = [&](NullState& s, const Event& e) {
+            if (e.kind != EventKind::Clobber) { ApplyEvent(s, e); return; }
+            for (const auto& [name, root] : indirectRoots)
+                if (e.rootStorage == nullptr || e.rootStorage == root) s.erase(name);
+        };
+
         // Entry-reachable blocks only - an aborted scoped expect_error can leave stale,
         // unreachable blocks whose state must not leak into a live dereference.
         std::unordered_map<llvm::BasicBlock*, int> rpo = movedf::ComputeRpoIndex(F);
@@ -837,7 +971,7 @@ namespace nulldf
                         if (rpo.count(pred)) MergeInto(in, blockOut[pred]);
                 NullState result = std::move(in);
                 if (auto it = byBlock.find(bb); it != byBlock.end())
-                    for (const Event* e : it->second) ApplyEvent(result, *e);
+                    for (const Event* e : it->second) apply(result, *e);
                 if (result != blockOut[bb]) { blockOut[bb] = std::move(result); changed = true; }
             }
         }
@@ -915,7 +1049,7 @@ namespace nulldf
                     if (rpo.count(pred)) MergeInto(running, blockOut[pred]);
             for (const Event* e : it->second)
             {
-                if (e->kind != EventKind::Deref) { ApplyEvent(running, *e); continue; }
+                if (e->kind != EventKind::Deref) { apply(running, *e); continue; }
                 if (e->line <= 0) continue;
                 auto wit = running.find(e->name);
                 if (wit == running.end()) continue;

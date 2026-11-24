@@ -1,5 +1,12 @@
 // Explicit move of a pointer that provably borrows (address-of a local) into a raw slot.
 // The moved-to local would free a stack address at scope exit. Refused.
+// UNIQARG legs: the borrow holds on ONE path only (a branch, loop or switch rebind), or sits in a
+// field (`h.p = &x;`); unique<T> destinations included.
+import "unique.cb";
+
+struct UqaSD { int v = 0; ~UqaSD() { } };
+struct UqaSH { UqaSD* p = default; };
+struct UqaSO { UqaSH h = default; };
 
 extern int main()
 {
@@ -7,6 +14,111 @@ extern int main()
         int x = 5;
         int* p = &x;
         int* q = move p;
+    }
+    expect_error("cannot move a borrowed pointer; move from the owning slot") {
+        int c = 0;
+        UqaSD x = default;
+        UqaSD* p = &x;
+        if (c) p = new UqaSD();
+        unique<UqaSD> u = move p;
+    }
+    expect_error("cannot move a borrowed pointer; move from the owning slot") {
+        int c = 1;
+        UqaSD x = default;
+        UqaSD* p = &x;
+        while (c) { p = new UqaSD(); c = 0; }
+        unique<UqaSD> u = move p;
+    }
+    expect_error("cannot move a borrowed pointer; move from the owning slot") {
+        int c = 1;
+        UqaSD x = default;
+        UqaSD* p = &x;
+        switch (c) { case 1: p = new UqaSD(); break; default: break; }
+        unique<UqaSD> u = move p;
+    }
+    expect_error("cannot move a borrowed pointer; move from the owning slot") {
+        int c = 1;
+        UqaSD x = default;
+        UqaSD* p = &x;
+        if (c) p = new UqaSD();
+        UqaSD* q = move p;
+        delete q;
+    }
+    expect_error("cannot move a borrowed pointer; move from the owning slot") {
+        int c = 1;
+        UqaSD x = default;
+        UqaSD* p = &x;
+        if (c) p = new UqaSD();
+        unique<UqaSD> u = default;
+        u = move p;
+    }
+    expect_error("cannot move a borrowed pointer; move from the owning slot") {
+        int c = 1;
+        UqaSD x = default;
+        UqaSD* p = &x;
+        if (c) p = new UqaSD();
+        UqaSD* q = p;
+        unique<UqaSD> u = move q;
+    }
+    expect_error("cannot move a borrowed pointer; move from the owning slot") {
+        UqaSD x = default;
+        UqaSH h = default;
+        h.p = &x;
+        unique<UqaSD> u = move h.p;
+    }
+    expect_error("cannot move a borrowed pointer; move from the owning slot") {
+        UqaSD x = default;
+        UqaSH* h = new UqaSH();
+        h.p = &x;
+        unique<UqaSD> u = move h.p;
+        delete h;
+    }
+    expect_error("cannot move a borrowed pointer; move from the owning slot") {
+        UqaSD x = default;
+        UqaSH h = default;
+        h.p = &x;
+        UqaSD* q = move h.p;
+        delete q;
+    }
+    expect_error("cannot move a borrowed pointer; move from the owning slot") {
+        int c = 1;
+        UqaSD x = default;
+        UqaSH h = default;
+        h.p = &x;
+        if (c) h.p = new UqaSD();
+        unique<UqaSD> u = move h.p;
+    }
+    expect_error("cannot move a borrowed pointer; move from the owning slot") {
+        UqaSD x = default;
+        UqaSH h = default;
+        h.p = &x;
+        UqaSH g = h;
+        unique<UqaSD> u = move g.p;
+    }
+    expect_error("cannot move a borrowed pointer; move from the owning slot") {
+        UqaSD x = default;
+        UqaSH h = default;
+        h.p = &x;
+        UqaSH g = default;
+        g = h;
+        unique<UqaSD> u = move g.p;
+    }
+    expect_error("cannot move a borrowed pointer; move from the owning slot") {
+        UqaSD x = default;
+        UqaSH h = default;
+        h.p = &x;
+        UqaSO o = default;
+        o.h = h;
+        unique<UqaSD> u = move o.h.p;
+    }
+    expect_error("cannot move a borrowed pointer; move from the owning slot") {
+        UqaSD x = default;
+        UqaSH h = default;
+        h.p = &x;
+        UqaSO o = default;
+        o.h = h;
+        UqaSO q = o;
+        unique<UqaSD> u = move q.h.p;
     }
     return 0;
 }

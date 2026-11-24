@@ -204,6 +204,9 @@ namespace cflat_cinterop
 
     // Ref-qualifier on a non-static C++ member function. The integer values are kept in the
     // clang-independent extraction record and in the backend caches.
+    // RawCxxRecord::assignRefusedMask bits: clang refuses `dst = src` for that source kind.
+    enum CxxAssignRefused : uint8_t { CxxAssignRefusedLvalue = 1, CxxAssignRefusedConstLvalue = 2,
+                                      CxxAssignRefusedRvalue = 4, CxxAssignRefusedConstRvalue = 8 };
     enum CxxRefQualifier { CxxRefQualifierNone = 0, CxxRefQualifierLValue = 1,
                            CxxRefQualifierRValue = 2 };
     enum class CtorPick : uint8_t { Unknown = 0, CopyOrMove = 1, Other = 2 };
@@ -576,6 +579,8 @@ namespace cflat_cinterop
         // selected operator= binds `const T&` (non-deleted). "c": the source is a const rvalue.
         bool moveAssignBindsConstRef = false;
         bool moveAssignConstSourceBindsConstRef = false;
+        // CxxAssignRefused bits per source kind (same-class `dst = src`, non-member context).
+        uint8_t assignRefusedMask = 0;
         bool isAggregate = false;
         std::vector<RawCxxCtorTemplate> ctorTemplates;
         std::vector<RawCxxMember> members;

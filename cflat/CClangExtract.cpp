@@ -2844,13 +2844,17 @@ namespace cflat_cinterop
 
         /*
          * Clang's own overload resolution for `dst = src` with a non-const lvalue dst of record
-         * `cxx` and a (const or non-const) rvalue src. True when the selected operator= is a
-         * non-deleted `const T&`. Implicit members, defaulted-deleted moves and ref-qualifiers are
-         * clang's call. A template operator= or an unresolved set answers false (no refusal).
+         * `cxx` and a (const or non-const) lvalue or rvalue src. `selectsConstRef`: the selected
+         * operator= is a non-deleted `const T&`. `refused`: clang refuses the assignment from a
+         * non-member context (no viable or ambiguous set, deleted or non-public selection).
+         * Implicit members, defaulted-deleted moves and ref-qualifiers are clang's call.
          */
-        bool AssignmentSelectsConstRef(Sema& sema, const CXXRecordDecl* cxx, bool constSource)
+        struct AssignmentResolution { bool selectsConstRef = false; bool refused = false; };
+        AssignmentResolution ResolveSameClassAssignment(Sema& sema, const CXXRecordDecl* cxx,
+                                                        bool constSource, bool lvalueSource)
         {
-            if (cxx == nullptr || !cxx->hasDefinition() || cxx->isDependentContext()) return false;
+            AssignmentResolution result;
+            if (cxx == nullptr || !cxx->hasDefinition() || cxx->isDependentContext()) return result;
             auto* record = const_cast<CXXRecordDecl*>(cxx);
             ASTContext& ctx = sema.getASTContext();
             SourceLocation loc = SemaLocationForDecl(ctx, cxx);
@@ -2862,7 +2866,7 @@ namespace cflat_cinterop
             found.suppressDiagnostics();
             QualType objectType = ctx.getCanonicalTagType(record);
             QualType argType = constSource ? objectType.withConst() : objectType;
-            OpaqueValueExpr arg(loc, argType, VK_XValue);
+            OpaqueValueExpr arg(loc, argType, lvalueSource ? VK_LValue : VK_XValue);
             Expr* args[] = { &arg };
             OverloadCandidateSet candidates(loc, OverloadCandidateSet::CSK_Normal);
             bool any = false;
@@ -2885,15 +2889,37 @@ namespace cflat_cinterop
                 sema.AddMethodCandidate(DeclAccessPair::make(d, d->getAccess()), objectType,
                     Expr::Classification::makeSimpleLValue(), args, candidates);
             }
-            if (!any) return false;
+            if (!any) return result;
             OverloadCandidateSet::iterator best;
-            if (candidates.BestViableFunction(sema, loc, best) != OR_Success)
-                return false;
+            const OverloadingResult resolved = candidates.BestViableFunction(sema, loc, best);
+            if (resolved == OR_No_Viable_Function || resolved == OR_Ambiguous)
+            {
+                result.refused = true;
+                return result;
+            }
+            if (resolved != OR_Success && resolved != OR_Deleted) return result;
             const FunctionDecl* selected = best->Function;
-            if (selected == nullptr || selected->isDeleted() || selected->getNumParams() != 1)
-                return false;
+            if (selected == nullptr) return result;
+            if (selected->isDeleted())
+            {
+                // cflat rebinds a reference member on assignment (the reference-escape analysis
+                // relies on it), so a deletion clang implies from one is not counted as refused.
+                const bool referenceMember = std::any_of(cxx->field_begin(), cxx->field_end(),
+                    [](const FieldDecl* field) { return field->getType()->isReferenceType(); });
+                result.refused = selected->isDeletedAsWritten() || !referenceMember;
+                return result;
+            }
+            // A CFlat assignment is never inside the class or a friend: only public is usable.
+            if (best->FoundDecl.getAccess() != AS_public)
+            {
+                result.refused = true;
+                return result;
+            }
+            if (selected->getNumParams() != 1) return result;
             QualType param = selected->getParamDecl(0)->getType();
-            return param->isLValueReferenceType() && param->getPointeeType().isConstQualified();
+            result.selectsConstRef = param->isLValueReferenceType()
+                && param->getPointeeType().isConstQualified();
+            return result;
         }
 
         struct DeclVisitor : public RecursiveASTVisitor<DeclVisitor>
@@ -4390,10 +4416,18 @@ namespace cflat_cinterop
                 rec.hasTrivialDtor = !cxx->hasNonTrivialDestructor();
                 if (st.ci != nullptr && st.ci->hasSema())
                 {
-                    rec.moveAssignBindsConstRef = AssignmentSelectsConstRef(
-                        st.ci->getSema(), cxx, false);
-                    rec.moveAssignConstSourceBindsConstRef = AssignmentSelectsConstRef(
-                        st.ci->getSema(), cxx, true);
+                    Sema& sema = st.ci->getSema();
+                    const auto rvalue = ResolveSameClassAssignment(sema, cxx, false, false);
+                    const auto constRvalue = ResolveSameClassAssignment(sema, cxx, true, false);
+                    rec.moveAssignBindsConstRef = rvalue.selectsConstRef;
+                    rec.moveAssignConstSourceBindsConstRef = constRvalue.selectsConstRef;
+                    rec.assignRefusedMask = static_cast<uint8_t>(
+                        (ResolveSameClassAssignment(sema, cxx, false, true).refused
+                            ? cflat_cinterop::CxxAssignRefusedLvalue : 0)
+                        | (ResolveSameClassAssignment(sema, cxx, true, true).refused
+                            ? cflat_cinterop::CxxAssignRefusedConstLvalue : 0)
+                        | (rvalue.refused ? cflat_cinterop::CxxAssignRefusedRvalue : 0)
+                        | (constRvalue.refused ? cflat_cinterop::CxxAssignRefusedConstRvalue : 0));
                 }
                 rec.paramDestroyedInCallee = cxx->isParamDestroyedInCallee();
                 rec.hasDefaultCtor = cxx->hasDefaultConstructor();

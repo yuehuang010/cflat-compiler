@@ -578,7 +578,7 @@ t50v.V* t50Up(t50v.L* p) { return p; }
 int t50Take(t50v.V* v) { return v == nullptr ? -1 : v.value; }
 import cpp {"library/t31_minmax_brace.hpp", "library/cpp_t63_brace_decl.hpp"};
 enum T276Cf : u8 { T276C0, T276C1 };
-import cpp {"library/cpp_t135_field_brace.hpp", "library/cpp_t78_scalar_table.h", "library/cpp_interop_t104_refparam.hpp", "library/cpp_t87_null_zero.h", "library/cpp_t132_s7_byval.hpp", "library/cpp_t310_fldinit.hpp", "library/cpp_private_base_shadow.h", "library/cpp_mixed_access.hpp", "library/cpp_private_overloads.hpp", "library/cpp_move_operand_ops.hpp", "library/cpp_copy_parity.hpp", "library/cpp_copy_ctor_pick.hpp"};
+import cpp {"library/cpp_t135_field_brace.hpp", "library/cpp_t78_scalar_table.h", "library/cpp_interop_t104_refparam.hpp", "library/cpp_t87_null_zero.h", "library/cpp_t132_s7_byval.hpp", "library/cpp_t310_fldinit.hpp", "library/cpp_private_base_shadow.h", "library/cpp_mixed_access.hpp", "library/cpp_private_overloads.hpp", "library/cpp_move_operand_ops.hpp", "library/cpp_copy_parity.hpp", "library/cpp_copy_ctor_pick.hpp", "library/cpp_retelide.hpp"};
 // GRPLEAK: three separate lines on purpose - a request on the host line includes the other two.
 import cpp "library/cpp_grpleak_dep.hpp";
 // (a separate line: its header must not see the line above's macros)
@@ -605,6 +605,30 @@ grpleak_bra.In GrpleakMakeIn(int a, alias int p) { return { r = p, v = a }; }
 cpcpick.CV ctorPickReturnParam(cpcpick.CV x) { return x; }
 cpcpick.CV ctorPickMoveParam(cpcpick.CV a) { return move a; }
 int ctorPickTakeValue(cpcpick.CV x) { return x.v; }
+// RETELIDE: a CFlat call result builds straight in a same-type initializer (clang elides).
+cpcpick.CV retelideRebuild(cpcpick.CV a) { return cpcpick.CV(a.v); }
+cpcpick.CV retelideRebuildPlus(cpcpick.CV a, int k) { return cpcpick.CV(a.v + k); }
+cpcpick.CV retelideMake(int x) { return cpcpick.CV(x); }
+cpcpick.CV retelideDouble(cpcpick.CV a) { return cpcpick.CV(a.v * 2); }
+cpcpick.CV retelideMaybeParam(cpcpick.CV a, bool c) { if (c) return a; return cpcpick.CV(1); }
+cpcpick.CV retelideRecurse(cpcpick.CV a, int n)
+{
+    if (n == 0) return cpcpick.CV(a.v);
+    return retelideRecurse(cpcpick.CV(a.v + 1), n - 1);
+}
+cpcpick.CV retelideNamed() { cpcpick.CV x = cpcpick.CV(7); return x; }
+cpcpick.CV retelideTwoNamed(bool c) { cpcpick.CV a = cpcpick.CV(1); cpcpick.CV b = cpcpick.CV(2); if (c) return a; return b; }
+retelide.TE retelideThrowAfter(retelide.TE a) { return retelide.TE(a.v - 10); }
+int retelideThrowBody(int x) { retelide.TE z = retelideThrowAfter(retelide.TE(x)); return z.v; }
+// A lambda that names no same-type by-value parameter leaves the result elided.
+retelide.TE retelideLamNone(retelide.TE a) { Lambda<int()> l = () => { return 1; }; return retelide.TE(a.v + l()); }
+retelide.TE retelideLamOther(retelide.TE a, int k) { Lambda<int()> l = () => { return k; }; return retelide.TE(a.v + l()); }
+// clang's implicit move of a returned parameter or `move h->m` picks TV's forwarding template.
+retelide.TV retelideTvReturn(retelide.TV a) { return a; }
+retelide.TV retelideTvMaybe(retelide.TV a, bool c) { if (c) return a; return retelide.TV(1); }
+struct RetelideTvHolder { retelide.TV m; };
+retelide.TV retelideTvHeld(RetelideTvHolder* h) { return move h->m; }
+retelide.TV retelideTvHeldCopy(RetelideTvHolder* h) { return h->m; }
 struct CopyFieldMutableDefaultCFlatHolder { cppcp.CopyFieldMutableDefault value = default; };
 struct CopyMoveFieldCFlatHolder { cppcp.DF value = cppcp.DF(0); };
 // T310 FLDINIT: scalar field defaults of C++ class type run the converting constructor.
@@ -5637,6 +5661,10 @@ struct CtSuHolder { CtSu f; };
 CtNr CtNrMk(int v) { return CtNr(v); }
 CtNr CtNrPickCall(int k) { return k ? CtNrMk(4) : CtNr(5); }
 CtNr CtNrPickNested(int k) { return k != 0 ? CtNr(4) : (k == 0 ? CtNr(5) : CtNr(6)); }
+// TERNLEFT: a lowered [cpp] struct (C++ field) join of temps builds the selected arm in place.
+[cpp] struct CtLu { int x = 0; e6mv.Tc item; CtLu(int v) { x = v; } ~CtLu() { ct_d++; } };
+CtLu CtLuPick(int k) { return k ? CtLu(4) : CtLu(5); }
+CtLu CtLuPickNested(int k) { return k != 0 ? CtLu(4) : (k == 0 ? CtLu(5) : CtLu(6)); }
 int CtTakeInt(int v) { return v; }
 int CppTernZeroedCheck(int k)
 {
@@ -5751,10 +5779,102 @@ int CppTernZeroedCheck(int k)
     cm_dtors = 0;
     { CmDtor a; a.x = 7; CmDtor b; b.x = 8; CmDtor c = k ? move a : move b; if (c.x != want) return 8265; }
     if (cm_dtors != 3) return 8266;
+    // TERNLEFT: `auto` and `return` from a lowered [cpp] struct join of temps construct once
+    // (no move, one destructor; was a move plus a second destructor, and a refused return).
+    const int lu = k ? 4 : 5;
+    ct_d = 0;
+    { auto c = k ? CtLu(4) : CtLu(5); if (c.x != lu) return 8306; }
+    if (ct_d != 1) return 8307;
+    ct_d = 0;
+    { auto c = k != 0 ? CtLu(4) : (k == 0 ? CtLu(5) : CtLu(6)); if (c.x != lu) return 8308; }
+    if (ct_d != 1) return 8309;
+    ct_d = 0;
+    { CtLu c = CtLuPick(k); if (c.x != lu) return 8310; }
+    if (ct_d != 1) return 8311;
+    ct_d = 0;
+    { CtLu c = CtLuPickNested(k); if (c.x != lu) return 8312; }
+    if (ct_d != 1) return 8313;
     return 0;
 }
 
 // ARRBOUND accept-set: C++ constant statics and enumerators still fold as fixed-array bounds.
+// CPPOPEQ: same-class assignments clang accepts keep their pick and value (the operator= offset
+// names the member that ran); a CFlat struct with such a field assigns member-wise.
+struct CppopeqPubHost { cppopeq.Pub f = cppopeq.Pub(); int z = 0; };
+struct CppopeqTrivDelMoveHost { cppopeq.TrivDelMove f = cppopeq.TrivDelMove(); int z = 0; };
+cppopeq.MoveOnly CppopeqMakeMoveOnly() { cppopeq.MoveOnly t = cppopeq.MoveOnly(); t.v = 9; return t; }
+int CppopeqAssignable<T>() { return is_assignable(T) ? 1 : 0; }
+int CppopeqAccept()
+{
+    cppopeq.DelMove dm = cppopeq.DelMove(); cppopeq.DelMove dmSrc = cppopeq.DelMove(); dmSrc.v = 7;
+    dm = dmSrc;
+    if (dm.v != 107) return 36801;
+    cppopeq.Pub pub = cppopeq.Pub(); cppopeq.Pub pubSrc = cppopeq.Pub(); pubSrc.v = 7;
+    pub = pubSrc;
+    if (pub.v != 107) return 36802;
+    pub = cppopeq.Pub();
+    if (pub.v != 101) return 36803;
+    cppopeq.PubMove pm = cppopeq.PubMove(); cppopeq.PubMove pmSrc = cppopeq.PubMove(); pmSrc.v = 7;
+    pm = pmSrc;
+    if (pm.v != 107) return 36804;
+    pm = move pmSrc;
+    if (pm.v != 57) return 36805;
+    pm = cppopeq.PubMove();
+    if (pm.v != 51) return 36806;
+    cppopeq.Dflt df = cppopeq.Dflt(); cppopeq.Dflt dfSrc = cppopeq.Dflt(); dfSrc.v = 7;
+    df = dfSrc;
+    if (df.v != 7) return 36807;
+    // The implicit copy assignment beats the template one (+300).
+    cppopeq.Tmpl tm = cppopeq.Tmpl(); cppopeq.Tmpl tmSrc = cppopeq.Tmpl(); tmSrc.v = 7;
+    tm = tmSrc;
+    if (tm.v != 7) return 36808;
+    // Protected move only: an lvalue (plain, const, ?: join) takes the public copy.
+    cppopeq.ProtMove pv = cppopeq.ProtMove(); cppopeq.ProtMove pvSrc = cppopeq.ProtMove(); pvSrc.v = 7;
+    pv = pvSrc;
+    if (pv.v != 107) return 36809;
+    const cppopeq.ProtMove* pvConst = &pvSrc;
+    pv = *pvConst;
+    if (pv.v != 107) return 36810;
+    cppopeq.ProtMove pvOther = cppopeq.ProtMove(); pvOther.v = 8;
+    int pick = 1;
+    pv = pick > 0 ? pvSrc : pvOther;
+    if (pv.v != 107) return 36811;
+    cppopeq.NcCopy nc = cppopeq.NcCopy(); cppopeq.NcCopy ncSrc = cppopeq.NcCopy(); ncSrc.v = 7;
+    nc = ncSrc;
+    if (nc.v != 107) return 36812;
+    cppopeq.TrivDelMove td = cppopeq.TrivDelMove(); cppopeq.TrivDelMove tdSrc = cppopeq.TrivDelMove(); tdSrc.v = 7;
+    td = tdSrc;
+    if (td.v != 7) return 36813;
+    // Private copy, public move: every rvalue source takes the move (+50).
+    cppopeq.MoveOnly mo = cppopeq.MoveOnly(); cppopeq.MoveOnly moSrc = cppopeq.MoveOnly(); moSrc.v = 7;
+    mo = move moSrc;
+    if (mo.v != 57) return 36814;
+    mo = cppopeq.MoveOnly();
+    if (mo.v != 51) return 36815;
+    mo = CppopeqMakeMoveOnly();
+    if (mo.v != 59) return 36816;
+    CppopeqPubHost host = CppopeqPubHost(); CppopeqPubHost hostSrc = CppopeqPubHost(); hostSrc.f.v = 7;
+    host = hostSrc;
+    if (host.f.v != 107) return 36817;
+    // The field's deleted move drops the host's move assignment; C++ falls back to the copy.
+    CppopeqTrivDelMoveHost tdHost = CppopeqTrivDelMoveHost(); CppopeqTrivDelMoveHost tdHostSrc = CppopeqTrivDelMoveHost();
+    tdHostSrc.f.v = 7;
+    tdHost = move tdHostSrc;
+    if (tdHost.f.v != 7) return 36818;
+    // A container of a non-assignable class still stores and replaces by construction.
+    list<cppopeq.Del> dels = list<cppopeq.Del>();
+    cppopeq.Del del = cppopeq.Del(); del.v = 7;
+    dels.add(del);
+    del.v = 8;
+    dels.set(0, del);
+    if (dels.get(0).v != 8 || dels.count() != 1) return 36819;
+    if (CppopeqAssignable<cppopeq.Del>() != 0 || CppopeqAssignable<cppopeq.Prot>() != 0) return 36820;
+    if (CppopeqAssignable<cppopeq.Pub>() != 1 || CppopeqAssignable<cppopeq.DelMove>() != 1) return 36821;
+    // Move-only: only the copy is refused, so the class still assigns (from an rvalue).
+    if (CppopeqAssignable<cppopeq.MoveOnly>() != 1) return 36822;
+    return 0;
+}
+
 int arrBoundCppAccept()
 {
     int[arrb.K.n] a = default; a[2] = 7;
@@ -5772,6 +5892,8 @@ extern int main()
 {
     int arrBoundCppRc = arrBoundCppAccept();
     if (arrBoundCppRc != 0) return arrBoundCppRc;
+    int cppopeqRc = CppopeqAccept();
+    if (cppopeqRc != 0) return cppopeqRc;
     int nullmacfnValue = 7;
     int* nullmacfnPointer = &nullmacfnValue;
     if (cpp_nullmacfn.ptr(CFLAT_NULLMACFN_ID(0)) != 5) return 86201;
@@ -6066,6 +6188,106 @@ extern int main()
         if (ctorPickTakeValue(pickSource) != 8 || cpcpick.CV.mutCopy != 1 || cpcpick.CV.constCopy != 0) return 55109;
     }
     if (cpcpick.CV.born != 2 || cpcpick.CV.dead != 2) return 55110;
+    // RETELIDE (clang++ -std=c++20 counts): the call result is the initialized object.
+    cpcpick.CV.reset();
+    {
+        cpcpick.CV elided = retelideRebuild(cpcpick.CV(7));
+        if (elided.v != 7 || cpcpick.CV.mutCopy != 0 || cpcpick.CV.constCopy != 0) return 55111;
+    }
+    if (cpcpick.CV.born != 2 || cpcpick.CV.dead != 2) return 55112;
+    {
+        cpcpick.CV elided = retelideRebuildPlus(cpcpick.CV(7), 1);
+        if (elided.v != 8 || cpcpick.CV.born != 4 || cpcpick.CV.mutCopy != 0) return 55113;
+    }
+    cpcpick.CV.reset();
+    {
+        cpcpick.CV elided = retelideRebuild(retelideMake(7));
+        if (elided.v != 7 || cpcpick.CV.born != 2 || cpcpick.CV.mutCopy != 0) return 55114;
+    }
+    cpcpick.CV.reset();
+    {
+        cpcpick.CV elided = retelideDouble(retelideDouble(cpcpick.CV(3)));
+        if (elided.v != 12 || cpcpick.CV.born != 3 || cpcpick.CV.mutCopy != 0) return 55115;
+    }
+    if (cpcpick.CV.dead != 3) return 55116;
+    cpcpick.CV.reset();
+    {
+        cpcpick.CV taken = retelideMaybeParam(cpcpick.CV(7), true);
+        cpcpick.CV built = retelideMaybeParam(cpcpick.CV(7), false);
+        if (taken.v != 9 || built.v != 1 || cpcpick.CV.born != 4 || cpcpick.CV.mutCopy != 0
+            || cpcpick.CV.constCopy != 1) return 55117;
+    }
+    cpcpick.CV.reset();
+    {
+        cpcpick.CV deep = retelideRecurse(cpcpick.CV(1), 2);
+        if (deep.v != 3 || cpcpick.CV.born != 4 || cpcpick.CV.mutCopy != 0) return 55118;
+    }
+    if (cpcpick.CV.dead != 4) return 55119;
+    cpcpick.CV.reset();
+    {
+        cpcpick.CV elided = cpcpick.CV(0);
+        elided = retelideRebuild(cpcpick.CV(7));
+        if (elided.v != 7 || cpcpick.CV.born != 3 || cpcpick.CV.mutCopy != 0) return 55120;
+    }
+    cpcpick.CV.reset();
+    {
+        auto elided = retelideRebuild(cpcpick.CV(7));
+        if (elided.v != 7 || cpcpick.CV.born != 2 || cpcpick.CV.mutCopy != 0) return 55121;
+    }
+    // NRVO follows clang: one named local is built in the slot, two candidates in one scope are not.
+    cpcpick.CV.reset();
+    {
+        cpcpick.CV named = retelideNamed();
+        cpcpick.CV second = retelideTwoNamed(false);
+        if (named.v != 7 || second.v != 4 || cpcpick.CV.born != 4 || cpcpick.CV.constCopy != 1) return 55122;
+    }
+    if (cpcpick.CV.dead != 4) return 55123;
+    // The callee throws after its argument was built: the argument dies once, no result exists.
+    retelide.TE.reset();
+    if (cppunw.guarded(retelideThrowBody, 15) != 5 || retelide.TE.born != 2 || retelide.TE.dead != 2
+        || retelide.TE.copies != 0) return 55124;
+    retelide.TE.reset();
+    if (cppunw.guarded(retelideThrowBody, 3) != -5 || retelide.TE.born != 1 || retelide.TE.dead != 1) return 55125;
+    retelide.TE.reset();
+    {
+        retelide.TE noCapture = retelideLamNone(retelide.TE(7));
+        if (noCapture.v != 8 || retelide.TE.born != 2 || retelide.TE.copies != 0) return 55132;
+    }
+    retelide.TE.reset();
+    {
+        retelide.TE otherCapture = retelideLamOther(retelide.TE(7), 2);
+        if (otherCapture.v != 9 || retelide.TE.born != 2 || retelide.TE.copies != 0) return 55133;
+    }
+    if (retelide.TE.dead != 2) return 55134;
+    // Implicit move with a forwarding template constructor picks the template (v + 3).
+    retelide.TV.reset();
+    {
+        retelide.TV moved = retelideTvReturn(retelide.TV(7));
+        if (moved.v != 10 || retelide.TV.tmpl != 1 || retelide.TV.constCopy != 0) return 55126;
+    }
+    if (retelide.TV.born != 2 || retelide.TV.dead != 2) return 55127;
+    retelide.TV.reset();
+    {
+        retelide.TV source = retelide.TV(7);
+        retelide.TV moved = retelideTvReturn(source);
+        if (moved.v != 11 || retelide.TV.mutCopy != 1 || retelide.TV.tmpl != 1
+            || retelide.TV.constCopy != 0) return 55128;
+    }
+    retelide.TV.reset();
+    {
+        retelide.TV moved = retelideTvMaybe(retelide.TV(7), true);
+        if (moved.v != 10 || retelide.TV.tmpl != 1 || retelide.TV.born != 2) return 55129;
+    }
+    retelide.TV.reset();
+    {
+        RetelideTvHolder holder = { m = retelide.TV(7) };
+        retelide.TV.reset();
+        retelide.TV moved = retelideTvHeld(&holder);
+        retelide.TV copied = retelideTvHeldCopy(&holder);
+        if (moved.v != 10 || copied.v != 8 || retelide.TV.tmpl != 1 || retelide.TV.mutCopy != 1
+            || retelide.TV.constCopy != 0) return 55130;
+    }
+    if (retelide.TV.born != 2 || retelide.TV.dead != 3) return 55131;
     // Copy assignment binds the overload clang picks: a const source takes operator=(const CV&),
     // a non-const lvalue takes operator=(CV&).
     const cppcp.CV cpCx = cppcp.CV(7);
@@ -23783,6 +24005,225 @@ extern int main()
         if (q[0] != 21 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99013;
         T288ConstSecond(false, q);
         if (q[0] != 22 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99014;
+        // TERNLEFT: lowered-host `z = k ? move a : move b` move-assigns the selected source (no temp);
+        // moved by-value parameters are destroyed; a discarded mixed join (lowered host or imported
+        // class) moves or copies the selected arm into a temporary. All counts as clang++ -std=c++20.
+        TlAsgBoth(true, 0, q);
+        if (q[0] != 21 || q[1] != 0 || q[3] != 3 || q[4] != 0 || q[5] != 0 || q[6] != 3) return 99600;
+        TlAsgBoth(true, 1, q);
+        if (q[0] != 21 || q[1] != 0 || q[3] != 3 || q[4] != 0 || q[5] != 0 || q[6] != 3) return 99601;
+        TlAsgField(true, q);
+        if (q[0] != 21 || q[1] != 0 || q[3] != 3 || q[4] != 0 || q[5] != 0 || q[6] != 3) return 99602;
+        TlAsgSelf(true, q);
+        if (q[0] != -1 || q[1] != 0 || q[3] != 2 || q[4] != 0 || q[5] != 0 || q[6] != 2) return 99603;
+        TlParams(true, 0, q);
+        if (q[0] != 22 || q[1] != 0 || q[3] != 1 || q[4] != 2 || q[5] != 1 || q[6] != 4) return 99604;
+        TlParams(true, 1, q);
+        if (q[0] != 22 || q[1] != 0 || q[3] != 2 || q[4] != 2 || q[5] != 0 || q[6] != 4) return 99605;
+        TlDisc(true, 0, q);
+        if (q[0] != 0 || q[1] != 0 || q[3] != 2 || q[4] != 1 || q[5] != 0 || q[6] != 3) return 99606;
+        TlDisc(true, 1, q);
+        if (q[0] != 0 || q[1] != 0 || q[3] != 2 || q[4] != 0 || q[5] != 1 || q[6] != 3) return 99607;
+        TlDiscCxx(true, 0, q);
+        if (q[0] != -1 || q[1] != 22 || q[3] != 4 || q[4] != 0 || q[5] != 1 || q[6] != 5) return 99608;
+        TlDiscCxx(true, 1, q);
+        if (q[0] != 21 || q[1] != 22 || q[3] != 4 || q[4] != 1 || q[5] != 0 || q[6] != 5) return 99609;
+        TlDiscCxx(true, 2, q);
+        if (q[0] != -1 || q[1] != 22 || q[3] != 4 || q[4] != 0 || q[5] != 1 || q[6] != 5) return 99610;
+        TlDiscCxx(true, 3, q);
+        if (q[0] != -1 || q[1] != 22 || q[3] != 4 || q[4] != 0 || q[5] != 1 || q[6] != 5) return 99611;
+        TlDiscCxx(true, 4, q);
+        if (q[0] != 21 || q[1] != 22 || q[3] != 4 || q[4] != 1 || q[5] != 0 || q[6] != 5) return 99612;
+        TlAsgBoth(false, 0, q);
+        if (q[0] != 22 || q[1] != 0 || q[3] != 3 || q[4] != 0 || q[5] != 0 || q[6] != 3) return 99613;
+        TlAsgBoth(false, 1, q);
+        if (q[0] != 22 || q[1] != 0 || q[3] != 3 || q[4] != 0 || q[5] != 0 || q[6] != 3) return 99614;
+        TlAsgField(false, q);
+        if (q[0] != 22 || q[1] != 0 || q[3] != 3 || q[4] != 0 || q[5] != 0 || q[6] != 3) return 99615;
+        TlAsgSelf(false, q);
+        if (q[0] != 22 || q[1] != 0 || q[3] != 2 || q[4] != 0 || q[5] != 0 || q[6] != 2) return 99616;
+        TlParams(false, 0, q);
+        if (q[0] != 22 || q[1] != 0 || q[3] != 1 || q[4] != 2 || q[5] != 1 || q[6] != 4) return 99617;
+        TlParams(false, 1, q);
+        if (q[0] != 22 || q[1] != 0 || q[3] != 2 || q[4] != 2 || q[5] != 0 || q[6] != 4) return 99618;
+        TlDisc(false, 0, q);
+        if (q[0] != 0 || q[1] != 0 || q[3] != 2 || q[4] != 0 || q[5] != 1 || q[6] != 3) return 99619;
+        TlDisc(false, 1, q);
+        if (q[0] != 0 || q[1] != 0 || q[3] != 2 || q[4] != 1 || q[5] != 0 || q[6] != 3) return 99620;
+        TlDiscCxx(false, 0, q);
+        if (q[0] != 21 || q[1] != 22 || q[3] != 4 || q[4] != 1 || q[5] != 0 || q[6] != 5) return 99621;
+        TlDiscCxx(false, 1, q);
+        if (q[0] != 21 || q[1] != -1 || q[3] != 4 || q[4] != 0 || q[5] != 1 || q[6] != 5) return 99622;
+        TlDiscCxx(false, 2, q);
+        if (q[0] != 21 || q[1] != 22 || q[3] != 4 || q[4] != 1 || q[5] != 0 || q[6] != 5) return 99623;
+        TlDiscCxx(false, 3, q);
+        if (q[0] != 21 || q[1] != 22 || q[3] != 4 || q[4] != 1 || q[5] != 0 || q[6] != 5) return 99624;
+        TlDiscCxx(false, 4, q);
+        if (q[0] != 21 || q[1] != 22 || q[3] != 4 || q[4] != 1 || q[5] != 0 || q[6] != 5) return 99625;
+        // TERNLEFT r2: a const lvalue arm makes the mixed join const: discarded and declared joins copy.
+        TlConstJoin(true, 0, q288);
+        if (q288[0] != 0 || q288[1] != 21 || q288[2] != 1 || q288[3] != 0 || q288[4] != 3 || q288[5] != 0 || q288[6] != 0 || q288[7] != 0) return 99626;
+        TlConstJoin(true, 1, q288);
+        if (q288[0] != 0 || q288[1] != 21 || q288[2] != 1 || q288[3] != 0 || q288[4] != 3 || q288[5] != 0 || q288[6] != 0 || q288[7] != 0) return 99627;
+        TlConstJoin(true, 2, q288);
+        if (q288[0] != 21 || q288[1] != 21 || q288[2] != 1 || q288[3] != 0 || q288[4] != 3 || q288[5] != 0 || q288[6] != 0 || q288[7] != 0) return 99628;
+        TlConstJoin(true, 3, q288);
+        if (q288[0] != 22 || q288[1] != 21 || q288[2] != 1 || q288[3] != 0 || q288[4] != 3 || q288[5] != 0 || q288[6] != 0 || q288[7] != 0) return 99629;
+        TlConstJoin(true, 4, q288);
+        if (q288[0] != 0 || q288[1] != 0 || q288[2] != 0 || q288[3] != 0 || q288[4] != 0 || q288[5] != 1 || q288[6] != 0 || q288[7] != 3) return 99630;
+        TlConstJoin(true, 5, q288);
+        if (q288[0] != 0 || q288[1] != 0 || q288[2] != 0 || q288[3] != 0 || q288[4] != 0 || q288[5] != 1 || q288[6] != 0 || q288[7] != 3) return 99631;
+        TlConstJoin(true, 6, q288);
+        if (q288[0] != 21 || q288[1] != 0 || q288[2] != 0 || q288[3] != 0 || q288[4] != 0 || q288[5] != 1 || q288[6] != 0 || q288[7] != 3) return 99632;
+        TlConstJoin(true, 7, q288);
+        if (q288[0] != 22 || q288[1] != 0 || q288[2] != 0 || q288[3] != 0 || q288[4] != 0 || q288[5] != 1 || q288[6] != 0 || q288[7] != 3) return 99633;
+        TlConstJoin(false, 0, q288);
+        if (q288[0] != 0 || q288[1] != 21 || q288[2] != 1 || q288[3] != 0 || q288[4] != 3 || q288[5] != 0 || q288[6] != 0 || q288[7] != 0) return 99634;
+        TlConstJoin(false, 1, q288);
+        if (q288[0] != 0 || q288[1] != 21 || q288[2] != 1 || q288[3] != 0 || q288[4] != 3 || q288[5] != 0 || q288[6] != 0 || q288[7] != 0) return 99635;
+        TlConstJoin(false, 2, q288);
+        if (q288[0] != 22 || q288[1] != 21 || q288[2] != 1 || q288[3] != 0 || q288[4] != 3 || q288[5] != 0 || q288[6] != 0 || q288[7] != 0) return 99636;
+        TlConstJoin(false, 3, q288);
+        if (q288[0] != 21 || q288[1] != 21 || q288[2] != 1 || q288[3] != 0 || q288[4] != 3 || q288[5] != 0 || q288[6] != 0 || q288[7] != 0) return 99637;
+        TlConstJoin(false, 4, q288);
+        if (q288[0] != 0 || q288[1] != 0 || q288[2] != 0 || q288[3] != 0 || q288[4] != 0 || q288[5] != 1 || q288[6] != 0 || q288[7] != 3) return 99638;
+        TlConstJoin(false, 5, q288);
+        if (q288[0] != 0 || q288[1] != 0 || q288[2] != 0 || q288[3] != 0 || q288[4] != 0 || q288[5] != 1 || q288[6] != 0 || q288[7] != 3) return 99639;
+        TlConstJoin(false, 6, q288);
+        if (q288[0] != 22 || q288[1] != 0 || q288[2] != 0 || q288[3] != 0 || q288[4] != 0 || q288[5] != 1 || q288[6] != 0 || q288[7] != 3) return 99640;
+        TlConstJoin(false, 7, q288);
+        if (q288[0] != 21 || q288[1] != 0 || q288[2] != 0 || q288[3] != 0 || q288[4] != 0 || q288[5] != 1 || q288[6] != 0 || q288[7] != 3) return 99641;
+        // TERNLEFT r3: a parenthesized or dereferenced const arm is a const leaf too.
+        TlConstJoin(true, 8, q288);
+        if (q288[0] != 0 || q288[1] != 21 || q288[2] != 1 || q288[3] != 0 || q288[4] != 3 || q288[5] != 0 || q288[6] != 0 || q288[7] != 0) return 99642;
+        TlConstJoin(true, 9, q288);
+        if (q288[0] != 21 || q288[1] != 21 || q288[2] != 1 || q288[3] != 0 || q288[4] != 3 || q288[5] != 0 || q288[6] != 0 || q288[7] != 0) return 99643;
+        TlConstJoin(true, 10, q288);
+        if (q288[0] != 0 || q288[1] != 0 || q288[2] != 0 || q288[3] != 0 || q288[4] != 0 || q288[5] != 1 || q288[6] != 0 || q288[7] != 3) return 99644;
+        TlConstJoin(true, 11, q288);
+        if (q288[0] != 22 || q288[1] != 0 || q288[2] != 0 || q288[3] != 0 || q288[4] != 0 || q288[5] != 1 || q288[6] != 0 || q288[7] != 3) return 99645;
+        TlConstJoin(true, 12, q288);
+        if (q288[0] != 0 || q288[1] != 21 || q288[2] != 1 || q288[3] != 0 || q288[4] != 3 || q288[5] != 0 || q288[6] != 0 || q288[7] != 0) return 99646;
+        TlConstJoin(true, 13, q288);
+        if (q288[0] != 22 || q288[1] != 21 || q288[2] != 1 || q288[3] != 0 || q288[4] != 3 || q288[5] != 0 || q288[6] != 0 || q288[7] != 0) return 99647;
+        TlConstJoin(false, 8, q288);
+        if (q288[0] != 0 || q288[1] != 21 || q288[2] != 1 || q288[3] != 0 || q288[4] != 3 || q288[5] != 0 || q288[6] != 0 || q288[7] != 0) return 99648;
+        TlConstJoin(false, 9, q288);
+        if (q288[0] != 22 || q288[1] != 21 || q288[2] != 1 || q288[3] != 0 || q288[4] != 3 || q288[5] != 0 || q288[6] != 0 || q288[7] != 0) return 99649;
+        TlConstJoin(false, 10, q288);
+        if (q288[0] != 0 || q288[1] != 0 || q288[2] != 0 || q288[3] != 0 || q288[4] != 0 || q288[5] != 1 || q288[6] != 0 || q288[7] != 3) return 99650;
+        TlConstJoin(false, 11, q288);
+        if (q288[0] != 21 || q288[1] != 0 || q288[2] != 0 || q288[3] != 0 || q288[4] != 0 || q288[5] != 1 || q288[6] != 0 || q288[7] != 3) return 99651;
+        TlConstJoin(false, 13, q288);
+        if (q288[0] != 21 || q288[1] != 21 || q288[2] != 1 || q288[3] != 0 || q288[4] != 3 || q288[5] != 0 || q288[6] != 0 || q288[7] != 0) return 99652;
+        // TERNREST: nested discarded joins materialize the selected leaf, nested all-move
+        // assignments name the selected source, unmoved place arms copy, a [cpp] struct move arm
+        // moves, `_ = move <C++ place>` move-constructs a temp (clang++ -std=c++20, TrLu as declared).
+        int[8] tr = { 0, 0, 0, 0, 0, 0, 0, 0 };
+        TrNestDisc(true, 0, tr);
+        if (tr[0] != -1 || tr[1] != 22 || tr[2] != 23 || tr[3] != 0 || tr[4] != 0 || tr[5] != 1 || tr[6] != 4 || tr[7] != 0) return 99653;
+        TrNestDisc(true, 1, tr);
+        if (tr[0] != 21 || tr[1] != 22 || tr[2] != 23 || tr[3] != 0 || tr[4] != 1 || tr[5] != 0 || tr[6] != 4 || tr[7] != 0) return 99654;
+        TrNestDisc(true, 2, tr);
+        if (tr[0] != 21 || tr[1] != 22 || tr[2] != 23 || tr[3] != 0 || tr[4] != 1 || tr[5] != 0 || tr[6] != 4 || tr[7] != 0) return 99655;
+        TrNestDisc(true, 3, tr);
+        if (tr[0] != -1 || tr[1] != 22 || tr[2] != 23 || tr[3] != 0 || tr[4] != 0 || tr[5] != 1 || tr[6] != 4 || tr[7] != 0) return 99656;
+        TrNestAsg(true, 0, tr);
+        if (tr[0] != 21 || tr[1] != 0 || tr[2] != 0 || tr[3] != 0 || tr[4] != 0 || tr[5] != 0 || tr[6] != 4 || tr[7] != 0) return 99657;
+        TrNestAsg(true, 1, tr);
+        if (tr[0] != 22 || tr[1] != 0 || tr[2] != 0 || tr[3] != 0 || tr[4] != 0 || tr[5] != 0 || tr[6] != 4 || tr[7] != 0) return 99658;
+        TrNestAsg(true, 2, tr);
+        if (tr[0] != 21 || tr[1] != 0 || tr[2] != 0 || tr[3] != 0 || tr[4] != 0 || tr[5] != 0 || tr[6] != 4 || tr[7] != 0) return 99659;
+        TrNestAsg(true, 3, tr);
+        if (tr[0] != 0 || tr[1] != 0 || tr[2] != 0 || tr[3] != 0 || tr[4] != 0 || tr[5] != 0 || tr[6] != 4 || tr[7] != 0) return 99660;
+        TrLvalDisc(true, 0, tr);
+        if (tr[0] != -1 || tr[1] != 22 || tr[2] != 0 || tr[3] != 0 || tr[4] != 0 || tr[5] != 1 || tr[6] != 1 || tr[7] != 0) return 99661;
+        TrLvalDisc(true, 1, tr);
+        if (tr[0] != 21 || tr[1] != 22 || tr[2] != 0 || tr[3] != 0 || tr[4] != 1 || tr[5] != 0 || tr[6] != 1 || tr[7] != 0) return 99662;
+        TrLvalDisc(true, 2, tr);
+        if (tr[0] != -1 || tr[1] != 22 || tr[2] != 0 || tr[3] != 0 || tr[4] != 0 || tr[5] != 1 || tr[6] != 1 || tr[7] != 0) return 99663;
+        TrLvalDisc(true, 3, tr);
+        if (tr[0] != -1 || tr[1] != 22 || tr[2] != 0 || tr[3] != 0 || tr[4] != 0 || tr[5] != 1 || tr[6] != 1 || tr[7] != 0) return 99664;
+        TrLvalDisc(true, 4, tr);
+        if (tr[0] != 21 || tr[1] != 22 || tr[2] != -1 || tr[3] != 1 || tr[4] != 0 || tr[5] != 1 || tr[6] != 2 || tr[7] != 0) return 99665;
+        TrLvalDisc(true, 5, tr);
+        if (tr[0] != -1 || tr[1] != 0 || tr[2] != 0 || tr[3] != 0 || tr[4] != 0 || tr[5] != 1 || tr[6] != 1 || tr[7] != 0) return 99666;
+        TrLvalDisc(true, 6, tr);
+        if (tr[0] != 0 || tr[1] != 22 || tr[2] != 0 || tr[3] != 0 || tr[4] != 0 || tr[5] != 1 || tr[6] != 7 || tr[7] != 0) return 99667;
+        TrLvalDisc(true, 7, tr);
+        if (tr[0] != 0 || tr[1] != 22 || tr[2] != 0 || tr[3] != 0 || tr[4] != 0 || tr[5] != 1 || tr[6] != 7 || tr[7] != 0) return 99668;
+        TrLvalDisc(true, 8, tr);
+        if (tr[0] != 0 || tr[1] != 22 || tr[2] != 0 || tr[3] != 0 || tr[4] != 0 || tr[5] != 1 || tr[6] != 7 || tr[7] != 0) return 99669;
+        TrLvalDisc(true, 9, tr);
+        if (tr[0] != 0 || tr[1] != 22 || tr[2] != 0 || tr[3] != 1 || tr[4] != 0 || tr[5] != 1 || tr[6] != 8 || tr[7] != 0) return 99670;
+        TrCppLu(true, 0, tr);
+        if (tr[0] != 7 || tr[1] != 0 || tr[2] != 0 || tr[3] != 0 || tr[4] != 0 || tr[5] != 1 || tr[6] != 2 || tr[7] != 2) return 99671;
+        TrCppLu(true, 1, tr);
+        if (tr[0] != 7 || tr[1] != 0 || tr[2] != 0 || tr[3] != 0 || tr[4] != 0 || tr[5] != 1 || tr[6] != 2 || tr[7] != 2) return 99672;
+        TrCppLu(true, 2, tr);
+        if (tr[0] != 5 || tr[1] != 0 || tr[2] != 0 || tr[3] != 1 || tr[4] != 0 || tr[5] != 0 || tr[6] != 2 || tr[7] != 2) return 99673;
+        TrCppLu(true, 3, tr);
+        if (tr[0] != 0 || tr[1] != 0 || tr[2] != 0 || tr[3] != 0 || tr[4] != 0 || tr[5] != 1 || tr[6] != 2 || tr[7] != 2) return 99674;
+        TrCppLu(true, 4, tr);
+        if (tr[0] != 0 || tr[1] != 0 || tr[2] != 0 || tr[3] != 1 || tr[4] != 0 || tr[5] != 0 || tr[6] != 2 || tr[7] != 2) return 99675;
+        TrNestDisc(false, 0, tr);
+        if (tr[0] != 21 || tr[1] != 22 || tr[2] != -1 || tr[3] != 0 || tr[4] != 0 || tr[5] != 1 || tr[6] != 4 || tr[7] != 0) return 99676;
+        TrNestDisc(false, 1, tr);
+        if (tr[0] != -1 || tr[1] != 22 || tr[2] != 23 || tr[3] != 0 || tr[4] != 0 || tr[5] != 1 || tr[6] != 4 || tr[7] != 0) return 99677;
+        TrNestDisc(false, 2, tr);
+        if (tr[0] != 21 || tr[1] != 22 || tr[2] != -1 || tr[3] != 0 || tr[4] != 0 || tr[5] != 1 || tr[6] != 4 || tr[7] != 0) return 99678;
+        TrNestDisc(false, 3, tr);
+        if (tr[0] != 21 || tr[1] != 22 || tr[2] != 23 || tr[3] != 0 || tr[4] != 1 || tr[5] != 0 || tr[6] != 4 || tr[7] != 0) return 99679;
+        TrNestAsg(false, 0, tr);
+        if (tr[0] != 23 || tr[1] != 0 || tr[2] != 0 || tr[3] != 0 || tr[4] != 0 || tr[5] != 0 || tr[6] != 4 || tr[7] != 0) return 99680;
+        TrNestAsg(false, 1, tr);
+        if (tr[0] != 21 || tr[1] != 0 || tr[2] != 0 || tr[3] != 0 || tr[4] != 0 || tr[5] != 0 || tr[6] != 4 || tr[7] != 0) return 99681;
+        TrNestAsg(false, 2, tr);
+        if (tr[0] != 22 || tr[1] != 0 || tr[2] != 0 || tr[3] != 0 || tr[4] != 0 || tr[5] != 0 || tr[6] != 4 || tr[7] != 0) return 99682;
+        TrNestAsg(false, 3, tr);
+        if (tr[0] != 0 || tr[1] != 0 || tr[2] != 0 || tr[3] != 0 || tr[4] != 0 || tr[5] != 0 || tr[6] != 4 || tr[7] != 0) return 99683;
+        TrLvalDisc(false, 0, tr);
+        if (tr[0] != 21 || tr[1] != 22 || tr[2] != 0 || tr[3] != 0 || tr[4] != 1 || tr[5] != 0 || tr[6] != 1 || tr[7] != 0) return 99684;
+        TrLvalDisc(false, 1, tr);
+        if (tr[0] != -1 || tr[1] != 22 || tr[2] != 0 || tr[3] != 0 || tr[4] != 0 || tr[5] != 1 || tr[6] != 1 || tr[7] != 0) return 99685;
+        TrLvalDisc(false, 2, tr);
+        if (tr[0] != 21 || tr[1] != 22 || tr[2] != 0 || tr[3] != 0 || tr[4] != 1 || tr[5] != 0 || tr[6] != 1 || tr[7] != 0) return 99686;
+        TrLvalDisc(false, 3, tr);
+        if (tr[0] != 21 || tr[1] != 22 || tr[2] != 0 || tr[3] != 0 || tr[4] != 1 || tr[5] != 0 || tr[6] != 1 || tr[7] != 0) return 99687;
+        TrLvalDisc(false, 4, tr);
+        if (tr[0] != 21 || tr[1] != 22 || tr[2] != 21 || tr[3] != 1 || tr[4] != 1 || tr[5] != 0 || tr[6] != 2 || tr[7] != 0) return 99688;
+        TrLvalDisc(false, 5, tr);
+        if (tr[0] != 21 || tr[1] != 0 || tr[2] != 0 || tr[3] != 1 || tr[4] != 0 || tr[5] != 0 || tr[6] != 1 || tr[7] != 0) return 99689;
+        TrLvalDisc(false, 6, tr);
+        if (tr[0] != 0 || tr[1] != 22 || tr[2] != 0 || tr[3] != 0 || tr[4] != 1 || tr[5] != 0 || tr[6] != 7 || tr[7] != 0) return 99690;
+        TrLvalDisc(false, 7, tr);
+        if (tr[0] != 0 || tr[1] != 22 || tr[2] != 0 || tr[3] != 0 || tr[4] != 1 || tr[5] != 0 || tr[6] != 7 || tr[7] != 0) return 99691;
+        TrLvalDisc(false, 8, tr);
+        if (tr[0] != 0 || tr[1] != 22 || tr[2] != 0 || tr[3] != 0 || tr[4] != 1 || tr[5] != 0 || tr[6] != 7 || tr[7] != 0) return 99692;
+        TrLvalDisc(false, 9, tr);
+        if (tr[0] != 0 || tr[1] != 22 || tr[2] != 0 || tr[3] != 1 || tr[4] != 1 || tr[5] != 0 || tr[6] != 8 || tr[7] != 0) return 99693;
+        TrCppLu(false, 0, tr);
+        if (tr[0] != 5 || tr[1] != 0 || tr[2] != 0 || tr[3] != 1 || tr[4] != 0 || tr[5] != 0 || tr[6] != 2 || tr[7] != 2) return 99694;
+        TrCppLu(false, 1, tr);
+        if (tr[0] != 5 || tr[1] != 0 || tr[2] != 0 || tr[3] != 1 || tr[4] != 0 || tr[5] != 0 || tr[6] != 2 || tr[7] != 2) return 99695;
+        TrCppLu(false, 2, tr);
+        if (tr[0] != 7 || tr[1] != 0 || tr[2] != 0 || tr[3] != 0 || tr[4] != 0 || tr[5] != 1 || tr[6] != 2 || tr[7] != 2) return 99696;
+        TrCppLu(false, 3, tr);
+        if (tr[0] != 0 || tr[1] != 0 || tr[2] != 0 || tr[3] != 1 || tr[4] != 0 || tr[5] != 0 || tr[6] != 2 || tr[7] != 2) return 99697;
+        TrCppLu(false, 4, tr);
+        if (tr[0] != 0 || tr[1] != 0 || tr[2] != 0 || tr[3] != 0 || tr[4] != 0 || tr[5] != 1 || tr[6] != 2 || tr[7] != 2) return 99698;
+        TrFieldDiscard(0, tr);
+        if (tr[0] != -1 || tr[1] != 0 || tr[2] != 0 || tr[3] != 1 || tr[4] != 1 || tr[5] != 4 || tr[6] != 0 || tr[7] != 0) return 99699;
+        TrFieldDiscard(1, tr);
+        if (tr[0] != -1 || tr[1] != 0 || tr[2] != 0 || tr[3] != 1 || tr[4] != 1 || tr[5] != 4 || tr[6] != 0 || tr[7] != 0) return 99700;
+        TrFieldDiscard(2, tr);
+        if (tr[0] != -1 || tr[1] != 0 || tr[2] != 0 || tr[3] != 0 || tr[4] != 0 || tr[5] != 1 || tr[6] != 2 || tr[7] != 0) return 99701;
+        TrFieldDiscard(3, tr);
+        if (tr[0] != -1 || tr[1] != 0 || tr[2] != 0 || tr[3] != 1 || tr[4] != 1 || tr[5] != 4 || tr[6] != 0 || tr[7] != 0) return 99702;
+        TrFieldDiscard(4, tr);
+        if (tr[0] != -1 || tr[1] != 0 || tr[2] != 0 || tr[3] != 1 || tr[4] != 1 || tr[5] != 4 || tr[6] != 0 || tr[7] != 0) return 99703;
+        TrFieldDiscard(5, tr);
+        if (tr[0] != -1 || tr[1] != 0 || tr[2] != 0 || tr[3] != 1 || tr[4] != 1 || tr[5] != 4 || tr[6] != 0 || tr[7] != 0) return 99704;
         // T288 r3: a const-host field arm is not a plain local join: copy-assign, sources kept (as clang).
         T288ConstHostField(true, q);
         if (q[0] != 21 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99015;
@@ -32331,6 +32772,228 @@ void T288DerivedBase(bool k, int* o)
     o[7] = cppbv.TernaryCnt.copyAssigns; o[8] = cppbv.TernaryCnt.moveAssigns;
 }
 struct T391Holder { cppbv.TernaryCnt f = cppbv.TernaryCnt(0); };
+// TERNLEFT helpers (legs 99600-99652): o = [v, a, b, ctors, copies, moves, dtors] read after the scope.
+// Lowered host `z = k ? move a : move b` move-assigns the selected source with no temp (clang).
+struct TlW { int x = 0; T249Host h; };
+void TlZero(int* o) { for (int i = 0; i < 7; i++) o[i] = 0; }
+void TlAsgBoth(bool k, int paren, int* o)
+{
+    TlZero(o); cppbv.CntA.reset();
+    {
+        T249Host h1; h1.c.v = 21; T249Host h2; h2.c.v = 22; T249Host z;
+        if (paren != 0) z = (k ? move h1 : move h2);
+        else z = k ? move h1 : move h2;
+        o[0] = z.c.v;
+    }
+    T249ReadCounts(o);
+}
+void TlAsgField(bool k, int* o)
+{
+    TlZero(o); cppbv.CntA.reset();
+    { T249Host h1; h1.c.v = 21; T249Host h2; h2.c.v = 22; TlW w; w.h = k ? move h1 : move h2; o[0] = w.h.c.v; }
+    T249ReadCounts(o);
+}
+void TlAsgSelf(bool k, int* o)
+{
+    TlZero(o); cppbv.CntA.reset();
+    { T249Host h1; h1.c.v = 21; T249Host h2; h2.c.v = 22; h1 = k ? move h1 : move h2; o[0] = h1.c.v; }
+    T249ReadCounts(o);
+}
+// A by-value parameter moved by a `?:` arm is re-armed: the callee still destroys it (was a leak).
+int TlParamDecl(bool k, T249Host a, T249Host b) { T249Host z = k ? move a : move b; return z.c.v; }
+int TlParamAsg(bool k, T249Host a, T249Host b) { T249Host z; z = k ? move a : move b; return z.c.v; }
+void TlParams(bool k, int asg, int* o)
+{
+    TlZero(o); cppbv.CntA.reset();
+    { T249Host h2; h2.c.v = 22; o[0] = asg != 0 ? TlParamAsg(k, h2, h2) : TlParamDecl(k, h2, h2); }
+    T249ReadCounts(o);
+}
+// A discarded mixed join is a prvalue: the selected arm is moved or copied into a temporary.
+void TlDisc(bool k, int moveFirst, int* o)
+{
+    TlZero(o); cppbv.CntA.reset();
+    {
+        T249Host h1; h1.c.v = 21; T249Host h2; h2.c.v = 22;
+        if (moveFirst != 0) k ? move h1 : h2;
+        else k ? h1 : move h2;
+    }
+    T249ReadCounts(o);
+}
+void TlDiscCxx(bool k, int shape, int* o)
+{
+    TlZero(o); cppbv.TernaryCnt.reset();
+    {
+        cppbv.TernaryCnt h1 = cppbv.TernaryCnt(21); cppbv.TernaryCnt h2 = cppbv.TernaryCnt(22);
+        T391Holder s; s.f.v = 21;
+        const cppbv.TernaryCnt c1 = cppbv.TernaryCnt(21);
+        if (shape == 0) k ? move h1 : h2;
+        else if (shape == 1) k ? h1 : move h2;
+        else if (shape == 2) (k ? move h1 : h2);
+        else if (shape == 3) k ? move s.f : h2;
+        else k ? move c1 : h2;
+        o[0] = shape == 3 ? s.f.v : shape == 4 ? c1.v : h1.v; o[1] = h2.v;
+    }
+    o[3] = cppbv.TernaryCnt.ctors; o[4] = cppbv.TernaryCnt.copies;
+    o[5] = cppbv.TernaryCnt.moves; o[6] = cppbv.TernaryCnt.dtors;
+}
+// A const lvalue arm makes the composite const: a discarded or declared mixed join copies the
+// moved arm (clang). o = [v, h1, TernaryCnt copies, moves, dtors, CntA copies, moves, dtors].
+void TlConstJoin(bool k, int shape, int* o)
+{
+    for (int i = 0; i < 9; i++) o[i] = 0;
+    cppbv.TernaryCnt.reset(); cppbv.CntA.reset();
+    if (shape < 4 || shape == 8 || shape == 9 || shape >= 12)
+    {
+        cppbv.TernaryCnt h1 = cppbv.TernaryCnt(21); const cppbv.TernaryCnt h2 = cppbv.TernaryCnt(22);
+        if (shape == 0) k ? move h1 : h2;
+        else if (shape == 1) k ? h2 : move h1;
+        else if (shape == 2) { cppbv.TernaryCnt z = k ? move h1 : h2; o[0] = z.v; }
+        else if (shape == 3) { cppbv.TernaryCnt z = k ? h2 : move h1; o[0] = z.v; }
+        else if (shape == 8) k ? move h1 : (h2);
+        else if (shape == 9) { cppbv.TernaryCnt z = k ? move h1 : ((h2)); o[0] = z.v; }
+        else if (shape == 12) { const cppbv.TernaryCnt* pc = &h2; k ? move h1 : *pc; }
+        else { const cppbv.TernaryCnt* pc = &h2; cppbv.TernaryCnt z = k ? *pc : move h1; o[0] = z.v; }
+        o[1] = h1.v;
+    }
+    else
+    {
+        T249Host h1; h1.c.v = 21; const T249Host h2 = T264Mk(22);
+        if (shape == 4) k ? move h1 : h2;
+        else if (shape == 5) k ? h2 : move h1;
+        else if (shape == 6) { T249Host z = k ? move h1 : h2; o[0] = z.c.v; }
+        else if (shape == 7) { T249Host z = k ? h2 : move h1; o[0] = z.c.v; }
+        else if (shape == 10) k ? move h1 : (h2);
+        else { T249Host z = k ? (h2) : move h1; o[0] = z.c.v; }
+    }
+    o[2] = cppbv.TernaryCnt.copies; o[3] = cppbv.TernaryCnt.moves; o[4] = cppbv.TernaryCnt.dtors;
+    o[5] = cppbv.CntA.copies; o[6] = cppbv.CntA.moves; o[7] = cppbv.CntA.dtors;
+}
+// TERNREST helpers (legs 99653-99704): o = [v0, v1, v2, ctors, copies, moves, dtors, lu], counted
+// after the setup. A discarded mixed join (any depth) moves or copies the selected leaf into one
+// temporary; an all-move join names the selected source (clang++ -std=c++20).
+void TrZero(int* o) { for (int i = 0; i < 8; i++) o[i] = 0; }
+void TrReadT(int* o)
+{
+    o[3] = cppbv.TernaryCnt.ctors; o[4] = cppbv.TernaryCnt.copies;
+    o[5] = cppbv.TernaryCnt.moves; o[6] = cppbv.TernaryCnt.dtors;
+}
+void TrNestDisc(bool k, int shape, int* o)
+{
+    TrZero(o);
+    {
+        cppbv.TernaryCnt h1 = cppbv.TernaryCnt(21); cppbv.TernaryCnt h2 = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt h3 = cppbv.TernaryCnt(23);
+        cppbv.TernaryCnt.reset();
+        if (shape == 0) k ? move h1 : (k ? h2 : move h3);
+        else if (shape == 1) k ? (k ? h2 : move h3) : move h1;
+        else if (shape == 2) k ? h1 : (k ? h2 : move h3);
+        else k ? move h1 : (k ? h2 : (k ? move h3 : h2));
+        o[0] = h1.v; o[1] = h2.v; o[2] = h3.v;
+    }
+    TrReadT(o);
+}
+void TrNestAsg(bool k, int shape, int* o)
+{
+    TrZero(o);
+    {
+        T249Host h1; h1.c.v = 21; T249Host h2; h2.c.v = 22; T249Host h3; h3.c.v = 23; T249Host z;
+        cppbv.CntA.reset();
+        if (shape == 0) z = k ? move h1 : (k ? move h2 : move h3);
+        else if (shape == 1) z = k ? (k ? move h2 : move h3) : move h1;
+        else if (shape == 2) z = k ? move h1 : (k ? move h2 : (k ? move h3 : move h2));
+        else k ? move h1 : (k ? move h2 : move h3);
+        o[0] = z.c.v;
+    }
+    T249ReadCounts(o);
+}
+struct TrThis
+{
+    cppbv.TernaryCnt f = cppbv.TernaryCnt(0);
+    int m(bool k) { cppbv.TernaryCnt h1 = cppbv.TernaryCnt(21); k ? move h1 : f; return h1.v; }
+};
+struct TrThisLow { T249Host h; void m(bool k) { T249Host h1; h1.c.v = 21; k ? move h1 : h; } };
+// An unmoved place arm that is no named variable (`*p`, `p->f`, `a[i]`, implicit-this field) is
+// copied into the temporary; a prvalue arm is not copied again.
+void TrLvalDisc(bool k, int shape, int* o)
+{
+    TrZero(o);
+    if (shape < 6)
+    {
+        cppbv.TernaryCnt h1 = cppbv.TernaryCnt(21); cppbv.TernaryCnt h2 = cppbv.TernaryCnt(22);
+        T391Holder s; s.f.v = 22; T391Holder* ps = &s;
+        cppbv.TernaryCnt[2] arr; arr[1].v = 22;
+        TrThis th; th.f.v = 22;
+        cppbv.TernaryCnt* pc = &h2;
+        cppbv.TernaryCnt.reset();
+        if (shape == 0) { k ? move h1 : *pc; o[1] = h2.v; }
+        else if (shape == 1) { k ? *pc : move h1; o[1] = h2.v; }
+        else if (shape == 2) { k ? move h1 : ps->f; o[1] = s.f.v; }
+        else if (shape == 3) { k ? move h1 : arr[1]; o[1] = arr[1].v; }
+        else if (shape == 4) { o[2] = th.m(k); o[1] = th.f.v; }
+        else k ? move h1 : cppbv.TernaryCnt(5);
+        o[0] = h1.v;
+        TrReadT(o);
+        return;
+    }
+    {
+        T249Host h1; h1.c.v = 21; T249Host h2; h2.c.v = 22; T249Host* pc = &h2;
+        TlW w; w.h.c.v = 22; TlW* pw = &w;
+        T249Host[2] arr; arr[1].c.v = 22;
+        TrThisLow th; th.h.c.v = 22;
+        cppbv.CntA.reset();
+        if (shape == 6) { k ? move h1 : *pc; o[1] = h2.c.v; }
+        else if (shape == 7) { k ? move h1 : pw->h; o[1] = w.h.c.v; }
+        else if (shape == 8) { k ? move h1 : arr[1]; o[1] = arr[1].c.v; }
+        else { th.m(k); o[1] = th.h.c.v; }
+    }
+    T249ReadCounts(o);
+}
+int tr_lu_d = 0;
+[cpp] struct TrLu { int x = 0; cppbv.CntA item; TrLu(int v) { x = v; } ~TrLu() { tr_lu_d++; } };
+// A [cpp] struct with a user dtor: its `move` arm moves (the shadow class has a move ctor and no
+// copy), a constructed arm builds in place; a discarded mixed join moves into a temporary.
+void TrCppLu(bool k, int shape, int* o)
+{
+    TrZero(o);
+    {
+        TrLu a = TrLu(7);
+        cppbv.CntA.reset(); tr_lu_d = 0;
+        if (shape == 0) { auto r = k ? move a : TrLu(5); o[0] = r.x; }
+        else if (shape == 1) { TrLu r = k ? move a : TrLu(5); o[0] = r.x; }
+        else if (shape == 2) { auto r = k ? TrLu(5) : move a; o[0] = r.x; }
+        else if (shape == 3) k ? move a : TrLu(5);
+        else k ? TrLu(5) : move a;
+    }
+    T249ReadCounts(o);
+    o[7] = tr_lu_d;
+}
+// `_ = move <C++ class place>` move-constructs a temporary and destroys it: clang's
+// `{ T t = std::move(p->f); }`. The source stays a valid moved-from object (v = -1).
+struct TrW2 { int x = 0; T391Holder s; };
+void TrFieldDiscard(int shape, int* o)
+{
+    TrZero(o);
+    if (shape == 2)
+    {
+        { T249Host s; s.c.v = 31; T249Host* p = &s; cppbv.CntA.reset(); _ = move p->c; o[0] = s.c.v; }
+        T249ReadCounts(o);
+        return;
+    }
+    {
+        T391Holder s; s.f.v = 31; T391Holder* p = &s;
+        cppbv.TernaryCnt h = cppbv.TernaryCnt(31); cppbv.TernaryCnt* ph = &h;
+        TrW2 w; w.s.f.v = 31; TrW2* pw = &w;
+        cppbv.TernaryCnt.reset();
+        if (shape == 0) { _ = move p->f; o[0] = s.f.v; }
+        else if (shape == 1) { _ = move s.f; o[0] = s.f.v; }
+        else if (shape == 3) { _ = move *ph; o[0] = h.v; }
+        else if (shape == 4) { _ = (move s.f); o[0] = s.f.v; }
+        else { _ = move pw->s.f; o[0] = w.s.f.v; }
+        o[1] = cppbv.TernaryCnt.ctors; o[2] = cppbv.TernaryCnt.copies;
+        o[3] = cppbv.TernaryCnt.moves; o[4] = cppbv.TernaryCnt.dtors;
+    }
+    o[5] = cppbv.TernaryCnt.dtors;
+}
 void T391FieldOneAsg(bool k, int* o)
 {
     cppbv.TernaryCnt.reset();

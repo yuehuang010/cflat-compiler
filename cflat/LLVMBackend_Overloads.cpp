@@ -11633,6 +11633,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         }
         ApplyMoveParamTransfer(functionName, *transferParams, slotWrapper ? slotBefore : matched,
                                true, candidate.IsMethod, true, candidate.IsCxx);
+        if (!candidate.IsCxx)
+            NullAliasedUniqueByValueArgs(*transferParams, matched, argList);
         std::vector<llvm::Value*> sinkConsumedTemps = std::move(moveTransferConsumedTemps_);
         moveTransferConsumedTemps_.clear();
 
@@ -11961,8 +11963,11 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             }
             if (cxxClassReturn)
             {
+                // A CFlat callee builds its result in the caller's slot like clang. A lambda naming
+                // a same-type by-value param borrows it (no capture copy): the result copy stays.
                 bool hasUnforwardedSameTypeCxxByValueArg = false;
                 if (!candidate.IsCxx && !pendingCxxSretReturn_
+                    && candidate.LambdaNamesReturnTypeParam
                     && !candidate.ReturnsDirectByValueParam && !candidate.ReturnsMovedByValueParam)
                     for (size_t i = 0; i < candidate.Parameters.size()
                         && i < matched.size(); ++i)
@@ -14548,21 +14553,77 @@ void LLVMBackend::SetPointsToBorrowedByValueParam(const std::string& name, bool 
         }
     }
 
-void LLVMBackend::SetPointsToBorrowedAddress(const std::string& name, bool value)
+LLVMBackend::NamedVariable* LLVMBackend::FindInnermostNamedVariable(const std::string& name)
 {
-        if (name.empty()) return;
+        if (name.empty()) return nullptr;
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
-            NamedVariable* nv = nullptr;
             if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
-                nv = &it->second;
-            else if (auto it2 = frame.functionArgument.find(name); it2 != frame.functionArgument.end())
-                nv = &it2->second;
-            if (nv == nullptr) continue;
-            nv->PointsToBorrowedAddress = value;
-            return;
+                return &it->second;
+            if (auto it2 = frame.functionArgument.find(name); it2 != frame.functionArgument.end())
+                return &it2->second;
+        }
+        return nullptr;
     }
-}
+
+void LLVMBackend::SetPointsToBorrowedAddress(const std::string& name, bool value, bool mayValue)
+{
+        NamedVariable* nv = FindInnermostNamedVariable(name);
+        if (nv == nullptr) return;
+        nv->PointsToBorrowedAddress = value;
+        nv->MayPointToBorrowedAddress = value || mayValue;
+        nv->BorrowedAddressFields.clear();
+    }
+
+void LLVMBackend::SetFieldBorrowedAddress(const std::string& name, const std::string& path, bool value)
+{
+        NamedVariable* nv = FindInnermostNamedVariable(name);
+        if (nv == nullptr) return;
+        if (path.empty())
+        {
+            nv->BorrowedAddressFields.clear();
+            return;
+        }
+        // A store to `a` retires the facts below it (`a.p`, `a[0]`) along with `a` itself.
+        std::erase_if(nv->BorrowedAddressFields, [&](const std::string& known) {
+            return known == path || (known.size() > path.size()
+                && known.compare(0, path.size(), path) == 0
+                && (known[path.size()] == '.' || known[path.size()] == '['));
+        });
+        if (value && !nv->FieldFactsEscaped) nv->BorrowedAddressFields.insert(path);
+    }
+
+void LLVMBackend::MarkFieldFactsEscaped(const std::string& name)
+{
+        NamedVariable* nv = FindInnermostNamedVariable(name);
+        if (nv == nullptr) return;
+        nv->FieldFactsEscaped = true;
+        nv->BorrowedAddressFields.clear();
+    }
+
+void LLVMBackend::CopyFieldBorrowedAddresses(const std::string& destination, const std::string& source)
+{
+        NamedVariable* dst = FindInnermostNamedVariable(destination);
+        if (dst == nullptr) return;
+        const NamedVariable* src = FindInnermostNamedVariable(source);
+        if (src == nullptr || src == dst || dst->FieldFactsEscaped)
+        {
+            if (src != dst) dst->BorrowedAddressFields.clear();
+            return;
+        }
+        dst->BorrowedAddressFields = src->BorrowedAddressFields;
+    }
+
+void LLVMBackend::CopyFieldBorrowedAddressesUnder(const std::string& destination,
+        const std::string& prefix, const std::string& source)
+{
+        if (prefix.empty()) return;
+        NamedVariable* dst = FindInnermostNamedVariable(destination);
+        const NamedVariable* src = FindInnermostNamedVariable(source);
+        if (dst == nullptr || src == nullptr || src == dst || dst->FieldFactsEscaped) return;
+        for (const std::string& path : src->BorrowedAddressFields)
+            dst->BorrowedAddressFields.insert(prefix + (path.front() == '[' ? "" : ".") + path);
+    }
 
 void LLVMBackend::SetStackCharBufferBorrow(const std::string& name, bool value,
                                            const std::string& source, size_t scopeDepth)
@@ -14732,13 +14793,22 @@ void LLVMBackend::MarkVariableNotExplicitlyMovedNull(const std::string& name)
 void LLVMBackend::MarkStorageNotExplicitlyMovedNull(llvm::Value* storage)
 {
         if (storage == nullptr) return;
+        // By-value parameters too: a `?:` arm `move a` of a parameter re-arms it like a local.
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
             for (auto& entry : frame.namedVariable)
                 if (entry.second.Storage == storage)
                 {
                     MarkVariableNotExplicitlyMovedNull(entry.first);
                     return;
                 }
+            for (auto& entry : frame.functionArgument)
+                if (entry.second.Storage == storage)
+                {
+                    MarkVariableNotExplicitlyMovedNull(entry.first);
+                    return;
+                }
+        }
     }
 
 void LLVMBackend::MarkVariableAddressEscaped(const std::string& name)
@@ -14810,28 +14880,76 @@ std::string LLVMBackend::MovedDerefDiagnostic(const NamedVariable& nv) const
 
 std::string LLVMBackend::UniqueFieldNullKey(const NamedVariable& nv) const
 {
-        if (nv.FieldName.empty() || nv.FieldPathText.empty() || nv.IsElementAccess
-            || nv.FieldPathThroughPointer || nv.FieldPathRoot.empty())
-            return "";
         if (!(nv.TypeAndValue.IsUnique || IsCoreUniqueType(nv.TypeAndValue.TypeName))) return "";
-        // Only a path rooted IN a struct value local: a pointer ("ps->p"), alias, parameter or global
-        // root may be rewritten through another name - left unchecked.
-        // The null-state analysis keys by name: a root shadowing an outer same-named local is unchecked.
-        const NamedVariable* root = nullptr;
-        for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        // A bare receiver field (`p` in a method) is `this->p`: indirect, keyed "this.p".
+        if (nv.FieldName.empty() && nv.RootIsBorrowedThisField && !nv.ThisFieldPath.empty()
+            && nv.CallerName.empty() && nv.FieldPathText.empty() && !nv.IsElementAccess)
         {
-            if (auto it = frame.namedVariable.find(nv.FieldPathRoot); it != frame.namedVariable.end())
-            {
-                if (root != nullptr) return "";
-                root = &it->second;
-                continue;
-            }
-            if (frame.functionArgument.count(nv.FieldPathRoot)) return "";
+            const NamedVariable* receiver = nullptr;
+            for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
+                if (auto it = frame.functionArgument.find("this"); it != frame.functionArgument.end())
+                {
+                    receiver = &it->second;
+                    break;
+                }
+            if (receiver == nullptr) return "";
+            std::string key = "this." + nv.ThisFieldPath;
+            indirectNullRoots_[key] = receiver->Storage;
+            return key;
         }
-        if (root == nullptr || root->TypeAndValue.Pointer || root->IsAliasBorrow
-            || root->TypeAndValue.IsAlias || root->IsStaticLocal)
+        if (nv.FieldName.empty() || nv.FieldPathText.empty() || nv.FieldPathRoot.empty()) return "";
+        // The null-state analysis keys by name: a root shadowing an outer same-named binding is unchecked.
+        const NamedVariable* root = nullptr;
+        bool rootIsParameter = false;
+        auto findRoot = [&](const std::string& name) {
+            for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
+            {
+                auto it = frame.namedVariable.find(name);
+                auto arg = frame.functionArgument.find(name);
+                if (it == frame.namedVariable.end() && arg == frame.functionArgument.end()) continue;
+                if (root != nullptr) return false;
+                rootIsParameter = it == frame.namedVariable.end();
+                root = rootIsParameter ? &arg->second : &it->second;
+            }
+            return true;
+        };
+        if (!findRoot(nv.FieldPathRoot)) return "";
+        // `this->p` is rooted at "this" but spelled through the receiver parameter ("T__.p").
+        if (root == nullptr && !nv.FieldPathText.starts_with(nv.FieldPathRoot + "."))
+            if (size_t dot = nv.FieldPathText.find('.'); dot != std::string::npos)
+                if (!findRoot(nv.FieldPathText.substr(0, dot)) || (root != nullptr && !rootIsParameter))
+                    return "";
+        const llvm::Value* globalStorage = nullptr;
+        if (root == nullptr)
+            if (auto g = globalNamedVariable.find(nv.FieldPathRoot); g != globalNamedVariable.end())
+                globalStorage = g->second;
+        if (root == nullptr && globalStorage == nullptr) return "";
+        const bool global = root == nullptr;
+        std::string key;
+        if (nv.IsElementAccess)
+        {
+            // A constant-index element path ("a[0].p"); a dynamic index is unchecked.
+            if (nv.MovePathHasDynamicIndex || nv.MovePathKey.empty() || nv.CallerName != nv.FieldPathRoot)
+                return "";
+            key = nv.FieldPathRoot + (nv.MovePathKey.front() == '[' ? "" : ".") + nv.MovePathKey;
+        }
+        else if (nv.FieldPathText.starts_with(nv.FieldPathRoot + "."))
+            key = nv.FieldPathText;
+        else if (size_t dot = nv.FieldPathText.find('.'); dot != std::string::npos)
+            key = nv.FieldPathRoot + nv.FieldPathText.substr(dot);
+        else
             return "";
-        return nv.FieldPathText;
+        // A path rooted IN a struct value local is exact; any other root (pointer, parameter,
+        // `this`, alias, static local, global, element) is indirect - see nulldf::InterleaveIndirectClobbers.
+        if (!rootIsParameter && !global && !root->TypeAndValue.Pointer && !root->IsStaticLocal
+            && !root->IsAliasBorrow && !root->TypeAndValue.IsAlias
+            && !nv.IsElementAccess && !nv.FieldPathThroughPointer)
+        {
+            indirectNullRoots_.erase(key);
+            return key;
+        }
+        indirectNullRoots_[key] = global ? globalStorage : root->Storage;
+        return key;
     }
 
 void LLVMBackend::RecordNullDerefFor(const NamedVariable& nv, int line, int col)
@@ -14843,10 +14961,10 @@ void LLVMBackend::RecordNullDerefFor(const NamedVariable& nv, int line, int col)
             return;
         }
         // A consumed `unique` field is null like a moved local, keyed by its full path ("o.b.p").
-        if (!nv.FieldName.empty())
+        if (!nv.FieldName.empty() || nv.RootIsBorrowedThisField)
         {
             if (std::string key = UniqueFieldNullKey(nv); !key.empty()) RecordNullDeref(key, line, col);
-            return;
+            if (!nv.FieldName.empty()) return;
         }
         if (nv.CallerName.empty() || nv.AddressEscaped) return;
         if (!(nv.ExplicitlyMovedNull || nv.PointeeMove || nv.IsOwning

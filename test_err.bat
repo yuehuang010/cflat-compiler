@@ -143,6 +143,7 @@ set "POLICY_FILE=%~1"
 set "POLICY_FLAGS="
 set "POLICY_EXPECT_EXIT="
 set "POLICY_EXPECT_OUTPUT="
+set "POLICY_LINK="
 for /f "usebackq tokens=1* delims==" %%A in ("!POLICY_FILE!.flags") do (
     if /I "%%A"=="flags" (
         if defined POLICY_FLAGS (
@@ -154,6 +155,8 @@ for /f "usebackq tokens=1* delims==" %%A in ("!POLICY_FILE!.flags") do (
         set "POLICY_EXPECT_EXIT=%%B"
     ) else if /I "%%A"=="expect_output" (
         set "POLICY_EXPECT_OUTPUT=%%B"
+    ) else if /I "%%A"=="link" (
+        set "POLICY_LINK=%%B"
     )
 )
 exit /b
@@ -170,8 +173,11 @@ if /I "!CFLAT_POLICY_SUPPORTED!"=="0" (
     exit /b
 )
 call :LoadPolicyFlags "!POLICY_FILE!"
+REM `link=1` links to results\<name>.exe (a link-time failure is the leg) instead of --check.
+set "POLICY_MODE=--check"
+if "!POLICY_LINK!"=="1" set "POLICY_MODE=-o "%OUT%\results\!POLICY_NAME!.exe""
 set "POLICY_T0=!TIME!"
-%COMPILER% "!POLICY_FILE!" -i %LIB% --locale-dir "%CFLAT_LOCALE_DIR%" --check --nologo %LOCALE_COLLECT% %TU_CHECK% !POLICY_FLAGS! >"!POLICY_LOG!" 2>&1
+%COMPILER% "!POLICY_FILE!" -i %LIB% --locale-dir "%CFLAT_LOCALE_DIR%" !POLICY_MODE! --nologo %LOCALE_COLLECT% %TU_CHECK% !POLICY_FLAGS! >"!POLICY_LOG!" 2>&1
 set "POLICY_RC=!ERRORLEVEL!"
 set "POLICY_PASS=0"
 if /I "!POLICY_EXPECT_EXIT!"=="nonzero" (

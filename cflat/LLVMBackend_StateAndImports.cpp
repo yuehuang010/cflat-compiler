@@ -3189,6 +3189,7 @@ nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r, CCachePathTable*
         if (r.hasAssignTemplate)     j["hat"] = true;
         if (r.moveAssignBindsConstRef) j["mab"] = true;
         if (r.moveAssignConstSourceBindsConstRef) j["mabc"] = true;
+        if (r.assignRefusedMask != 0) j["arf"] = r.assignRefusedMask;
         if (r.isAggregate)           j["ag"] = true;
         // M6 - inheritance surface. Base offsets drive every derived-to-base adjustment and the
         // abstract/virtual-base gates; a warm cache that lost them would emit unadjusted pointers.
@@ -3323,6 +3324,7 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j, const CCac
         r.hasAssignTemplate     = j.value("hat", false);
         r.moveAssignBindsConstRef = j.value("mab", false);
         r.moveAssignConstSourceBindsConstRef = j.value("mabc", false);
+        r.assignRefusedMask = j.value("arf", (uint8_t)0);
         r.isAggregate           = j.value("ag", false);
         r.hasVirtualBases       = j.value("hvb", false);
         r.isFinal               = j.value("fin", false);
