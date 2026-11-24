@@ -48,11 +48,10 @@ clang++ -std=c++20 is the oracle. Repros: scratch/repro_keep/refmem/ and scratch
      off member-template wrappers: broadening it changed `PvHost::byVal(PvCount<T,F>)` from the existing no-move
      prvalue route to an extra move (`Test/test_cpp_interop_template.cb`, leg 2856). That member path matches both
      master and clang when kept on its prior route.
-   - By-value param through the C++ wrapper is still destroyed inside the call when a constructor argument has side
-     effects or is not a plain scalar (master the same, values right, order differs): `C(g())`, `C(i++)` / `--`,
-     `C(GA[i])`, `C(*p)`, `C(a + b)` with an overloaded C++ `operator+`, and member-template callees. Repro:
-     `one(C(g())) + cref2(C(G2), C(3))` (one takes C by value, cref2 two const C&, C prints c<v>/d<v>) prints
-     `c2 d2 c2 c3 d3 d2`; clang++ -std=c++20 prints `c2 c2 c3 d3 d2 d2`. BVPARAM's deferral gate admits only
-     side-effect-free scalar arguments (IsCxxSideEffectFreeScalarExpression, MainListener_Conditional.cpp).
+   - By-value param whose ctor takes a MUTABLE reference (`struct R { int v; R(int& x) { x += 100; ... } }`) is
+     still constructed eagerly, so it dies inside the call (BVPARAM2 kept the eager branch on purpose,
+     directConstructionHasMutableRefParameter, MainListener_PostfixExpression.cpp ~14124): `one(R(x)) + cref2(C(2), C(3))`
+     with R printing 300 + v on ctor / 330 on dtor and C c<v>/d<v> as above gives `300 52 330 2 3 60 33 32`, clang
+     `300 52 2 3 60 33 32 330`. Values and reference identity are right (x 7 -> 107).
    - A conditional mixing a prvalue and an lvalue arm (`c ? D(1) : y`) is refused; clang accepts.
 

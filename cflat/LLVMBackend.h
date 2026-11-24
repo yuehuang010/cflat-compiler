@@ -2311,6 +2311,7 @@ public:
         bool IsCxxDirectConstruction = false;
         bool IsCxxMoveSelected = false; // the move constructor has already built this temporary
         bool CxxDirectConstructionUsesBraces = false;
+        bool CxxDirectConstructionCopyListInit = false;
         std::string CxxDirectConstructionType;
         std::vector<NamedVariable> CxxDirectConstructionArguments;
         // A deferred C++ call or conditional shape spelled by a generated wrapper.
@@ -2723,8 +2724,12 @@ public:
         // retain the existing scalar-list diagnostic.
         std::string cxxElementType;
         bool hasCxxClassElements = false;
+        bool hasNestedBraceElements = false;
         bool hasNonCxxElements = false;
         bool hasMixedElements = false;
+        bool hasPreconstructedClassBacking = false;
+        std::string preconstructedClassElementType;
+        llvm::Value* preconstructedClassData = nullptr;
         std::vector<NamedVariable> elements;
         // Replacements for a class list: the contiguous data pointer and element count passed to
         // the generated wrapper. Scalar lists continue to expand to their original elements.
@@ -3358,6 +3363,8 @@ public:
     {
         llvm::Value* Value = nullptr;
         llvm::BasicBlock* Block = nullptr;
+        bool IsProvenBorrowed = false;
+        bool IsUnmovedUniqueField = false;
     };
 
     /*
@@ -4442,7 +4449,8 @@ private:
     void LogBorrowedPointerMoveSinkError(const std::string& sourceDescription,
                                          const std::string& parameterName,
                                          const std::string& functionName,
-                                         const std::string& declaredName) const;
+                                         const std::string& declaredName,
+                                         bool suggestMoveParameter = true) const;
     void LogOwningLocalCopyMoveSinkError(const std::string& sourceName,
                                          const std::string& ownerName,
                                          const std::string& parameterName,
@@ -5548,9 +5556,8 @@ private:
         // A generated wrapper for an INSTANCE member template: p0 is the receiver, so the
         // symbol is a member call although it is registered like a free function (IsMethod off).
         bool isInstanceTemplateWrapper = false;
-        // Direct by-value callee for a class that cannot be copied or moved: its record parameters are
-        // fed only prvalues the call elides, so the copy/move binding check does not apply.
-        bool prvalueOnlyByValue = false;
+        // Generated direct wrapper with a checked path for its selected nontrivial record parameters.
+        bool allowsDirectNontrivialByValue = false;
         std::string bindRefusal;
         // Refusal reported by clang extraction, before backend type mapping. A cached C++
         // signature remaps its types from the preserved spellings and retains this reason.
@@ -6661,6 +6668,8 @@ private:
     bool TernaryArmJoinsOwning(llvm::Value* arm, bool includeOwningLocal = false);
     // True when every non-null arm is owned by a local slot, move, or owned temporary.
     bool CanAdoptUniquePointerJoin(llvm::Value* joined);
+    bool JoinHasProvenBorrowedArm(const llvm::Value* joined) const;
+    bool JoinHasUnmovedUniqueAdoptionArm(const llvm::Value* joined) const;
 
     /*
      * True when `value` is a by-value struct of an OWNING-VALUE type (a `unique` field, directly or
@@ -8372,7 +8381,8 @@ private:
                                     std::vector<NamedVariable>& arguments,
                                     std::string& registeredName, std::string& error,
                                     bool typeDefaultTrailing = false,
-                                    const std::vector<size_t>* knownByValueArguments = nullptr);
+                                    const std::vector<size_t>* knownByValueArguments = nullptr,
+                                    bool adlCall = false);
     // Operator form: the infix wrapper bound under registeredName (free or template).
     bool SwitchCxxOperatorDirectByValueCall(const std::string& functionName,
                                             std::vector<NamedVariable>& arguments,
@@ -8425,6 +8435,9 @@ private:
                                  std::vector<NamedVariable>& arguments,
                                  std::vector<CxxBraceArgument>& braceArguments,
                                  std::string& error);
+    bool GetUniqueCxxBraceFunctionClassElementType(const std::string& functionName,
+                                                   size_t parameterIndex, size_t arity,
+                                                   std::string& elementType);
     // The C++ type a braced scalar element is ranked as (literal/declared type, enum promotion).
     std::string CxxBraceElementIdentity(const NamedVariable& element) const;
     std::string CxxBraceSelectorElement(const NamedVariable& element,
@@ -8456,6 +8469,9 @@ private:
                                            std::string& expression, std::string& error);
     // A dry run of SpellCxxBraceDeferredConstruction: may the element be deferred into the wrapper?
     bool CanSpellCxxBraceDeferredConstruction(const NamedVariable& construction);
+    bool EmitCxxBraceElementToSlot(const NamedVariable& source, const std::string& elementType,
+                                   llvm::Value* destination, const char* context,
+                                   std::string& error, bool registerDestinationDtor = true);
     static bool IsBareNullptrBraceLiteral(const NamedVariable& element);
     bool CxxRecordFieldTypeSpelling(const std::string& typeName,
                                     const std::string& fieldName,
@@ -11536,7 +11552,10 @@ public:
     {
         enum class Kind { Ill, Ambiguous, LvalueRef, XvalueRef, Prvalue };
         Kind kind = Kind::Ill;
-        bool resultIsTrue = false; // the result is the true arm's class, else the false arm's
+        bool resultIsTrue = false; // the result type matches the true arm
+        bool resultIsClass = false;
+        TypeAndValue resultType; // Exact C++ result type for an accepted pointer/class join.
+        bool hasResultType = false;
     };
     // Value category of one `?:` arm, read from the arm expression itself.
     enum class CxxArmCategory { Lvalue, Xvalue, Prvalue };

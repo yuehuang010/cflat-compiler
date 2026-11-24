@@ -740,7 +740,12 @@ bool CxxArrayReferenceParameter(const std::string& parameter, std::string& eleme
 std::string CxxInitializerListOverStorage(const std::string& listType, const std::string& il,
                                                  const std::string& p, size_t count)
 {
-        const std::string n = std::to_string(count);
+        return CxxInitializerListOverStorage(listType, il, p, std::to_string(count));
+}
+std::string CxxInitializerListOverStorage(const std::string& listType, const std::string& il,
+                                                 const std::string& p, const std::string& count)
+{
+        const std::string& n = count;
         return "\n" + listType + " " + il + ";\n#if defined(_MSVC_STL_VERSION)\nconst void* " + il
             + "_words[2] = { " + p + ", " + p + " + " + n
             + " };\n#elif defined(_LIBCPP_VERSION) || defined(__GLIBCXX__)\n"

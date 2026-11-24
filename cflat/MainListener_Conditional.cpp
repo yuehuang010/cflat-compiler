@@ -32,6 +32,7 @@ public:
 private:
     LLVMBackend* compiler_;
 };
+
 }
 
 llvm::Value* MainListener::BoxTernaryThinArmToInterface(llvm::Value* thinValue, const std::string& interfaceName,
@@ -2917,13 +2918,47 @@ bool MainListener::CollectBorrowedPointerArm(const LLVMBackend::TypedValue& shap
 {
     if (!inCallArgument_) return false;
     if (storage == nullptr) storage = shape.receiverStorage;
-    if (value == nullptr || storage == nullptr || armBlock == nullptr
-        || !value->getType()->isPointerTy() || !shape.sourceFieldName.empty()
-        || shape.sourceIsElementAccess)
-        return false;
     std::string sourceName = shape.sourceCallerName;
-    if (sourceName.empty()) sourceName = Compiler()->FindVariableNameByStorage(storage);
+    if (sourceName.empty() && storage != nullptr)
+        sourceName = Compiler()->FindVariableNameByStorage(storage);
+    if (sourceName.empty() && shape.hasSourceType)
+        sourceName = shape.sourceType.VariableName;
+    if (storage == nullptr && !sourceName.empty())
+        storage = Compiler()->FindVariableStorage(sourceName).Storage;
+    if (value == nullptr || storage == nullptr || armBlock == nullptr
+        || !value->getType()->isPointerTy() || shape.sourceIsElementAccess)
+        return false;
     if (sourceName.empty()) return false;
+    const bool plainPointerSource = shape.hasSourceType && shape.sourceType.Pointer
+        && !shape.sourceType.IsUnique && !shape.sourceType.IsArrayView;
+    auto recordBorrowedArm = [&]() {
+        const bool borrowedThisField = shape.sourceRootIsBorrowedThisField
+            && !shape.sourceFieldName.empty();
+        const std::string recordedName = borrowedThisField
+            ? "this." + shape.sourceFieldName : sourceName;
+        out.push_back({ storage, value->getType(), armBlock, recordedName,
+            borrowedThisField ? std::string() : shape.sourceFieldName, false });
+        auto& recorded = out.back();
+        recorded.MoveParamSinkArgument = true;
+        recorded.BorrowedPointer = true;
+        recorded.BorrowedOrigin = shape.sourceFieldName.empty() ? sourceName : std::string();
+        if (borrowedThisField)
+        {
+            recorded.RootIsBorrowedThisField = true;
+            recorded.ThisFieldPath = shape.sourceThisFieldPath;
+        }
+        recorded.IsExplicitMove = shape.isExplicitMove;
+        return true;
+    };
+    if (!shape.sourceFieldName.empty() && plainPointerSource)
+        return recordBorrowedArm();
+    if (llvm::isa<llvm::GlobalVariable>(storage) && plainPointerSource)
+    {
+        const auto global = Compiler()->GetGlobalVariableNV(sourceName);
+        if (global.Storage == storage && !global.IsOwning && !global.IsNewAllocated)
+            return recordBorrowedArm();
+        return false;
+    }
     const auto* source = Compiler()->FindVariableByStorage(storage);
     if (source == nullptr || !source->TypeAndValue.Pointer
         || source->BorrowedThroughField || Compiler()->BorrowProofRetiredByRebind(*source))
@@ -3359,6 +3394,44 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
         const std::string& cxxTernaryDeclType, bool collapseLvalueArms,
         bool collapseLvalueSink, int& ownedCallArms) {
         auto* compiler = Compiler(ctx);
+        auto convertClassArmToPointer = [&](LLVMBackend::TypeAndValue& armType,
+                                            llvm::Value*& value, llvm::Value*& storage,
+                                            LLVMBackend::TypedValue& shape,
+                                            llvm::BasicBlock*& endBlock, bool isRvalue,
+                                            bool& isAlias,
+                                            const LLVMBackend::TypeAndValue& pointerResultType) {
+            if (armType.Pointer || armType.IsCxxNullptrT) return true;
+            if (endBlock == nullptr || (value == nullptr && storage == nullptr)) return false;
+            auto savedIP = compiler->builder->saveIP();
+            compiler->builder->SetInsertPoint(endBlock);
+            LLVMBackend::NamedVariable arm;
+            arm.Primary = value;
+            arm.Storage = storage;
+            arm.BaseType = value != nullptr ? value->getType() : compiler->GetType(armType);
+            arm.TypeAndValue = armType;
+            arm.IsRvalue = isRvalue;
+            if (!compiler->ApplyCxxConversionOperator(
+                    arm, pointerResultType, /*allowExplicit*/ false))
+            {
+                compiler->builder->restoreIP(savedIP);
+                return false;
+            }
+            value = arm.Primary;
+            storage = arm.Storage;
+            armType = pointerResultType;
+            shape.value = value;
+            shape.storage = storage;
+            shape.receiverStorage = storage;
+            shape.sourceType = pointerResultType;
+            shape.sourceTypeName = pointerResultType.TypeName;
+            shape.hasSourceType = true;
+            shape.isRvalue = true;
+            shape.isAlias = false;
+            isAlias = false;
+            endBlock = compiler->builder->GetInsertBlock();
+            compiler->builder->restoreIP(savedIP);
+            return value != nullptr && value->getType()->isPointerTy();
+        };
         const bool uniquePointerDestination =
             (outerExpected.IsUnique && outerExpected.Pointer && !outerExpected.ElemPointer
                 && !outerExpected.IsArrayView)
@@ -3629,6 +3702,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
         };
         UnevaluatedOperandType trueArmCallType, falseArmCallType;
         bool hasTrueArmCallType = false, hasFalseArmCallType = false;
+        std::unordered_set<antlr4::tree::ParseTree*> voidCallArms;
         auto armCallCategory = [&](antlr4::tree::ParseTree* node) {
             auto* postfix = SolePostfixExpressionShape(node);
             if (postfix == nullptr || !PostfixExpressionEndsInCall(postfix)) return 2;
@@ -3645,7 +3719,11 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     hasFalseArmCallType = true;
                 }
                 if (operand.Type.TypeName.empty()
-                    || compiler->ResolveTypeAlias(operand.Type.TypeName) == "void") return 2;
+                    || compiler->ResolveTypeAlias(operand.Type.TypeName) == "void")
+                {
+                    voidCallArms.insert(node);
+                    return 2;
+                }
                 if (operand.Type.IsRvalueRef && operand.IsRvalue) return 1;
                 return operand.IsRvalue ? 4 : 2;
             };
@@ -3678,12 +3756,23 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             if (armIsMove(node)) return 1;
             return armCallCategory(node);
         };
+        auto armHasVoidCall = [&](antlr4::tree::ParseTree* node) {
+            std::function<bool(antlr4::tree::ParseTree*)> visit =
+                [&](antlr4::tree::ParseTree* current) {
+                if (current == nullptr) return false;
+                if (voidCallArms.contains(current)) return true;
+                for (auto* child : current->children)
+                    if (visit(child)) return true;
+                return false;
+            };
+            return visit(node);
+        };
         auto sameDirectClassType = [&]() {
-            if (ArmTernaryThroughParens(expressionTrueCtx) != nullptr
-                || ArmTernaryThroughParens(expressionFalseCtx) != nullptr) return false;
             auto armType = [&](antlr4::tree::ParseTree* node,
                                const UnevaluatedOperandType& callType, bool hasCallType) {
                 if (hasCallType) return callType;
+                if (auto* nested = ArmTernaryThroughParens(node); nested != nullptr)
+                    node = nested;
                 if (auto* expression = dynamic_cast<CFlatParser::ExpressionContext*>(node);
                     expression != nullptr && expression->assignmentExpression() != nullptr)
                     return EvaluateOperandTypeOnly([&]() {
@@ -3692,8 +3781,11 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     });
                 if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node))
                 {
+                    // Use discarded context for CFlat's nested void joins; other joins need a value type.
                     return EvaluateOperandTypeOnly([&]() {
-                        auto value = ParseConditionalExpression(conditional, ResultUse::Discard);
+                        const auto nestedUse = armHasVoidCall(conditional)
+                            ? ResultUse::Discard : ResultUse::Value;
+                        auto value = ParseConditionalExpression(conditional, nestedUse);
                         LLVMBackend::NamedVariable named;
                         named.Primary = value.value;
                         named.Storage = value.storage;
@@ -3772,20 +3864,27 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             compiler->builder->restoreIP(savedIP);
             return moved;
         };
-        auto discardLoweredArm = [&](bool explicitMove, llvm::Value* value, llvm::Value* storage,
+        auto discardLoweredArm = [&](bool explicitMove, bool armIsRvalueRef,
+                                     llvm::Value* value, llvm::Value* storage,
                                      const std::string& sourceTypeName, bool armIsRvalue,
                                      const LLVMBackend::OwnedTempMark& armMark,
                                      antlr4::tree::ParseTree* armCtx) {
+            llvm::Value* sourceStorage = storage;
+            if (sourceStorage == nullptr && armIsRvalueRef
+                && value != nullptr && value->getType()->isPointerTy())
+                sourceStorage = value;
             if (!discardedPrvalueJoin || keepBothMoved
-                || storage == nullptr || !storage->getType()->isPointerTy())
+                || sourceStorage == nullptr || !sourceStorage->getType()->isPointerTy())
                 return false;
-            const bool nestedArm = llvm::isa<llvm::PHINode>(storage)
+            const bool nestedArm = llvm::isa<llvm::PHINode>(sourceStorage)
                 && ArmTernaryThroughParens(armCtx) != nullptr;
-            if (llvm::isa<llvm::PHINode>(storage) && !nestedArm) return false;
+            if (llvm::isa<llvm::PHINode>(sourceStorage) && !nestedArm) return false;
             // A discarded lvalue (or imported-class move) arm is not loaded: use the parsed type.
-            auto* st = llvm::dyn_cast_or_null<llvm::StructType>(value != nullptr ? value->getType()
-                : sourceTypeName.empty() ? nullptr
-                : compiler->GetType(LLVMBackend::TypeAndValue{ .TypeName = sourceTypeName }));
+            auto* st = llvm::dyn_cast_or_null<llvm::StructType>(value != nullptr
+                ? value->getType() : nullptr);
+            if (st == nullptr && !sourceTypeName.empty())
+                st = llvm::dyn_cast_or_null<llvm::StructType>(
+                    compiler->GetType(LLVMBackend::TypeAndValue{ .TypeName = sourceTypeName }));
             if (st == nullptr || !st->hasName()) return false;
             const std::string typeName = st->getName().str();
             // Imported only: a CFlat-declared [cpp] struct's moved arm is restored and moved like a
@@ -3801,12 +3900,12 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             if (nestedArm)
             {
                 // A nested join selects the leaf at run time: move or copy as that leaf was written.
-                auto* moved = nestedLeafMoved(armCtx, storage, armMark);
+                auto* moved = nestedLeafMoved(armCtx, sourceStorage, armMark);
                 if (moved == nullptr) return false;
                 auto* temp = compiler->AllocaAtEntry(st, nullptr, "discardtemp");
                 const bool joinConst = lvalueJoinConst();
                 auto construct = [&](bool useMove) {
-                    return compiler->EmitCxxCopyOrMoveConstruct(typeName, temp, storage,
+                    return compiler->EmitCxxCopyOrMoveConstruct(typeName, temp, sourceStorage,
                         useMove && !joinConst, "into a conditional expression",
                         /*displayTypeName*/ std::string(), /*constSource*/ joinConst);
                 };
@@ -3831,10 +3930,11 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 if (built) compiler->RegisterOwnedStructTemp(temp, typeName);
                 return true;
             }
-            const llvm::Value* root = storage->stripInBoundsOffsets();
+            const llvm::Value* root = sourceStorage->stripInBoundsOffsets();
             // An unmoved lvalue arm (variable, field, `*p`, element) is copied; a prvalue arm already
             // owns its temporary.
-            if (!explicitMove && compiler->FindVariableByStorage(root) == nullptr
+            if (!explicitMove && !armIsRvalueRef
+                && compiler->FindVariableByStorage(root) == nullptr
                 && (armIsRvalue || compiler->IsProducedTempValue(value)
                     || compiler->IsOwnedStructTempSince(armMark, const_cast<llvm::Value*>(root))))
                 return false;
@@ -3843,25 +3943,34 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             {
                 // An imported class is never zeroed by `move`: construct from the source in place.
                 const bool joinConst = lvalueJoinConst();
-                if (compiler->EmitCxxCopyOrMoveConstruct(typeName, temp, storage,
-                        /*useMove*/ explicitMove && !joinConst, "into a conditional expression",
+                if (compiler->EmitCxxCopyOrMoveConstruct(typeName, temp, sourceStorage,
+                        /*useMove*/ (explicitMove || armIsRvalueRef) && !joinConst,
+                        "into a conditional expression",
                         /*displayTypeName*/ std::string(), /*constSource*/ joinConst))
-                    compiler->RegisterOwnedStructTemp(temp, typeName);
+                {
+                    if (armIsRvalueRef && use == ResultUse::Discard)
+                    {
+                        if (auto* dtor = compiler->GetOrCreateFullDestructor(typeName))
+                            compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { temp });
+                    }
+                    else
+                        compiler->RegisterOwnedStructTemp(temp, typeName);
+                }
                 return true;
             }
             if (explicitMove)
             {
-                compiler->builder->CreateStore(value, storage);
+                compiler->builder->CreateStore(value, sourceStorage);
                 if (lvalueJoinConst())
-                    compiler->EmitLoweredMemberwiseCopy(typeName, st, temp, storage,
+                    compiler->EmitLoweredMemberwiseCopy(typeName, st, temp, sourceStorage,
                         "into a conditional expression");
                 else
-                    compiler->EmitLoweredMemberwiseMove(typeName, st, temp, storage,
+                    compiler->EmitLoweredMemberwiseMove(typeName, st, temp, sourceStorage,
                         "into a conditional expression");
-                compiler->MarkStorageNotExplicitlyMovedNull(storage);
+                compiler->MarkStorageNotExplicitlyMovedNull(sourceStorage);
             }
             else
-                compiler->EmitLoweredMemberwiseCopy(typeName, st, temp, storage,
+                compiler->EmitLoweredMemberwiseCopy(typeName, st, temp, sourceStorage,
                     "into a conditional expression");
             compiler->RegisterOwnedStructTemp(temp, typeName);
             return true;
@@ -3904,7 +4013,14 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                                           const LLVMBackend::OwnedTempMark& armMark,
                                           antlr4::tree::ParseTree* armCtx) {
             const bool discard = use == ResultUse::Discard;
-            if (discardLoweredArm(explicitMove, value, storage, shape.sourceTypeName, shape.isRvalue,
+            const bool armIsRvalueRef = (armCtx == expressionTrueCtx && hasTrueArmCallType
+                    && trueArmCallType.Type.IsRvalueRef)
+                || (armCtx == expressionFalseCtx && hasFalseArmCallType
+                    && falseArmCallType.Type.IsRvalueRef)
+                || (shape.hasSourceType && shape.sourceType.IsRvalueRef);
+            if (discardLoweredArm(explicitMove,
+                    armIsRvalueRef,
+                    value, storage, shape.sourceTypeName, shape.isRvalue,
                     armMark, armCtx))
                 return;
             // A discarded moved string: all-move joins keep the bytes in the source (as structs do
@@ -4341,6 +4457,9 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     if (auto* st = llvm::dyn_cast<llvm::StructType>(alloca->getAllocatedType());
                         st != nullptr && st->hasName())
                         type.TypeName = st->getName().str();
+            if (type.TypeName.empty()
+                && llvm::isa_and_nonnull<llvm::ConstantPointerNull>(value))
+                type.IsCxxNullptrT = true;
             return type;
         };
         auto consumeNewCxxTernaryElision = [&](LLVMBackend::TypedValue& joined) {
@@ -5225,13 +5344,15 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 };
                 if (TernaryIsMemberReceiver(ctx) && trueMoveLvalueJoin)
                 {
-                    materializeArm(true, true);
-                    materializeArm(false, false);
+                    const bool joinConst = lvalueJoinConst();
+                    materializeArm(true, !joinConst, joinConst);
+                    materializeArm(false, false, joinConst);
                 }
                 else if (TernaryIsMemberReceiver(ctx) && falseMoveLvalueJoin)
                 {
-                    materializeArm(true, false);
-                    materializeArm(false, true);
+                    const bool joinConst = lvalueJoinConst();
+                    materializeArm(true, false, joinConst);
+                    materializeArm(false, !joinConst, joinConst);
                 }
                 else if (trueTemp && trueShape.isCxxSameTypeCastCopy && !falseTemp && !falseShape.isRvalue
                     && isAddressableLvalue(falseValue, falseStorage))
@@ -5426,13 +5547,39 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 return CxxValueJoinResult::NotApplicable;
             auto trueType = ternaryArmSourceType(trueShape, trueValue, trueStorage);
             auto falseType = ternaryArmSourceType(falseShape, falseValue, falseStorage);
-            if (trueType.TypeName.empty() || falseType.TypeName.empty()
-                || trueType.Pointer || falseType.Pointer || trueType.IsArrayView || falseType.IsArrayView
+            auto rvalueRefClassArm = [&](const LLVMBackend::TypeAndValue& type,
+                                         const LLVMBackend::TypedValue& shape,
+                                         llvm::Value* value) {
+                return type.Pointer && type.IsRvalueRef && !type.ElemPointer
+                    && type.PointerDepth <= 1 && shape.isRvalue && value != nullptr
+                    && value->getType()->isPointerTy();
+            };
+            const bool trueRvalueRef = rvalueRefClassArm(trueType, trueShape, trueValue);
+            const bool falseRvalueRef = rvalueRefClassArm(falseType, falseShape, falseValue);
+            if ((trueType.TypeName.empty() && !trueType.IsCxxNullptrT)
+                || (falseType.TypeName.empty() && !falseType.IsCxxNullptrT)
+                || trueType.IsArrayView || falseType.IsArrayView
                 || trueType.IsInterface || falseType.IsInterface
                 || trueType.IsUnique || falseType.IsUnique)
                 return CxxValueJoinResult::NotApplicable;
             const std::string trueName = compiler->ResolveTypeAlias(trueType.TypeName);
             const std::string falseName = compiler->ResolveTypeAlias(falseType.TypeName);
+            auto plainCxxClassPointer = [&](const LLVMBackend::TypeAndValue& type,
+                                            const std::string& name, bool rvalueRef) {
+                return type.Pointer && !rvalueRef && !type.ElemPointer
+                    && type.PointerDepth <= 1 && compiler->IsCxxRecord(name);
+            };
+            const bool trueClassPointer = plainCxxClassPointer(trueType, trueName, trueRvalueRef);
+            const bool falseClassPointer = plainCxxClassPointer(falseType, falseName, falseRvalueRef);
+            const bool pointerClassPair = trueClassPointer != falseClassPointer;
+            const bool nullptrClassPair = (trueType.IsCxxNullptrT && compiler->IsCxxRecord(falseName))
+                || (falseType.IsCxxNullptrT && compiler->IsCxxRecord(trueName));
+            if ((trueType.Pointer || falseType.Pointer) && !pointerClassPair
+                && !trueRvalueRef && !falseRvalueRef)
+                return CxxValueJoinResult::NotApplicable;
+            if ((trueType.Pointer && !trueRvalueRef && !trueClassPointer)
+                || (falseType.Pointer && !falseRvalueRef && !falseClassPointer))
+                return CxxValueJoinResult::NotApplicable;
             using CxxArmCategory = LLVMBackend::CxxArmCategory;
             auto armCategory = [&](const LLVMBackend::TypedValue& shape) {
                 if (shape.storage != nullptr
@@ -5448,8 +5595,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             };
             CxxArmCategory trueCategory = armCategory(trueShape);
             CxxArmCategory falseCategory = armCategory(falseShape);
-            if (trueName.empty() || falseName.empty()
-                || !compiler->IsCxxRecord(trueName) || !compiler->IsCxxRecord(falseName))
+            if (!nullptrClassPair && (trueName.empty() || falseName.empty()
+                || !compiler->IsCxxRecord(trueName) || !compiler->IsCxxRecord(falseName)))
                 return CxxValueJoinResult::NotApplicable;
             const bool sameClass = trueName == falseName;
             const bool lvalueXvalueMix = (trueCategory == CxxArmCategory::Lvalue
@@ -5460,7 +5607,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     && falseCategory == CxxArmCategory::Xvalue)
                 || (trueCategory == CxxArmCategory::Xvalue
                     && falseCategory == CxxArmCategory::Prvalue);
-            if (sameClass && !lvalueXvalueMix
+            if (sameClass && !pointerClassPair && !lvalueXvalueMix
                 && !(trueCategory == CxxArmCategory::Xvalue
                     && falseCategory == CxxArmCategory::Xvalue)
                 && !prvalueXvalueMix)
@@ -5478,19 +5625,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                             compiler->ResolveTypeAlias(outerExpected.TypeName)))
                 && IsWholeCxxCallArgumentShape(ctx, outerExpected);
             const bool callThroughSink = callArgument && cxxTernaryCallSink_ != nullptr;
-            if (!cxxTernaryDecl && !callArgument)
-                return CxxValueJoinResult::NotApplicable;
-            if (cxxTernaryDecl && !trueCxxTernaryDeclDeferred
-                && !falseCxxTernaryDeclDeferred)
-                return CxxValueJoinResult::NotApplicable;
+            const bool rvalueRefValueJoin = trueRvalueRef || falseRvalueRef;
 
-            auto rvalueRefClassArm = [&](const LLVMBackend::TypeAndValue& type,
-                                         const LLVMBackend::TypedValue& shape,
-                                         llvm::Value* value) {
-                return type.Pointer && type.IsRvalueRef && !type.ElemPointer
-                    && type.PointerDepth <= 1 && shape.isRvalue && value != nullptr
-                    && value->getType()->isPointerTy();
-            };
             auto bindRvalueRefArm = [&](LLVMBackend::TypeAndValue& type, llvm::Value*& value,
                                         llvm::Value*& storage, llvm::BasicBlock* endBlock) {
                 type.Pointer = false;
@@ -5527,6 +5663,34 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                         compiler->DisplayCxxClassName(falseName)));
                 return CxxValueJoinResult::NotApplicable;
             }
+            if (!cxxTernaryDecl && (pointerClassPair || nullptrClassPair)
+                && !verdict.resultIsClass)
+            {
+                const auto& pointerResultType = verdict.hasResultType
+                    ? verdict.resultType : (verdict.resultIsTrue ? trueType : falseType);
+                const std::string& classArmName = trueType.IsCxxNullptrT ? falseName
+                    : falseType.IsCxxNullptrT ? trueName : trueType.Pointer ? falseName : trueName;
+                if (!convertClassArmToPointer(trueType, trueValue,
+                        trueStorage, trueShape, trueEnd,
+                        trueCategory != CxxArmCategory::Lvalue, trueAlias, pointerResultType)
+                    || !convertClassArmToPointer(falseType, falseValue,
+                        falseStorage, falseShape, falseEnd,
+                        falseCategory != CxxArmCategory::Lvalue, falseAlias, pointerResultType))
+                    LogErrorContext(ctx, std::format(
+                        "cannot convert C++ class '{}' to pointer '{}' in conditional expression",
+                        compiler->DisplayCxxClassName(classArmName),
+                        SpellType(*compiler, pointerResultType)));
+                return CxxValueJoinResult::NotApplicable;
+            }
+            const bool pointerClassValueJoin = (pointerClassPair || nullptrClassPair)
+                && verdict.resultIsClass;
+            if (cxxTernaryDecl && !trueCxxTernaryDeclDeferred
+                && !falseCxxTernaryDeclDeferred && !rvalueRefValueJoin
+                && !pointerClassValueJoin)
+                return CxxValueJoinResult::NotApplicable;
+            if (!cxxTernaryDecl && !callArgument && !rvalueRefValueJoin
+                && !pointerClassValueJoin)
+                return CxxValueJoinResult::NotApplicable;
             const std::string resultName = compiler->ResolveTypeAlias(
                 verdict.resultIsTrue ? trueType.TypeName : falseType.TypeName);
             std::unordered_map<std::string, bool> byValueCtorMemo;
@@ -5548,7 +5712,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 return CxxValueJoinResult::NotApplicable;
             const std::string targetName = cxxTernaryDecl
                 ? compiler->ResolveTypeAlias(cxxTernaryDeclType)
-                : outerExpected.TypeName.empty() ? resultName
+                : outerExpected.TypeName.empty()
+                    || compiler->ResolveTypeAlias(outerExpected.TypeName) == "auto" ? resultName
                 : compiler->ResolveTypeAlias(outerExpected.TypeName);
             if (resultName.empty() || resultName != targetName)
                 return CxxValueJoinResult::NotApplicable;
@@ -6153,13 +6318,38 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 };
                 const bool trueRvalueRef = rvalueRefClassArm(trueClassType, trueShape, trueValue);
                 const bool falseRvalueRef = rvalueRefClassArm(falseClassType, falseShape, falseValue);
-                const bool cxxClassConditional = (!trueClassType.Pointer || trueRvalueRef)
+                auto isCxxClassObject = [&](const LLVMBackend::TypeAndValue& type, bool rvalueRef) {
+                    return !type.TypeName.empty()
+                        && compiler->IsCxxRecord(compiler->ResolveTypeAlias(type.TypeName))
+                        && (!type.Pointer || rvalueRef);
+                };
+                auto isPlainCxxClassPointer = [&](const LLVMBackend::TypeAndValue& type,
+                                                  bool rvalueRef) {
+                    return type.Pointer && !rvalueRef && !type.ElemPointer
+                        && type.PointerDepth <= 1 && !type.TypeName.empty()
+                        && compiler->IsCxxRecord(compiler->ResolveTypeAlias(type.TypeName));
+                };
+                const bool pointerClassConditional =
+                    (isPlainCxxClassPointer(trueClassType, trueRvalueRef)
+                        && isCxxClassObject(falseClassType, falseRvalueRef))
+                    || (isPlainCxxClassPointer(falseClassType, falseRvalueRef)
+                        && isCxxClassObject(trueClassType, trueRvalueRef));
+                const bool nullptrClassConditional =
+                    (trueClassType.IsCxxNullptrT
+                        && isCxxClassObject(falseClassType, falseRvalueRef))
+                    || (falseClassType.IsCxxNullptrT
+                        && isCxxClassObject(trueClassType, trueRvalueRef));
+                const bool hasPointerClassConditional = pointerClassConditional
+                    || nullptrClassConditional;
+                const bool cxxClassConditional = hasPointerClassConditional
+                    || ((!trueClassType.Pointer || trueRvalueRef)
                     && (!falseClassType.Pointer || falseRvalueRef)
                     && !trueClassName.empty() && !falseClassName.empty()
                     && (trueClassName != falseClassName
+                        || (trueRvalueRef && use == ResultUse::Discard)
                         || (trueCategory == CxxArmCategory::Xvalue
                             && falseCategory == CxxArmCategory::Xvalue))
-                    && compiler->IsCxxRecord(trueClassName) && compiler->IsCxxRecord(falseClassName);
+                    && compiler->IsCxxRecord(trueClassName) && compiler->IsCxxRecord(falseClassName));
                 auto bindRvalueRefArm = [&](LLVMBackend::TypeAndValue& type, llvm::Value*& value,
                                             llvm::Value*& storage, llvm::BasicBlock* endBlock) {
                     type.Pointer = false;
@@ -6189,7 +6379,69 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                         trueClassType, trueCategory, falseClassType, falseCategory);
                     using CxxKind = LLVMBackend::CxxTernaryVerdict::Kind;
                     if (cxxVerdict.kind == CxxKind::Ambiguous || cxxVerdict.kind == CxxKind::Ill)
-                        rejectUnmaterializedAggregateMismatch();
+                    {
+                        if (!hasPointerClassConditional)
+                            rejectUnmaterializedAggregateMismatch();
+                        else if (cxxVerdict.kind == CxxKind::Ambiguous)
+                            LogErrorContext(ctx, std::format(
+                                "ternary branches have ambiguous C++ conversions between '{}' and '{}'",
+                                compiler->DisplayCxxClassName(trueClassName),
+                                compiler->DisplayCxxClassName(falseClassName)));
+                        else
+                        {
+                            auto describeArm = [](const LLVMBackend::TypeAndValue& type,
+                                                  llvm::Value* value) {
+                                if (type.Pointer || (value != nullptr && value->getType()->isPointerTy()))
+                                    return std::string("pointer");
+                                if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(
+                                        value != nullptr ? value->getType() : nullptr))
+                                    return st->hasName() ? st->getName().str() : std::string("struct");
+                                if (!type.TypeName.empty()) return type.TypeName;
+                                return std::string("unknown");
+                            };
+                            LogErrorContext(ctx, std::format(
+                                "ternary branches have incompatible types '{}' and '{}'",
+                                describeArm(trueClassType, trueValue),
+                                describeArm(falseClassType, falseValue)));
+                        }
+                    }
+                    else if (hasPointerClassConditional && !cxxVerdict.resultIsClass)
+                    {
+                        const auto& pointerResultType = cxxVerdict.hasResultType
+                            ? cxxVerdict.resultType
+                            : (cxxVerdict.resultIsTrue ? trueClassType : falseClassType);
+                        const std::string& classArmName = trueClassType.IsCxxNullptrT
+                            ? falseClassName : falseClassType.IsCxxNullptrT ? trueClassName
+                            : trueClassType.Pointer ? falseClassName : trueClassName;
+                        if (!convertClassArmToPointer(trueClassType,
+                                trueValue, trueStorage, trueShape, trueEnd,
+                                trueCategory != CxxArmCategory::Lvalue, trueAlias,
+                                pointerResultType)
+                            || !convertClassArmToPointer(falseClassType,
+                                falseValue, falseStorage, falseShape, falseEnd,
+                                falseCategory != CxxArmCategory::Lvalue, falseAlias,
+                                pointerResultType))
+                            LogErrorContext(ctx, std::format(
+                                "cannot convert C++ class '{}' to pointer '{}' in conditional expression",
+                                compiler->DisplayCxxClassName(classArmName),
+                                SpellType(*compiler, pointerResultType)));
+                    }
+                    else if (use == ResultUse::Discard && trueRvalueRef
+                        && trueClassName == falseClassName)
+                    {
+                        // The discarded arm parser already materialized the selected xvalue.
+                        flushDeferredCxxArm(false);
+                        flushDeferredCxxArm(true);
+                        for (llvm::BasicBlock* bb : { trueEnd, falseEnd })
+                        {
+                            if (bb == nullptr || cflat_llvm::GetTerminatorOrNull(bb) != nullptr)
+                                continue;
+                            compiler->SwitchToBlock(bb);
+                            compiler->CreateJump(resumeBlock);
+                        }
+                        compiler->SwitchToBlock(resumeBlock);
+                        return {};
+                    }
                     else
                     {
                         // Each arm is lowered in its own block; the join merges the storage it leaves.
@@ -8159,6 +8411,54 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 coalesceFunctionExpected);
             llvm::Value* lhsStorage = lhsTv.receiverStorage;
             const bool lhsUniqueFieldRead = compiler->IsUniqueFieldReadValue(lhs);
+            auto coalesceArmIsProvenBorrow = [&](const LLVMBackend::TypedValue& shape,
+                                                  llvm::Value* value,
+                                                  llvm::Value* storage) {
+                if (value == nullptr || !value->getType()->isPointerTy()
+                    || JoinArmIsProvablyNull(value)
+                    || compiler->TernaryArmJoinsOwning(value, true))
+                    return false;
+                if (storage == nullptr) storage = shape.receiverStorage;
+                if (!shape.hasSourceType || !shape.sourceType.Pointer
+                    || shape.sourceType.IsUnique || shape.sourceType.IsArrayView)
+                    return false;
+                if (!shape.sourceFieldName.empty() && !shape.sourceIsElementAccess)
+                    return true;
+                const std::string sourceName = shape.sourceCallerName.empty()
+                    ? shape.sourceType.VariableName : shape.sourceCallerName;
+                if (!sourceName.empty() && compiler->IsFunctionParameter(sourceName)
+                    && !compiler->IsVariableOwning(sourceName)
+                    && !compiler->IsCxxRecord(shape.sourceType.TypeName))
+                    return true;
+                if (auto* global = llvm::dyn_cast_or_null<llvm::GlobalVariable>(storage))
+                {
+                    const std::string sourceName = shape.sourceCallerName.empty()
+                        ? global->getName().str() : shape.sourceCallerName;
+                    const auto globalNV = compiler->GetGlobalVariableNV(sourceName);
+                    return globalNV.Storage == global && !globalNV.IsOwning
+                        && !globalNV.IsNewAllocated;
+                }
+                const auto* local = compiler->FindVariableByStorage(storage);
+                if (local == nullptr || local->IsOwning || local->IsNewAllocated
+                    || local->IsOwningStruct || local->IsOwningString
+                    || compiler->BorrowProofRetiredByRebind(*local))
+                    return false;
+                return (local->IsBorrowed && (!local->BorrowedOrigin.empty()
+                            || !local->BorrowedUniqueField.empty()))
+                    || local->BorrowsOwningLocal
+                    || ((local->IsAliasBorrow || local->TypeAndValue.IsAlias)
+                        && !local->BorrowedOrigin.empty());
+            };
+            auto coalesceArmIsUnmovedUniqueField = [&](const LLVMBackend::TypedValue& shape,
+                                                        llvm::Value* value,
+                                                        llvm::Value* storage) {
+                if (storage == nullptr) storage = shape.receiverStorage;
+                return value != nullptr && value->getType()->isPointerTy()
+                    && !shape.sourceIsElementAccess && !shape.isExplicitMove
+                    && !compiler->IsMovedOutPtrValue(value)
+                    && llvm::isa_and_nonnull<llvm::GetElementPtrInst>(storage)
+                    && compiler->IsUniqueFieldReadValue(value);
+            };
             auto clearUniqueFieldRead = [&](llvm::Value* value, llvm::Value* storage) {
                 if (value == nullptr || storage == nullptr) return;
                 if (value->getType()->isPointerTy())
@@ -8659,8 +8959,23 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 && rhs != nullptr && joined->getType()->isPointerTy()
                 && lhs->getType()->isPointerTy() && rhs->getType()->isPointerTy())
             {
+                if (uniquePointerDestination && !inCallArgument_
+                    && ArmIsExplicitMove(logicCtx))
+                {
+                    const bool provenBorrow = coalesceArmIsProvenBorrow(lhsTv, lhs, lhsStorage)
+                        || coalesceArmIsProvenBorrow(rhsShape, rhs, rhsStorage);
+                    if (provenBorrow)
+                        RejectMixedOwnershipPointerTernaryJoin(lhs, rhs, joined,
+                            lhsStorage, rhsStorage, logicCtx, ctx->conditionalExpression(), ctx,
+                            nullptr, true, true);
+                }
                 compiler->RegisterNullCoalesceJoin(
-                    joined, { { lhs, lhsBr->getParent() }, { rhs, rhsBr->getParent() } });
+                    joined, { { lhs, lhsBr->getParent(),
+                                    coalesceArmIsProvenBorrow(lhsTv, lhs, lhsStorage),
+                                    coalesceArmIsUnmovedUniqueField(lhsTv, lhs, lhsStorage) },
+                              { rhs, rhsBr->getParent(),
+                                    coalesceArmIsProvenBorrow(rhsShape, rhs, rhsStorage),
+                                    coalesceArmIsUnmovedUniqueField(rhsShape, rhs, rhsStorage) } });
                 compiler->AttachNullCoalesceFallback(joined, fallbackOwner);
                 if (!inCallArgument_ && JoinArmIsProvablyNull(lhs)
                     && compiler->IsOwnedNewTemp(rhs))
@@ -8739,7 +9054,12 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     && compiler->IsCoreUniqueType(st->getName().str()))
                 {
                     compiler->RegisterNullCoalesceJoin(
-                        joined, { { lhs, lhsBr->getParent() }, { rhs, rhsBr->getParent() } });
+                        joined, { { lhs, lhsBr->getParent(),
+                                        coalesceArmIsProvenBorrow(lhsTv, lhs, lhsStorage),
+                                        coalesceArmIsUnmovedUniqueField(lhsTv, lhs, lhsStorage) },
+                                  { rhs, rhsBr->getParent(),
+                                        coalesceArmIsProvenBorrow(rhsShape, rhs, rhsStorage),
+                                        coalesceArmIsUnmovedUniqueField(rhsShape, rhs, rhsStorage) } });
                     compiler->PropagateUniqueFieldRead(lhs, rhs, joined);
                 }
             }
@@ -8773,6 +9093,11 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                             result.conditionalMoveSources[i].ThisFieldPath = shape.sourceThisFieldPath;
                         }
                     };
+                    // An explicit move of a borrowed argument is still a borrow for a sink;
+                    // classify that leaf before forwarding any move-source ledger.
+                    if (shape.isExplicitMove && CollectBorrowedPointerArm(shape, value, storage,
+                            armBlock, result.conditionalMoveSources))
+                        return;
                     if (!shape.conditionalMoveSources.empty())
                     {
                         result.conditionalMoveSources.insert(result.conditionalMoveSources.end(),

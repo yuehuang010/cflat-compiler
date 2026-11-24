@@ -228,6 +228,7 @@
 //     list/dictionary values are not destroyed, unique list values are, and Box<T> stores T*.
 
 import cpp {"library/cpp_interop_basic.h", "library/cpp_constrec_accept.hpp", "library/cpp_rangeadl.hpp", "library/cpp_raw_string_base.hpp", "library/cpp_arrbound.hpp", "library/cpp_bracefold_base.hpp"};
+import cpp {"library/cpp_braceback.hpp", "vector"};
 import "application.cb";
 import cpp {"library/cpp_defarg_trace.hpp", "library/cpp_cdefarg.hpp", "library/cpp_mixs2.hpp", "library/cpp_defcls.hpp", "library/cpp_braceprv.hpp", "library/cpp_interop_mixcond3.h"};
 import cpp {"library/cpp_hdrglob_a.hpp", "library/cpp_hdrglob_b.hpp"};
@@ -480,7 +481,7 @@ import cpp {"sstream", "fstream", "iostream", "iomanip"};
 import cpp {"library/cpp_interop_stream.h", "library/cpp_interop_list.h"};
 import cpp "library/cpp_ostream_base.hpp";
 // Assignment into a live object from a temporary: instrumented, header-only.
-import cpp {"library/cpp_interop_assign.h", "library/cpp_t231_byvalue.hpp", "library/cpp_t239_ternary_byvalue.hpp", "library/cpp_t331_override.hpp", "library/cpp_interop_proxy_assign.h", "library/t29_valarray_subscript.hpp", "library/cpp_interop_refbinding.h", "library/cpp_interop_opaque_return.hpp", "library/cpp_t34_traits_static.hpp", "library/t17_empty_return.hpp", "memory", "library/cpp_t46_smartdot.hpp", "library/cpp_interop_uniqueptr.h", "library/cpp_t492_fieldmove.hpp", "library/cpp_objoin.hpp"};
+import cpp {"library/cpp_interop_assign.h", "library/cpp_t231_byvalue.hpp", "library/cpp_t480_ternleft4.hpp", "library/cpp_t239_ternary_byvalue.hpp", "library/cpp_t331_override.hpp", "library/cpp_interop_proxy_assign.h", "library/t29_valarray_subscript.hpp", "library/cpp_interop_refbinding.h", "library/cpp_interop_opaque_return.hpp", "library/cpp_t34_traits_static.hpp", "library/t17_empty_return.hpp", "memory", "library/cpp_t46_smartdot.hpp", "library/cpp_interop_uniqueptr.h", "library/cpp_t492_fieldmove.hpp", "library/cpp_objoin.hpp"};
 
 using NestCastSxAlias = cppne.Sx;
 namespace NestCastAliasNs { using SA = cppne.Sx; }
@@ -4470,6 +4471,47 @@ int T513MixresNestedLvalueProbe(bool k, bool j)
     t513mix.A a = t513mix.mkA(3);
     return t513mix.ctakeBV(k ? (j ? a : t513mix.mkBV(2)) : a);
 }
+int T513Mixcond4CtorProbe(bool k)
+{
+    t513mix.t513M3Reset();
+    t513mix.W w = t513mix.W(k ? t513mix.mkBV(9) : t513mix.mkA(3));
+    return w.v;
+}
+int T513Mixcond4LvalueProbe(bool k)
+{
+    t513mix.t513M3Reset();
+    t513mix.A a = t513mix.mkA(3);
+    t513mix.W w = t513mix.W(k ? a : t513mix.mkBV(20));
+    return w.v;
+}
+int T513Mixcond4NestedProbe(bool k, bool j)
+{
+    t513mix.t513M3Reset();
+    t513mix.W w = t513mix.W(k ? (j ? t513mix.mkA(1) : t513mix.mkBV(2)) : t513mix.mkA(3));
+    return w.v;
+}
+int T513Mixcond4NewParenProbe(bool k)
+{
+    t513mix.t513M3Reset();
+    t513mix.W* w = new t513mix.W(k ? t513mix.mkBV(9) : t513mix.mkA(3));
+    int value = w->v;
+    delete w;
+    return value;
+}
+int T513Mixcond4NewBraceProbe(bool k)
+{
+    t513mix.t513M3Reset();
+    t513mix.W* w = new t513mix.W{k ? t513mix.mkBV(9) : t513mix.mkA(3)};
+    int value = w->v;
+    delete w;
+    return value;
+}
+int T513Mixcond4SecondProbe(bool k)
+{
+    t513mix.t513M3Reset();
+    t513mix.W w = t513mix.W(50, k ? t513mix.mkBV(9) : t513mix.mkA(3));
+    return w.v;
+}
 int T513M2C14Probe(bool k, bool j)
 {
     t513V10Reset();
@@ -6099,6 +6141,70 @@ class ConvPtrImpl : IConvPtr
     int m(ConvPtrR r) { return r.value + 40; }
     int n(ConvPtrRN r) { return r.value + 50; }
 };
+interface IRv { int n(RvRN r); };
+class RvImpl : IRv { int n(RvRN r) { return r.value; } };
+interface IRvGeneric<T> { int n(RvRN r); };
+class RvGenericImpl : IRvGeneric<int> { int n(RvRN r) { return r.value; } };
+struct RvHolder { RvRN value = nullptr; };
+interface IRvHolder { int n(RvHolder h); };
+class RvHolderImpl : IRvHolder { int n(RvHolder h) { return h.value.value; } };
+RvRN rv_make(RvFoo* p) { return p; }
+int rv_direct(RvRN r) { return r.value; }
+int testRvInterfaceArgs()
+{
+    int failure = 0;
+    RvFoo foo = default;
+    RvFoo* fp = &foo;
+    RvImpl impl = default;
+    IRv iface = &impl;
+    rv_reset();
+    int value = iface.n(fp);
+    if (value != 3 || rv_counts() != 101) failure = 100310;
+    rv_reset();
+    value = iface.n(RvRN(fp));
+    if (value != 3 || rv_counts() != 101) if (failure == 0) failure = 100311;
+    rv_reset();
+    int localValue = 0;
+    {
+        RvRN local = fp;
+        localValue = iface.n(local);
+    }
+    if (localValue != 3 || rv_counts() != 212) if (failure == 0) failure = 100312;
+    rv_reset();
+    int moveValue = 0;
+    {
+        RvRN local = fp;
+        rv_reset();
+        moveValue = iface.n(move local);
+    }
+    if (moveValue != 3 || rv_counts() != 112) if (failure == 0) failure = 100313;
+    rv_reset();
+    value = iface.n(move rv_make(fp));
+    if (value != 3 || rv_counts() != 212) if (failure == 0) failure = 100318;
+    rv_reset();
+    value = iface.n(rv_make(fp));
+    if (value != 3 || rv_counts() != 101) if (failure == 0) failure = 100314;
+    RvGenericImpl genericImpl = default;
+    IRvGeneric<int> genericIface = &genericImpl;
+    rv_reset();
+    value = genericIface.n(fp);
+    if (value != 3 || rv_counts() != 101) if (failure == 0) failure = 100315;
+    rv_reset();
+    value = rv_direct(fp);
+    if (value != 3 || rv_counts() != 101) if (failure == 0) failure = 100316;
+    RvHolderImpl holderImpl = default;
+    IRvHolder holderIface = &holderImpl;
+    rv_reset();
+    int holderValue = 0;
+    {
+        RvHolder holder = default;
+        holder.value = fp;
+        rv_reset();
+        holderValue = holderIface.n(holder);
+    }
+    if (holderValue != 3 || rv_counts() != 112) if (failure == 0) failure = 100317;
+    return failure;
+}
 // ETARG: an expression template / class value copy-initializes a CFlat callee's by-value C++
 // class parameter through the target's ctor template (clang++ -std=c++20 values in comments).
 double EtargTake(cppi_expr.Vec3 v) { return v.v[0] + v.v[1] + v.v[2]; }
@@ -8085,8 +8191,8 @@ extern int main()
         return 9305;
     t63.resetCounted();
     std.vector<t63.Counted> t63Temps{t63.Counted(30), t63.Counted(40)};
-    // Vector brace-list expansion remains separate from call-argument elision in this round.
-    if (t63.countedCopyCount() != 2 || t63.countedMoveCount() != 2
+    // Backing elements are built in place (clang): 2 copies into the vector, no moves.
+    if (t63.countedCopyCount() != 2 || t63.countedMoveCount() != 0
         || t63Temps.size() != 2 || t63Temps[0].value != 30 || t63Temps[1].value != 40)
         return 9306;
     t63.resetCounted();
@@ -9074,6 +9180,43 @@ extern int main()
     if (T513MixresNestedLvalueProbe(true, true) != 103 || !T513MixresTrace(126744)) return 95314;
     if (T513MixresNestedLvalueProbe(true, false) != 2 || !T513MixresTrace(1574)) return 95315;
     if (T513MixresNestedLvalueProbe(false, false) != 103 || !T513MixresTrace(126744)) return 95316;
+    if (T513Mixcond4CtorProbe(false) != 1103 || !T513MixresTrace(1674)) return 95317;
+    if (T513Mixcond4CtorProbe(true) != 1009 || !T513MixresTrace(57)) return 95318;
+    if (T513Mixcond4LvalueProbe(false) != 1020 || !T513MixresTrace(1574)) return 95319;
+    if (T513Mixcond4LvalueProbe(true) != 1103 || !T513MixresTrace(126744)) return 95320;
+    if (T513Mixcond4NestedProbe(false, false) != 1103 || !T513MixresTrace(1674)) return 95321;
+    if (T513Mixcond4NestedProbe(false, true) != 1103 || !T513MixresTrace(1674)) return 95322;
+    if (T513Mixcond4NestedProbe(true, false) != 1002 || !T513MixresTrace(57)) return 95323;
+    if (T513Mixcond4NestedProbe(true, true) != 1101 || !T513MixresTrace(1674)) return 95324;
+    if (T513Mixcond4NewParenProbe(false) != 1103 || !T513MixresTrace(1674)) return 95325;
+    if (T513Mixcond4NewParenProbe(true) != 1009 || !T513MixresTrace(57)) return 95326;
+    if (T513Mixcond4NewBraceProbe(false) != 1103 || !T513MixresTrace(1674)) return 95327;
+    if (T513Mixcond4NewBraceProbe(true) != 1009 || !T513MixresTrace(57)) return 95328;
+    if (T513Mixcond4SecondProbe(false) != 1153 || !T513MixresTrace(1674)) return 95329;
+    if (T513Mixcond4SecondProbe(true) != 1059 || !T513MixresTrace(57)) return 95330;
+    // The ternary is inside a casted call argument nested in new A's positional brace field.
+    t513mix.t513M3Reset();
+    bool mixcond4CastBraceKFalse = false;
+    t513mix.A* mixcond4CastBraceFalse = new t513mix.A{t513mix.ctakeBV(
+        (t513mix.BV)(mixcond4CastBraceKFalse ? t513mix.mkBV(9) : t513mix.mkA(3)))};
+    int mixcond4CastBraceFalseValue = mixcond4CastBraceFalse->v;
+    int mixcond4CastBraceFalseTrace = t513mix.t513M3Stats();
+    delete mixcond4CastBraceFalse;
+    bool mixcond4CastBraceFalseTraceMatches = mixcond4CastBraceFalseTrace == 16174;
+    if const (__WINDOWS__) { mixcond4CastBraceFalseTraceMatches = true; }
+    if (mixcond4CastBraceFalseValue != 103 || !mixcond4CastBraceFalseTraceMatches
+        || !T513MixresTrace(161744)) return 95331;
+    t513mix.t513M3Reset();
+    bool mixcond4CastBraceKTrue = true;
+    t513mix.A* mixcond4CastBraceTrue = new t513mix.A{t513mix.ctakeBV(
+        (t513mix.BV)(mixcond4CastBraceKTrue ? t513mix.mkBV(9) : t513mix.mkA(3)))};
+    int mixcond4CastBraceTrueValue = mixcond4CastBraceTrue->v;
+    int mixcond4CastBraceTrueTrace = t513mix.t513M3Stats();
+    delete mixcond4CastBraceTrue;
+    bool mixcond4CastBraceTrueTraceMatches = mixcond4CastBraceTrueTrace == 517;
+    if const (__WINDOWS__) { mixcond4CastBraceTrueTraceMatches = true; }
+    if (mixcond4CastBraceTrueValue != 9 || !mixcond4CastBraceTrueTraceMatches
+        || !T513MixresTrace(5174)) return 95332;
     if (T513V12Probe(true, 11) != t513V12TrueExpected) return 95175;
     if (T513V12Probe(false, 11) != 200057) return 95176;
     // By-value B(A): MSVC destroys A inside B(A), so A dies before the callee's B (clang-cl 1647).
@@ -17899,6 +18042,116 @@ extern int main()
         || cppcr.brc_convert_source_gone() - brcConvertSourceGone != 1
         || cppcr.brc_convert_target_made() - brcConvertTargetMade != 1
         || cppcr.brc_convert_target_gone() - brcConvertTargetGone != 1)   return 7229;
+    // BRACEBACK: class prvalues initialize initializer_list backing slots directly (clang C++20).
+    int brcBackMade = braceback.made();
+    int brcBackGone = braceback.gone();
+    int brcBackCopies = braceback.copies();
+    int brcBackValue = braceback.read(
+        braceback.keep({braceback.Element(1), braceback.Element(2)}));
+    if (brcBackValue != 12 || braceback.made() - brcBackMade != 2
+        || braceback.gone() - brcBackGone != 2
+        || braceback.copies() - brcBackCopies != 0)                         return 7230;
+    brcBackMade = braceback.made();
+    brcBackGone = braceback.gone();
+    brcBackCopies = braceback.copies();
+    brcBackValue = braceback.function_read({braceback.Element(1), braceback.Element(2)});
+    if (brcBackValue != 212 || braceback.made() - brcBackMade != 2
+        || braceback.gone() - brcBackGone != 2
+        || braceback.copies() - brcBackCopies != 0)                         return 7231;
+    brcBackMade = braceback.made();
+    brcBackGone = braceback.gone();
+    brcBackCopies = braceback.copies();
+    braceback.Sink brcBackSink = {braceback.Element(1), braceback.Element(2)};
+    if (brcBackSink.which * 100 + brcBackSink.value != 312
+        || braceback.made() - brcBackMade != 2 || braceback.gone() - brcBackGone != 2
+        || braceback.copies() - brcBackCopies != 0)                         return 7232;
+    brcBackMade = braceback.made();
+    brcBackGone = braceback.gone();
+    brcBackCopies = braceback.copies();
+    int brcBackVectorValue = 0;
+    {
+        braceback.Vec brcBackVector = {braceback.Element(1), braceback.Element(2)};
+        brcBackVectorValue = braceback.vector_read(brcBackVector);
+        if (brcBackVectorValue != 412 || braceback.made() - brcBackMade != 4
+            || braceback.gone() - brcBackGone != 2
+            || braceback.copies() - brcBackCopies != 2)                     return 7233;
+    }
+    if (braceback.gone() - brcBackGone != 4)                                return 7234;
+    braceback.Element brcBackLvalue = braceback.Element(2);
+    brcBackMade = braceback.made();
+    brcBackGone = braceback.gone();
+    brcBackCopies = braceback.copies();
+    brcBackValue = braceback.read(braceback.keep({braceback.Element(1), brcBackLvalue}));
+    if (brcBackValue != 12 || braceback.made() - brcBackMade != 2
+        || braceback.gone() - brcBackGone != 2
+        || braceback.copies() - brcBackCopies != 1)                         return 7235;
+    brcBackMade = braceback.made();
+    brcBackGone = braceback.gone();
+    brcBackCopies = braceback.copies();
+    brcBackValue = braceback.function_read({1, braceback.Element(2)});
+    if (brcBackValue != 212 || braceback.made() - brcBackMade != 2
+        || braceback.gone() - brcBackGone != 2
+        || braceback.copies() - brcBackCopies != 0)                         return 7236;
+    brcBackMade = braceback.made();
+    brcBackGone = braceback.gone();
+    brcBackCopies = braceback.copies();
+    brcBackValue = braceback.function_read({{1}, {2}});
+    if (brcBackValue != 212 || braceback.made() - brcBackMade != 2
+        || braceback.gone() - brcBackGone != 2
+        || braceback.copies() - brcBackCopies != 0)                         return 7237;
+    brcBackMade = braceback.made();
+    brcBackGone = braceback.gone();
+    brcBackCopies = braceback.copies();
+    braceback.Sink brcBackNestedSink = {{1}, {2}};
+    if (brcBackNestedSink.which * 100 + brcBackNestedSink.value != 312
+        || braceback.made() - brcBackMade != 2 || braceback.gone() - brcBackGone != 2
+        || braceback.copies() - brcBackCopies != 0)                         return 7238;
+    // Scalar conversions to initializer_list elements use copy-init, which permits the
+    // conversion inside Element(int) even when the source is a double.
+    double brcBackDouble = 1.0;
+    brcBackMade = braceback.made();
+    brcBackGone = braceback.gone();
+    brcBackCopies = braceback.copies();
+    brcBackValue = braceback.function_read({brcBackDouble, braceback.Element(2)});
+    if (brcBackValue != 212 || braceback.made() - brcBackMade != 2
+        || braceback.gone() - brcBackGone != 2
+        || braceback.copies() - brcBackCopies != 0)                         return 7380;
+    brcBackMade = braceback.made();
+    brcBackGone = braceback.gone();
+    brcBackCopies = braceback.copies();
+    brcBackValue = braceback.function_read({1.0, braceback.Element(2)});
+    if (brcBackValue != 212 || braceback.made() - brcBackMade != 2
+        || braceback.gone() - brcBackGone != 2
+        || braceback.copies() - brcBackCopies != 0)                         return 7381;
+    // The first mutable-reference constructor changes the source before the next element.
+    int brcRefOne = 1;
+    if (braceback.reference_read({braceback.ReferenceElement(brcRefOne)}) != 10
+        || brcRefOne != 2)                                                  return 7382;
+    int brcRefTemplate = 1;
+    braceback.keep({braceback.ReferenceElement(brcRefTemplate)});
+    if (brcRefTemplate != 2)                                                return 7383;
+    int brcRefPair = 1;
+    if (braceback.reference_read({braceback.ReferenceElement(brcRefPair), brcRefPair}) != 12
+        || brcRefPair != 3)                                                return 7384;
+    // This call's backing constructions must stay before the later mark() argument.
+    braceback.reset_ordered_events();
+    int brcOrderValue = braceback.ordered_function_read_marked(
+        {braceback.OrderedElement(1), braceback.OrderedElement(2)}, braceback.ordered_mark());
+    if (brcOrderValue != 12 || braceback.ordered_events() != 12965)        return 7385;
+    // A derived source temporary remains alive until its sliced element is destroyed.
+    braceback.reset_ordered_events();
+    int brcDerivedValue = braceback.ordered_function_read(
+        {braceback.DerivedOrderedElement(1), braceback.DerivedOrderedElement(2)});
+    if (brcDerivedValue != 12 || braceback.ordered_events() != 18286565)   return 7386;
+    // LIFO cleanup destroys backing slots in reverse construction order for both paths.
+    braceback.reset_ordered_events();
+    brcOrderValue = braceback.ordered_function_read(
+        {braceback.OrderedElement(1), braceback.OrderedElement(2)});
+    if (brcOrderValue != 12 || braceback.ordered_events() != 1265)         return 7387;
+    braceback.reset_ordered_events();
+    brcOrderValue = braceback.ordered_read(braceback.keep(
+        {braceback.OrderedElement(1), braceback.OrderedElement(2)}));
+    if (brcOrderValue != 12 || braceback.ordered_events() != 1265)         return 7388;
     if (cppcr.BrcPack<long>({2, 3}, 5).which != 2)                         return 7225;
     if (cppcr.BrcPackView<long>({2, 3}, 5).probe() != 25
         || cppcr.BrcPackCopy<long>({2, 3}, 5).probe() != 23
@@ -19521,6 +19774,9 @@ extern int main()
             + convRestCfPPN(convRestPp) + convrest_ppn(convRestPp);
     }
     if (convRestSum != 136 || convrest_counts() - convRestBase2 != 404) return 9793;
+    // IFACECOPY: interface dispatch forwards owned C++ prvalues, with balanced parameter cleanup.
+    int rvCopyStatus = testRvInterfaceArgs();
+    if (rvCopyStatus != 0) return rvCopyStatus;
     // PTRSAFE: an explicit cast between related C++ classes is static_cast (PtrSafeF sits past
     // T305R4Pad in PtrSafeD): the upcast adds the base offset, the downcast subtracts it.
     PtrSafeD ptrSafeD = default;
@@ -25123,6 +25379,108 @@ extern int main()
         if (tr[0] != 21 || tr[1] != 33 || tr[3] != 1 || tr[4] != 1 || tr[5] != 0 || tr[6] != 2) return 99809;
         TrDiscardReferencePlace(true, 1, tr);
         if (tr[0] != 21 || tr[1] != 33 || tr[3] != 1 || tr[4] != 1 || tr[5] != 0 || tr[6] != 2) return 99810;
+        // TERNLEFT4: a selected T&& call is moved into the discarded mixed-join temporary.
+        Tl4DiscardRvalueRef(false, tr);
+        if (tr[0] != 21 || tr[1] != -1 || tr[3] != 1 || tr[4] != 0 || tr[5] != 1 || tr[6] != 2) return 99811;
+        Tl4DiscardRvalueRef(true, tr);
+        if (tr[0] != 21 || tr[1] != 33 || tr[3] != 1 || tr[4] != 1 || tr[5] != 0 || tr[6] != 2) return 99812;
+        // A direct const leaf makes the member-receiver composite const, including its move leaf.
+        Tl4ConditionConst(false, tr);
+        if (tr[0] != 1 || tr[1] != 21 || tr[3] != 2 || tr[4] != 1 || tr[5] != 0 || tr[6] != 3) return 99813;
+        Tl4ConditionConst(true, tr);
+        if (tr[0] != 1 || tr[1] != 21 || tr[3] != 2 || tr[4] != 1 || tr[5] != 0 || tr[6] != 3) return 99814;
+        // A nested place arm beside a prvalue is copied; only its selected getp/idx runs once.
+        Tl4DiscardNested(false, false, tr);
+        if (tr[0] != 21 || tr[1] != 1 || tr[3] != 1 || tr[4] != 1 || tr[5] != 0 || tr[6] != 2) return 99815;
+        Tl4DiscardNested(false, true, tr);
+        if (tr[0] != 21 || tr[1] != 1 || tr[3] != 1 || tr[4] != 1 || tr[5] != 0 || tr[6] != 2) return 99816;
+        Tl4DiscardNested(true, false, tr);
+        if (tr[0] != 21 || tr[1] != 0 || tr[3] != 2 || tr[4] != 0 || tr[5] != 0 || tr[6] != 2) return 99817;
+        Tl4DiscardNested(true, true, tr);
+        if (tr[0] != 21 || tr[1] != 0 || tr[3] != 2 || tr[4] != 0 || tr[5] != 0 || tr[6] != 2) return 99818;
+        // A T&& call joins a same-class prvalue as a value; select both arms at runtime.
+        Tl4RvaluePrvalue(false, tr);
+        if (tr[0] != 9 || tr[1] != 33 || tr[3] != 1 || tr[4] != 0 || tr[5] != 0 || tr[6] != 1) return 99819;
+        Tl4RvaluePrvalue(true, tr);
+        if (tr[0] != 33 || tr[1] != -1 || tr[3] != 0 || tr[4] != 0 || tr[5] != 1 || tr[6] != 1) return 99820;
+        // The same T&& join can initialize an explicitly typed local as well as an inferred one.
+        Tl4RvaluePrvalueTyped(false, tr);
+        if (tr[0] != 9 || tr[1] != 33 || tr[3] != 1 || tr[4] != 0 || tr[5] != 0 || tr[6] != 1) return 99821;
+        Tl4RvaluePrvalueTyped(true, tr);
+        if (tr[0] != 33 || tr[1] != -1 || tr[3] != 0 || tr[4] != 0 || tr[5] != 1 || tr[6] != 1) return 99822;
+        // A pointer/pointer discarded join and both pointer/nullptr orders keep the selected arm.
+        Tl4DiscardPointerJoin(true, 0, tr);
+        if (tr[0] != 11 || tr[1] != 22 || tr[2] != 1 || tr[3] != 0) return 99823;
+        Tl4DiscardPointerJoin(false, 0, tr);
+        if (tr[0] != 11 || tr[1] != 22 || tr[2] != 0 || tr[3] != 1) return 99824;
+        Tl4DiscardPointerJoin(true, 1, tr);
+        if (tr[0] != 11 || tr[1] != 22 || tr[2] != 1 || tr[3] != 0) return 99825;
+        Tl4DiscardPointerJoin(false, 1, tr);
+        if (tr[0] != 11 || tr[1] != 22 || tr[2] != 0 || tr[3] != 0) return 99826;
+        Tl4DiscardPointerJoin(true, 2, tr);
+        if (tr[0] != 11 || tr[1] != 22 || tr[2] != 0 || tr[3] != 0) return 99827;
+        Tl4DiscardPointerJoin(false, 2, tr);
+        if (tr[0] != 11 || tr[1] != 22 || tr[2] != 0 || tr[3] != 1) return 99828;
+        // A true-arm T&& call joins a prvalue or local in a discarded expression like clang.
+        Tl4DiscardTrueRvalueRef(true, 0, tr);
+        if (tr[0] != 21 || tr[1] != -1 || tr[3] != 1 || tr[4] != 0 || tr[5] != 1 || tr[6] != 2) return 99829;
+        Tl4DiscardTrueRvalueRef(false, 0, tr);
+        if (tr[0] != 21 || tr[1] != 33 || tr[3] != 2 || tr[4] != 0 || tr[5] != 0 || tr[6] != 2) return 99830;
+        Tl4DiscardTrueRvalueRef(true, 1, tr);
+        if (tr[0] != 21 || tr[1] != -1 || tr[3] != 1 || tr[4] != 0 || tr[5] != 1 || tr[6] != 2) return 99831;
+        Tl4DiscardTrueRvalueRef(false, 1, tr);
+        if (tr[0] != 21 || tr[1] != 33 || tr[3] != 1 || tr[4] != 1 || tr[5] != 0 || tr[6] != 2) return 99832;
+        // TERNLEFT4 r3: a non-explicit pointer constructor makes both discarded arm orders valid.
+        Tl4DiscardPtrCtor(false, false, tr);
+        if (tr[0] != 9 || tr[1] != 21 || tr[3] != 1 || tr[4] != 0 || tr[5] != 0 || tr[6] != 2) return 99833;
+        Tl4DiscardPtrCtor(true, false, tr);
+        if (tr[0] != 21 || tr[1] != 21 || tr[3] != 1 || tr[4] != 0 || tr[5] != 0 || tr[6] != 2) return 99834;
+        Tl4DiscardPtrCtor(false, true, tr);
+        if (tr[0] != 21 || tr[1] != 21 || tr[3] != 1 || tr[4] != 0 || tr[5] != 0 || tr[6] != 2) return 99835;
+        Tl4DiscardPtrCtor(true, true, tr);
+        if (tr[0] != 9 || tr[1] != 21 || tr[3] != 1 || tr[4] != 0 || tr[5] != 0 || tr[6] != 2) return 99836;
+        // TERNLEFT5: class-pointer joins materialize in value positions like clang.
+        for (int form = 0; form < 5; form++)
+            for (int reverse = 0; reverse < 2; reverse++)
+                for (int kk = 0; kk < 2; kk++)
+                {
+                    Tl5PointerClassValue(kk != 0, reverse != 0, form, tr);
+                    int expected = reverse != 0
+                        ? (kk != 0 ? 9 : 21) : (kk != 0 ? 21 : 9);
+                    if (tr[0] != expected || tr[3] != 1 || tr[4] != 0
+                        || tr[5] != 0 || tr[6] != 2) return 99837 + form * 4 + reverse * 2 + kk;
+                }
+        // A class conversion operator selected by a pointer-result join runs once in either use.
+        for (int discard = 0; discard < 2; discard++)
+            for (int reverse = 0; reverse < 2; reverse++)
+                for (int kk = 0; kk < 2; kk++)
+                {
+                    Tl5PointerConversion(kk != 0, reverse != 0, discard != 0, tr);
+                    int expectedCalls = reverse != 0 ? kk : 1 - kk;
+                    if (tr[0] != (discard != 0 ? -1 : 21) || tr[1] != expectedCalls)
+                        return 99857 + discard * 4 + reverse * 2 + kk;
+                }
+        // TERNLEFT5 r2: preserve the conversion operator's pointer type before joining pointer arms.
+        for (int discard = 0; discard < 2; discard++)
+            for (int reverse = 0; reverse < 2; reverse++)
+                for (int kk = 0; kk < 2; kk++)
+                {
+                    Tl5R2ConstPointerConversion(kk != 0, reverse != 0, discard != 0, tr);
+                    int expectedCalls = reverse != 0 ? kk : 1 - kk;
+                    if (tr[0] != (discard != 0 ? -1 : 21) || tr[1] != expectedCalls)
+                        return 99865 + discard * 4 + reverse * 2 + kk;
+                    Tl5R2DerivedPointerConversion(kk != 0, reverse != 0, discard != 0, tr);
+                    expectedCalls = reverse != 0 ? kk : 1 - kk;
+                    int expectedValue = reverse != 0
+                        ? (kk != 0 ? 21 : 33) : (kk != 0 ? 33 : 21);
+                    if (tr[0] != (discard != 0 ? -1 : expectedValue)
+                        || tr[1] != expectedCalls)
+                        return 99873 + discard * 4 + reverse * 2 + kk;
+                }
+        Tl5R2NullPointerValue(false, tr);
+        if (tr[0] != 9 || tr[3] != 1 || tr[4] != 0 || tr[5] != 0 || tr[6] != 1) return 99883;
+        Tl5R2NullPointerValue(true, tr);
+        if (tr[0] != 0 || tr[3] != 1 || tr[4] != 0 || tr[5] != 0 || tr[6] != 1) return 99884;
         // OBJOIN: an imported-class prvalue arm beside an unmoved place arm copies the place into
         // the prvalue join (was refused as a mixed-ownership join). clang++ -std=c++20 value + sig.
         if (ObjoinAddDefaultPlace(false) != 23 || cppobjoin.Obj.sig() != 110004 || cppobjoin.Obj.live != 0) return 99705;
@@ -29505,6 +29863,298 @@ int CallresTpl() { cpptw.reset_counts(); int baseLive = cpptw.live_allocations()
 int CallresTplExact() { cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0; { cpptw.Twin x = cpptw.Twin(7); value = callres_tplx(1, x); } return T420Pack(value, baseLive); }
 // The rvalue form picks the same overload (its copy counts are the ADL wrapper's, see the issue file).
 int CallresRvalue() { return callres_take(cpptw.Twin(7)); }
+// CALLRES: a bare ADL call with no same-name CFlat overload preserves two prvalue parameters.
+int CallresAdlPrvalueNoStandin()
+{
+    cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0;
+    value = take2(cpptw.Twin(7), cpptw.Twin(8));
+    return T420Pack(value, baseLive);
+}
+// CALLRES: the visible int stand-in loses to the exact ADL class overload.
+int CallresAdlPrvalueWithStandin()
+{
+    cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0;
+    value = callres_take(cpptw.Twin(7));
+    return T420Pack(value, baseLive);
+}
+// Qualified calls keep clang's direct callee parameter construction.
+int CallresQualifiedPrvalue()
+{
+    cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0;
+    value = cpptw.take(cpptw.Twin(7));
+    return T420Pack(value, baseLive);
+}
+// The by-value ADL parameter remains live through the rest of its full-expression.
+int CallresAdlLifetime()
+{
+    rv.C cc = rv.C(4);
+    int observed = rr_adlwrap(cc) * 10 + rv.liveC();
+    return observed * 10 + rv.liveC();
+}
+int CallresQualifiedLifetime()
+{
+    rv.C cc = rv.C(4);
+    int observed = rv.rr(cc) * 10 + rv.liveC();
+    return observed * 10 + rv.liveC();
+}
+// CALLRES r2: hidden friend by-value prvalue plus qualified wrappers whose body uses ADL.
+int CallresHiddenFriendPrvalue()
+{
+    adlwrap2.resetH();
+    int value = hf(adlwrap2.H(5));
+    if (adlwrap2.nestedBody(adlwrap2.N(4)) != 4010) return -1;
+    adlwrap2.N nested = adlwrap2.N(4);
+    if (adlwrap2.nestedBody(nested) != 4010) return -1;
+    return adlwrap2.hiddenPack(value);
+}
+// ADLWRAP3: hidden friend function-template specializations bind the selected native callee.
+int Adlwrap3HiddenTemplatePrvalue()
+{
+    ad.resetHft();
+    int value = hft(ad.HFT(5), 3);
+    return ad.hftPack(value);
+}
+int Adlwrap3HiddenTemplateLvalue()
+{
+    ad.resetHft();
+    int value;
+    {
+        ad.HFT input = ad.HFT(5);
+        value = hft(input, 3);
+    }
+    return ad.hftPack(value);
+}
+// ADLWRAP3: inline-namespace ADL binds for prvalues, lvalues and repeated mixed categories.
+int Adlwrap3InlinePrvalue()
+{
+    ad.resetI();
+    int value = itake(ad.I(5));
+    return ad.iPack(value);
+}
+int Adlwrap3InlineLvalue()
+{
+    ad.resetI();
+    int value;
+    {
+        ad.I input = ad.I(5);
+        value = itake(input);
+    }
+    return ad.iPack(value);
+}
+int Adlwrap3InlineQualifiedPrvalue()
+{
+    ad.resetI();
+    int value = ad.v1.itake(ad.I(5));
+    return ad.iPack(value);
+}
+int Adlwrap3InlinePrvalueThenLvalue()
+{
+    ad.resetI();
+    int value = itake(ad.I(5)) * 100;
+    {
+        ad.I input = ad.I(6);
+        value += itake(input);
+    }
+    return ad.iPack(value);
+}
+int Adlwrap3InlineLvalueThenPrvalue()
+{
+    ad.resetI();
+    int value;
+    {
+        ad.I input = ad.I(5);
+        value = itake(input) * 100;
+    }
+    value += itake(ad.I(6));
+    return ad.iPack(value);
+}
+// ADLWRAP3 r2: non-trivial copy/move constructors with trivial destructors.
+int Adlwrap3NoDtorHiddenTemplatePrvalue()
+{
+    ad3.resetH();
+    int value = hft(ad3.H(5), 3);
+    return ad3.hPack(value);
+}
+int Adlwrap3NoDtorHiddenTemplateLvalue()
+{
+    ad3.resetH();
+    int value;
+    {
+        ad3.H input = ad3.H(5);
+        value = hft(input, 3);
+    }
+    return ad3.hPack(value);
+}
+int Adlwrap3NoDtorQualifiedPrvalue()
+{
+    ad3.resetH();
+    int value = ad3.qtake(ad3.H(5));
+    return ad3.hPack(value);
+}
+int Adlwrap3NoDtorQualifiedLvalue()
+{
+    ad3.resetH();
+    int value;
+    {
+        ad3.H input = ad3.H(5);
+        value = ad3.qtake(input);
+    }
+    return ad3.hPack(value);
+}
+int Adlwrap3NoDtorInlinePrvalue()
+{
+    ad3.resetI();
+    int value = itake(ad3.I(5));
+    return ad3.iPack(value);
+}
+int Adlwrap3NoDtorInlineLvalue()
+{
+    ad3.resetI();
+    int value;
+    {
+        ad3.I input = ad3.I(5);
+        value = itake(input);
+    }
+    return ad3.iPack(value);
+}
+int Adlwrap3NoDtorInlineQualifiedPrvalue()
+{
+    ad3.resetI();
+    int value = ad3.v1.itake(ad3.I(5));
+    return ad3.iPack(value);
+}
+int Adlwrap3NoDtorInlineQualifiedLvalue()
+{
+    ad3.resetI();
+    int value;
+    {
+        ad3.I input = ad3.I(5);
+        value = ad3.v1.itake(input);
+    }
+    return ad3.iPack(value);
+}
+int Adlwrap3TrivialRegisterValue()
+{
+    ad3.resetReg();
+    ad3.Reg input = default;
+    input.value = 5;
+    return ad3.regPack(ad3.take(input));
+}
+// ADLMIX: class by-value arguments bind per parameter for qualified and ADL calls.
+int AdlmixQualifiedPrvalueLvalue()
+{
+    ad3.resetMixed();
+    int value = 0;
+    {
+        ad3.H input = ad3.H(5);
+        value = ad3.mix(ad3.H(5), input);
+    }
+    return ad3.mixPack(value);
+}
+int AdlmixQualifiedLvaluePrvalue()
+{
+    ad3.resetMixed();
+    int value = 0;
+    {
+        ad3.H input = ad3.H(5);
+        value = ad3.mix(input, ad3.H(6));
+    }
+    return ad3.mixPack(value);
+}
+int AdlmixAdlPrvalueLvalue()
+{
+    ad3.resetMixed();
+    int value = 0;
+    {
+        ad3.H input = ad3.H(5);
+        value = adlMix(ad3.H(5), input);
+    }
+    return ad3.mixPack(value);
+}
+int AdlmixAdlLvaluePrvalue()
+{
+    ad3.resetMixed();
+    int value = 0;
+    {
+        ad3.H input = ad3.H(5);
+        value = adlMix(input, ad3.H(6));
+    }
+    return ad3.mixPack(value);
+}
+int AdlmixAdlPrvaluePrvalue()
+{
+    ad3.resetMixed();
+    int value = adlMix(ad3.H(5), ad3.H(6));
+    return ad3.mixPack(value);
+}
+int AdlmixAdlLvalueLvalue()
+{
+    ad3.resetMixed();
+    int value = 0;
+    {
+        ad3.H first = ad3.H(5);
+        ad3.H second = ad3.H(5);
+        value = adlMix(first, second);
+    }
+    return ad3.mixPack(value);
+}
+int AdlmixQualifiedDtorPrvaluePrvalue()
+{
+    ad3.resetMixed();
+    int value = ad3.mixd(ad3.H(5), ad3.D(6));
+    return ad3.mixdPack(value);
+}
+int AdlmixAdlDtorLvaluePrvalue()
+{
+    ad3.resetMixed();
+    int value = 0;
+    {
+        ad3.H input = ad3.H(5);
+        value = adlMixd(input, ad3.D(6));
+    }
+    return ad3.mixdPack(value);
+}
+int AdlmixQualifiedDtorPrvalueLvalue()
+{
+    ad3.resetMixed();
+    int value = 0;
+    {
+        ad3.D input = ad3.D(6);
+        value = ad3.mixd(ad3.H(5), input);
+    }
+    return ad3.mixdPack(value);
+}
+int AdlmixAdlThreeArguments()
+{
+    ad3.resetMixed();
+    int value = 0;
+    {
+        ad3.H input = ad3.H(5);
+        value = adlMix3(2, input, ad3.D(6));
+    }
+    return ad3.mix3Pack(value);
+}
+int AdlmixMethodPrvaluePrvalue()
+{
+    ad3.resetMixed();
+    int value = 0;
+    {
+        ad3.MixHost host = default;
+        value = host.method(ad3.H(5), ad3.D(6));
+    }
+    return ad3.methodPack(value);
+}
+int AdlmixMethodLvaluePrvalue()
+{
+    ad3.resetMixed();
+    int value = 0;
+    {
+        ad3.H input = ad3.H(5);
+        ad3.MixHost host = default;
+        value = host.method(input, ad3.D(6));
+    }
+    return ad3.methodPack(value);
+}
 int callres_after(int z) { return z; }
 // Accept-set: a member of the enclosing struct still hides ADL (clang 33).
 struct CallresMemberHides
@@ -30236,6 +30886,73 @@ int DirordLegs()
     r = DirordLegGlobal();
     if (r != 0) return r;
     return DirordLegPrvalues();
+}
+bool Bvparam2Same(int* want, int n)
+{
+    if (bvparam2.size() != n || bvparam2.live() != 0) return false;
+    for (int i = 0; i < n; i++)
+        if (bvparam2.at(i) != want[i]) return false;
+    return true;
+}
+int Bvparam2Legs()
+{
+    int[9] wantG = { 70, 2, 50, 2, 3, 60, 33, 32, 32 };
+    bvparam2.reset();
+    int fromCall = bvparam2.one(bvparam2.C(bvparam2.g()))
+        + bvparam2.cref2(bvparam2.C(2), bvparam2.C(3));
+    if (fromCall != 25 || !Bvparam2Same(wantG, 9)) return 57101;
+
+    int[8] wantInc = { 2, 50, 2, 3, 60, 33, 32, 32 };
+    bvparam2.reset();
+    int inc = 2;
+    int fromInc = bvparam2.one(bvparam2.C(inc++))
+        + bvparam2.cref2(bvparam2.C(2), bvparam2.C(3));
+    if (fromInc != 25 || inc != 3 || !Bvparam2Same(wantInc, 8)) return 57102;
+
+    int[8] wantDec = { 3, 50, 2, 3, 60, 33, 32, 33 };
+    bvparam2.reset();
+    int dec = 3;
+    int fromDec = bvparam2.one(bvparam2.C(dec--))
+        + bvparam2.cref2(bvparam2.C(2), bvparam2.C(3));
+    if (fromDec != 26 || dec != 2 || !Bvparam2Same(wantDec, 8)) return 57103;
+
+    int[8] wantIndex = { 2, 50, 2, 3, 60, 33, 32, 32 };
+    bvparam2.reset();
+    int fromIndex = bvparam2.one(bvparam2.C(bvparam2.GA[0]))
+        + bvparam2.cref2(bvparam2.C(2), bvparam2.C(3));
+    if (fromIndex != 25 || !Bvparam2Same(wantIndex, 8)) return 57104;
+
+    int[8] wantDeref = { 2, 50, 2, 3, 60, 33, 32, 32 };
+    bvparam2.reset();
+    int fromDeref = bvparam2.one(bvparam2.C(*bvparam2.p))
+        + bvparam2.cref2(bvparam2.C(2), bvparam2.C(3));
+    if (fromDeref != 25 || !Bvparam2Same(wantDeref, 8)) return 57105;
+
+    int[9] wantOperator = { 80, 2, 50, 2, 3, 60, 33, 32, 32 };
+    bvparam2.reset();
+    int fromOperator = bvparam2.one(bvparam2.C(bvparam2.addA + bvparam2.addB))
+        + bvparam2.cref2(bvparam2.C(2), bvparam2.C(3));
+    if (fromOperator != 25 || !Bvparam2Same(wantOperator, 9)) return 57106;
+
+    int[9] wantTemplate = { 70, 2, 52, 2, 3, 60, 33, 32, 32 };
+    bvparam2.reset();
+    int fromTemplate = bvparam2.templateOne(bvparam2.C(bvparam2.g()))
+        + bvparam2.cref2(bvparam2.C(2), bvparam2.C(3));
+    if (fromTemplate != 25 || !Bvparam2Same(wantTemplate, 9)) return 57107;
+
+    int[9] wantMember = { 70, 2, 51, 2, 3, 60, 33, 32, 32 };
+    bvparam2.reset();
+    bvparam2.Host host = default;
+    int fromMember = host.memberOne(bvparam2.C(bvparam2.g()))
+        + bvparam2.cref2(bvparam2.C(2), bvparam2.C(3));
+    if (fromMember != 25 || !Bvparam2Same(wantMember, 9)) return 57108;
+
+    int[9] wantMemberTemplate = { 70, 2, 53, 2, 3, 60, 33, 32, 32 };
+    bvparam2.reset();
+    int fromMemberTemplate = host.memberTemplateOne(bvparam2.C(bvparam2.g()))
+        + bvparam2.cref2(bvparam2.C(2), bvparam2.C(3));
+    if (fromMemberTemplate != 25 || !Bvparam2Same(wantMemberTemplate, 9)) return 57109;
+    return 0;
 }
 int LoweredUserDtorAssignLegs(int argc)
 {
@@ -33437,6 +34154,40 @@ int LoweredUserDtorAssignLegs(int argc)
     if (CallresEnum() != 1) return 93728;
     if (CallresGenericShape() != 1) return 93729;
     if (CallresGenericDefault() != 1) return 93730;
+    if (CallresAdlPrvalueNoStandin() != 152000020) return 93731;
+    if (CallresAdlPrvalueWithStandin() != 71000010) return 93732;
+    if (CallresQualifiedPrvalue() != 71000010) return 93733;
+    if (CallresAdlLifetime() != 421) return 93734;
+    if (CallresQualifiedLifetime() != 421) return 93735;
+    if (CallresHiddenFriendPrvalue() != 510010) return 93736;
+    if (Adlwrap3HiddenTemplatePrvalue() != 811001) return 93737;
+    if (Adlwrap3HiddenTemplateLvalue() != 10811102) return 93738;
+    if (Adlwrap3InlinePrvalue() != 511001) return 93739;
+    if (Adlwrap3InlineLvalue() != 10511102) return 93740;
+    if (Adlwrap3InlineQualifiedPrvalue() != 511001) return 93741;
+    if (Adlwrap3InlinePrvalueThenLvalue() != 60622103) return 93742;
+    if (Adlwrap3InlineLvalueThenPrvalue() != 1050622103) return 93743;
+    if (Adlwrap3NoDtorHiddenTemplatePrvalue() != 811000) return 93744;
+    if (Adlwrap3NoDtorHiddenTemplateLvalue() != 10811100) return 93745;
+    if (Adlwrap3NoDtorQualifiedPrvalue() != 511000) return 93746;
+    if (Adlwrap3NoDtorQualifiedLvalue() != 10511100) return 93747;
+    if (Adlwrap3NoDtorInlinePrvalue() != 511000) return 93748;
+    if (Adlwrap3NoDtorInlineLvalue() != 10511100) return 93749;
+    if (Adlwrap3NoDtorInlineQualifiedPrvalue() != 511000) return 93750;
+    if (Adlwrap3NoDtorInlineQualifiedLvalue() != 10511100) return 93751;
+    if (Adlwrap3TrivialRegisterValue() != 10510) return 93752;
+    if (AdlmixQualifiedPrvalueLvalue() != 5105101) return 93753;
+    if (AdlmixQualifiedLvaluePrvalue() != 105006101) return 93754;
+    if (AdlmixAdlPrvalueLvalue() != 5105101) return 93755;
+    if (AdlmixAdlLvaluePrvalue() != 105006101) return 93756;
+    if (AdlmixAdlPrvaluePrvalue() != 5006001) return 93757;
+    if (AdlmixAdlLvalueLvalue() != 105105201) return 93758;
+    if (AdlmixQualifiedDtorPrvaluePrvalue() != 5006003) return 93759;
+    if (AdlmixAdlDtorLvaluePrvalue() != 105006103) return 93760;
+    if (AdlmixQualifiedDtorPrvalueLvalue() != 5106010) return 93761;
+    if (AdlmixAdlThreeArguments() != 305006103) return 93762;
+    if (AdlmixMethodPrvaluePrvalue() != 5006003) return 93763;
+    if (AdlmixMethodLvaluePrvalue() != 105006103) return 93764;
     // T461: +200 identifies the const copy constructor; +100 identifies the non-const one.
     if (T461LocalFree() != 207) return 46101;
     if (T461LocalMember() != 207) return 46102;
@@ -33618,6 +34369,8 @@ int LoweredUserDtorAssignLegs(int argc)
     // DIRORD: a direct constructor with a by-value class lvalue argument copies it at its position.
     int dirordR = DirordLegs();
     if (dirordR != 0) return dirordR;
+    int bvparam2R = Bvparam2Legs();
+    if (bvparam2R != 0) return bvparam2R;
     // SRCTYPE round 2: unscoped C++ enums promote by their registered C++ type.
     if (srctypeEnumPromotionRound2() != 0) return 27089;
     // SRCTYPE round 4: identity-only sources reach free operators and C++ templates (clang oracle).
@@ -36415,3 +37168,274 @@ void ConstjoinLife(int shape, bool c, int* o)
 int WrapbindJoin(bool c) { int r = 0; { cppwrapbind.Obj x = cppwrapbind.Obj(3); cppwrapbind.Obj.reset(); r = cppwrapbind.use(c ? cppwrapbind.mk(5) : x); } return r; }
 int WrapbindJoinCref(bool c) { int r = 0; { cppwrapbind.Obj x = cppwrapbind.Obj(3); cppwrapbind.Obj.reset(); r = cppwrapbind.use(c ? x.cref() : cppwrapbind.mk(5)); } return r; }
 int WrapbindPlain(bool c) { int r = 0; { cppwrapbind.Obj x = cppwrapbind.Obj(3); cppwrapbind.Obj.reset(); r = c ? cppwrapbind.use(cppwrapbind.mk(5)) : cppwrapbind.use(x); } return r; }
+
+void Tl4DiscardRvalueRef(bool k, int* o)
+{
+    TrZero(o); cppbv.setTernaryRefObject(33); cppbv.TernaryCnt.reset();
+    {
+        cppbv.TernaryCnt x = cppbv.TernaryCnt(21);
+        k ? x : cppbv.grv();
+        o[0] = x.v; o[1] = cppbv.ternaryRefValue();
+    }
+    o[3] = cppbv.TernaryCnt.ctors; o[4] = cppbv.TernaryCnt.copies;
+    o[5] = cppbv.TernaryCnt.moves; o[6] = cppbv.TernaryCnt.dtors;
+}
+
+void Tl4ConditionConst(bool k, int* o)
+{
+    TrZero(o); cppbv.TernaryCnt.reset();
+    {
+        cppbv.TernaryCnt h1 = cppbv.TernaryCnt(21);
+        cppbv.TernaryCnt h2 = cppbv.TernaryCnt(31);
+        const cppbv.TernaryCnt* pc = &h2;
+        o[0] = (k ? *pc : move h1).v > 0 ? 1 : 0;
+        o[1] = h1.v;
+    }
+    o[3] = cppbv.TernaryCnt.ctors; o[4] = cppbv.TernaryCnt.copies;
+    o[5] = cppbv.TernaryCnt.moves; o[6] = cppbv.TernaryCnt.dtors;
+}
+
+void Tl4DiscardNested(bool k, bool j, int* o)
+{
+    TrZero(o); cppbv.TernaryCnt.reset(); cppbv.resetTernaryPlaceCalls();
+    {
+        cppbv.TernaryCnt x = cppbv.TernaryCnt(21);
+        cppbv.TernaryCnt* px = &x;
+        k ? cppbv.mk(9) : (j ? *cppbv.ternaryGetPlace(&x) : px[cppbv.ternaryPlaceIndex()]);
+        o[0] = x.v; o[1] = cppbv.ternaryPlaceCallCount();
+    }
+    o[3] = cppbv.TernaryCnt.ctors; o[4] = cppbv.TernaryCnt.copies;
+    o[5] = cppbv.TernaryCnt.moves; o[6] = cppbv.TernaryCnt.dtors;
+}
+
+void Tl4RvaluePrvalue(bool k, int* o)
+{
+    TrZero(o); cppbv.setTernaryRefObject(33); cppbv.TernaryCnt.reset();
+    {
+        auto value = k ? cppbv.grv() : cppbv.mk(9);
+        o[0] = value.v;
+    }
+    o[1] = cppbv.ternaryRefValue();
+    o[3] = cppbv.TernaryCnt.ctors; o[4] = cppbv.TernaryCnt.copies;
+    o[5] = cppbv.TernaryCnt.moves; o[6] = cppbv.TernaryCnt.dtors;
+}
+
+void Tl4RvaluePrvalueTyped(bool k, int* o)
+{
+    TrZero(o); cppbv.setTernaryRefObject(33); cppbv.TernaryCnt.reset();
+    {
+        cppbv.TernaryCnt value = k ? cppbv.grv() : cppbv.mk(9);
+        o[0] = value.v;
+    }
+    o[1] = cppbv.ternaryRefValue();
+    o[3] = cppbv.TernaryCnt.ctors; o[4] = cppbv.TernaryCnt.copies;
+    o[5] = cppbv.TernaryCnt.moves; o[6] = cppbv.TernaryCnt.dtors;
+}
+
+int Tl4PointerFirstCalls = 0;
+int Tl4PointerSecondCalls = 0;
+cppbv.TernaryCnt* Tl4PointerFirst(cppbv.TernaryCnt* value)
+{
+    Tl4PointerFirstCalls++;
+    return value;
+}
+cppbv.TernaryCnt* Tl4PointerSecond(cppbv.TernaryCnt* value)
+{
+    Tl4PointerSecondCalls++;
+    return value;
+}
+void Tl4DiscardPointerJoin(bool k, int shape, int* o)
+{
+    TrZero(o);
+    {
+        cppbv.TernaryCnt a = cppbv.TernaryCnt(11);
+        cppbv.TernaryCnt b = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt* pa = &a;
+        cppbv.TernaryCnt* pb = &b;
+        Tl4PointerFirstCalls = 0;
+        Tl4PointerSecondCalls = 0;
+        if (shape == 0) k ? Tl4PointerFirst(pa) : Tl4PointerSecond(pb);
+        else if (shape == 1) k ? Tl4PointerFirst(pa) : nullptr;
+        else k ? nullptr : Tl4PointerSecond(pb);
+        o[0] = a.v;
+        o[1] = b.v;
+        o[2] = Tl4PointerFirstCalls;
+        o[3] = Tl4PointerSecondCalls;
+    }
+}
+
+void Tl4DiscardTrueRvalueRef(bool k, int shape, int* o)
+{
+    TrZero(o); cppbv.setTernaryRefObject(33); cppbv.TernaryCnt.reset();
+    {
+        cppbv.TernaryCnt x = cppbv.TernaryCnt(21);
+        if (shape == 0) k ? cppbv.grv() : cppbv.mk(9);
+        else k ? cppbv.grv() : x;
+        o[0] = x.v; o[1] = cppbv.ternaryRefValue();
+    }
+    o[3] = cppbv.TernaryCnt.ctors; o[4] = cppbv.TernaryCnt.copies;
+    o[5] = cppbv.TernaryCnt.moves; o[6] = cppbv.TernaryCnt.dtors;
+}
+
+void Tl4DiscardPtrCtor(bool k, bool reverse, int* o)
+{
+    TrZero(o); cppbv.TernaryPtrJoin.reset();
+    {
+        cppbv.TernaryPtrJoin x = cppbv.TernaryPtrJoin(21);
+        cppbv.TernaryPtrJoin* px = &x;
+        cppbv.TernaryPtrJoin.reset();
+        if (reverse) k ? cppbv.TernaryPtrJoin(9) : px;
+        else k ? px : cppbv.TernaryPtrJoin(9);
+        o[0] = cppbv.TernaryPtrJoin.last; o[1] = x.v;
+    }
+    o[3] = cppbv.TernaryPtrJoin.ctors; o[4] = cppbv.TernaryPtrJoin.copies;
+    o[5] = cppbv.TernaryPtrJoin.moves; o[6] = cppbv.TernaryPtrJoin.dtors;
+}
+
+cppbv.TernaryPtrJoin Tl5ReturnPtrCtor(bool k, bool reverse, cppbv.TernaryPtrJoin* px)
+{
+    if (reverse) return k ? cppbv.TernaryPtrJoin(9) : px;
+    return k ? px : cppbv.TernaryPtrJoin(9);
+}
+
+void Tl5PointerClassValue(bool k, bool reverse, int form, int* o)
+{
+    TrZero(o);
+    {
+        cppbv.TernaryPtrJoin x = cppbv.TernaryPtrJoin(21);
+        cppbv.TernaryPtrJoin* px = &x;
+        cppbv.TernaryPtrJoin.reset();
+        if (form == 0)
+        {
+            if (reverse) { auto value = k ? cppbv.TernaryPtrJoin(9) : px; o[0] = value.v; }
+            else { auto value = k ? px : cppbv.TernaryPtrJoin(9); o[0] = value.v; }
+        }
+        else if (form == 1)
+        {
+            if (reverse) { cppbv.TernaryPtrJoin value = k ? cppbv.TernaryPtrJoin(9) : px; o[0] = value.v; }
+            else { cppbv.TernaryPtrJoin value = k ? px : cppbv.TernaryPtrJoin(9); o[0] = value.v; }
+        }
+        else if (form == 2)
+        {
+            if (reverse) o[0] = cppbv.takeTernaryPtrJoin(k ? cppbv.TernaryPtrJoin(9) : px);
+            else o[0] = cppbv.takeTernaryPtrJoin(k ? px : cppbv.TernaryPtrJoin(9));
+        }
+        else if (form == 3)
+        {
+            if (reverse) o[0] = (k ? cppbv.TernaryPtrJoin(9) : px).v;
+            else o[0] = (k ? px : cppbv.TernaryPtrJoin(9)).v;
+        }
+        else
+        {
+            cppbv.TernaryPtrJoin value = Tl5ReturnPtrCtor(k, reverse, px);
+            o[0] = value.v;
+        }
+    }
+    o[3] = cppbv.TernaryPtrJoin.ctors; o[4] = cppbv.TernaryPtrJoin.copies;
+    o[5] = cppbv.TernaryPtrJoin.moves; o[6] = cppbv.TernaryPtrJoin.dtors;
+}
+
+void Tl5PointerConversion(bool k, bool reverse, bool discard, int* o)
+{
+    TrZero(o);
+    {
+        cppbv.TernaryPtrJoin x = cppbv.TernaryPtrJoin(21);
+        cppbv.TernaryPtrJoin* px = &x;
+        cppbv.TernaryPtrConversion pc = cppbv.TernaryPtrConversion(px);
+        cppbv.TernaryPtrConversion.calls = 0;
+        if (discard)
+        {
+            if (reverse) k ? pc : px;
+            else k ? px : pc;
+            o[0] = -1;
+        }
+        else
+        {
+            if (reverse)
+            {
+                cppbv.TernaryPtrJoin* q = k ? pc : px;
+                o[0] = q->v;
+            }
+            else
+            {
+                cppbv.TernaryPtrJoin* q = k ? px : pc;
+                o[0] = q->v;
+            }
+        }
+        o[1] = cppbv.TernaryPtrConversion.calls;
+    }
+}
+
+void Tl5R2ConstPointerConversion(bool k, bool reverse, bool discard, int* o)
+{
+    TrZero(o);
+    {
+        cppbv.TernaryPtrJoin x = cppbv.TernaryPtrJoin(21);
+        cppbv.TernaryPtrJoin* px = &x;
+        cppbv.TernaryConstPtrConversion.calls = 0;
+        if (discard)
+        {
+            if (reverse) k ? cppbv.TernaryConstPtrConversion(px) : px;
+            else k ? px : cppbv.TernaryConstPtrConversion(px);
+            o[0] = -1;
+        }
+        else
+        {
+            if (reverse)
+            {
+                auto q = k ? cppbv.TernaryConstPtrConversion(px) : px;
+                o[0] = q->v;
+            }
+            else
+            {
+                auto q = k ? px : cppbv.TernaryConstPtrConversion(px);
+                o[0] = q->v;
+            }
+        }
+        o[1] = cppbv.TernaryConstPtrConversion.calls;
+    }
+}
+
+void Tl5R2DerivedPointerConversion(bool k, bool reverse, bool discard, int* o)
+{
+    TrZero(o);
+    {
+        cppbv.TernaryPtrJoin x = cppbv.TernaryPtrJoin(21);
+        cppbv.TernaryPtrJoin* px = &x;
+        cppbv.TernaryDerivedPtrJoin d = cppbv.TernaryDerivedPtrJoin(33);
+        cppbv.TernaryDerivedPtrJoin* pd = &d;
+        cppbv.TernaryDerivedPtrConversion.calls = 0;
+        if (discard)
+        {
+            if (reverse) k ? cppbv.TernaryDerivedPtrConversion(px) : pd;
+            else k ? pd : cppbv.TernaryDerivedPtrConversion(px);
+            o[0] = -1;
+        }
+        else
+        {
+            if (reverse)
+            {
+                cppbv.TernaryPtrJoin* q = k ? cppbv.TernaryDerivedPtrConversion(px) : pd;
+                o[0] = q->v;
+            }
+            else
+            {
+                cppbv.TernaryPtrJoin* q = k ? pd : cppbv.TernaryDerivedPtrConversion(px);
+                o[0] = q->v;
+            }
+        }
+        o[1] = cppbv.TernaryDerivedPtrConversion.calls;
+    }
+}
+
+void Tl5R2NullPointerValue(bool k, int* o)
+{
+    TrZero(o);
+    cppbv.TernaryPtrJoin.reset();
+    {
+        auto value = k ? nullptr : cppbv.TernaryPtrJoin(9);
+        o[0] = value.v;
+    }
+    o[3] = cppbv.TernaryPtrJoin.ctors; o[4] = cppbv.TernaryPtrJoin.copies;
+    o[5] = cppbv.TernaryPtrJoin.moves; o[6] = cppbv.TernaryPtrJoin.dtors;
+}

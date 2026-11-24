@@ -5827,7 +5827,8 @@ public:
         llvm::Value* trueValue, llvm::Value* falseValue, llvm::Value* joined,
         llvm::Value* trueStorage, llvm::Value* falseStorage,
         antlr4::ParserRuleContext* trueCtx, antlr4::ParserRuleContext* falseCtx,
-        antlr4::ParserRuleContext* ctx, std::string* deferredDiagnostic = nullptr);
+        antlr4::ParserRuleContext* ctx, std::string* deferredDiagnostic = nullptr,
+        bool borrowProvenByCaller = false, bool isNullCoalesce = false);
 
     // Shared declaration/assignment predicate for borrowing a named owning pointer source.
     bool ShouldBorrowPlainPointerBinding(
@@ -8182,6 +8183,11 @@ public:
 
     // Build a tuple<T1,T2,...> value from a parenthesized expression list: (e1, e2, ...)
     LLVMBackend::NamedVariable ParseTupleExpression(CFlatParser::TupleExpressionContext* ctx);
+    void PrepareTupleLiteralStringsForAdoption(
+        LLVMBackend::NamedVariable& value, antlr4::ParserRuleContext* ctx);
+    bool ConditionalTupleHasLiteralArms(antlr4::tree::ParseTree* node);
+    void DestroyConditionalTupleStageAfterCopy(antlr4::tree::ParseTree* node,
+        llvm::Value* stageValue, const std::string& typeName);
 
     // Heap-allocate and default-construct a node type for the <Tag> sugar: operator
     // new(sizeof) then the default constructor, returning a typed pointer. Mirrors

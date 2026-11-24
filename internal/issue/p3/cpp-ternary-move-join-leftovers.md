@@ -27,21 +27,42 @@ move ctor, user dtor; [cpp] struct ruling: no implicit copy), not a plain C++ st
   move b` moves `a`; clang copies. Needs const carried on parameter signatures.
 - `_ = move w.lu` on a [cpp] struct FIELD (as for a [cpp] local) destroys in place, no move ctor (item.v 0); clang moves
   into a temp. movedCxxPlace excludes IsCppStructName on purpose (CFlat release design). Same on master.
-- Discarded `k ? x : cppbv.ternaryGetRvalue()` with a `T&&` call result, `k=false`: clang moves from the
-  referent (value -1, ct/cp/mv/dt=1/0/1/2); master and TERNLEFT3 round 2 leave it intact (3, 1/0/0/1).
-  The `k=true` copy case is fixed by round 2 (leg 99810). The sameDirectClassType category now admits the
-  reference join, but the selected rvalue-reference call is not materialized as a move in the discard path.
-  Fix direction: move the selected T&& referent into the discarded join temporary while preserving the
-  lvalue arm's copy.
-
-- TERNLEFT3 review 2 (2026-11-22, same on master): a join used as a CONDITION operand with its own direct const leaf,
-  `(k ? *pc : move h1).v > 0 ? ... : ...` at k=0, moves h1; clang copies it.
-- Same review: a discarded NESTED join of places next to a prvalue, `k ? mk(9) : (j ? *getp(&x) : px[idx()]);`,
-  makes no copy of the selected place; clang copies it (sameDirectClassType excludes nested arms on purpose).
-- Same review: CFlat refuses two joins clang accepts: `k ? px : gpref()` (`T*` against a `T*&` call) and
-  `k ? grv() : mk(9)` (a `T&&` call against a prvalue, "incompatible types 'pointer' and 'rv.T'").
-
 ## Out of scope here (unchanged, not re-measured)
 - By-value first-argument unwind leak (`take2T` with the FIRST argument's copy throwing), master the same.
 - `rq.cref(k ? mkC(1) : mkC(2))` one extra move+destroy vs clang; the direct `rq.cref(mkC(1))` has the same
   mismatch (CFlat-return materialization, not ternary-only).
+
+## TERNLEFT5 (2026-11-22)
+Tuple-element class joins remain open. Exact repro from `scratch/briefs/rev_tupown3_cpp_tuple_join_copies.cb`:
+
+```cflat
+cppbv.TernaryCnt h1 = cppbv.TernaryCnt(21);
+cppbv.TernaryCnt h2 = cppbv.TernaryCnt(22);
+cppbv.TernaryCnt h3 = cppbv.TernaryCnt(23);
+const cppbv.TernaryCnt* pc = &h2;
+cppbv.TernaryCnt x = cppbv.TernaryCnt(24);
+cppbv.TernaryCnt* px = &x;
+(cppbv.TernaryCnt, int) t = (k ? move h1 : (k ? *pc : move h3), 4);
+(cppbv.TernaryCnt, int) u = (k ? *px : cppbv.TernaryCnt(9), 4);
+auto ta = (k ? move h1 : (k ? *pc : move h3), 4);
+auto ua = (k ? *px : cppbv.TernaryCnt(9), 4);
+```
+
+Against declarations initialized directly from the same joins, the first tuple copies `h1` at `k=1`
+(`0/1/0/5`, h1 stays 21) where clang/declaration move it (`0/0/1/5`, h1 becomes -1). The second tuple
+adds one copy and destructor at each selector: k=0 tuple `1/1/0/6` vs declaration `1/0/0/5`; k=1
+tuple `0/2/0/6` vs declaration `0/1/0/5`. A prototype construction into the parsed typed field removed
+one temporary destructor but still copied that field when the tuple literal initialized its declared
+storage. Fixing the full path requires threading the final tuple destination through declaration
+initialization. The inferred `auto` forms above also need an element destination before tuple type
+inference and remain open with this design work.
+
+## Return of a pointer / conversion-operator class join (needs a maintainer ruling)
+With `struct T { int v; }; struct PC { T* p; PC(T* q) : p(q) {} operator T*() const { return p; } };`,
+`T* f(bool k, T* px, T* y) { return k ? px : PC(y); }` is refused ("cannot return the address of a '?:' arm" /
+points into this function's own frame); clang accepts (PC returns the parameter). It cannot be told apart from
+`struct HT { T t; operator T*() { return &t; } }; return k ? y : HT(4);`, which really returns a pointer into a dead
+temporary (and `return k ? y : h;` into a local), the same way `h.get()` / `HG(4).get()` member calls are refused
+(IsFrameOwnedBorrowingMemberCall, MainListener_Statements.cpp). TERNLEFT5 r2 tried exempting every conversion
+operator there and was backed out as a safety hole. Accepting the PC form needs a ruling on borrowed results of
+conversion operators on frame-owned receivers.

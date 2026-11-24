@@ -24,6 +24,15 @@ expect_error("cannot initialize string 'item_0' from nullptr") {
     void tupsafeStringNullTuple() { (string, int) value = (nullptr, 4); }
 }
 
+expect_error("cannot cast an aggregate value") {
+    void tupsafeStringPointerTuple()
+    {
+        string source = "text";
+        string* sourcePointer = &source;
+        (int, string) value = (1, sourcePointer);
+    }
+}
+
 expect_error("cannot initialize string 's' from nullptr") {
     void tupsafeStringNullTernaryDecl()
     {

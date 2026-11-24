@@ -5058,6 +5058,7 @@ bool LLVMBackend::TernaryArmJoinsOwning(llvm::Value* arm, bool includeOwningLoca
 bool LLVMBackend::CanAdoptUniquePointerJoin(llvm::Value* joined)
 {
         if (joined == nullptr || !joined->getType()->isPointerTy()) return false;
+        if (JoinHasUnmovedUniqueAdoptionArm(joined)) return false;
         const auto arms = JoinArmValues(joined);
         if (arms.empty()) return false;
         bool hasValueArm = false;
@@ -5079,6 +5080,57 @@ bool LLVMBackend::CanAdoptUniquePointerJoin(llvm::Value* joined)
         }
         return hasValueArm;
     }
+
+bool LLVMBackend::JoinHasProvenBorrowedArm(const llvm::Value* joined) const
+{
+        std::unordered_set<const llvm::Value*> visited;
+        std::function<bool(const llvm::Value*)> containsBorrow = [&](const llvm::Value* value) {
+            if (value == nullptr || !visited.insert(value).second) return false;
+            const NullCoalesceJoin* join = FindNullCoalesceJoin(value);
+            if (join == nullptr) return false;
+            for (const auto& arm : join->Arms)
+                if (arm.IsProvenBorrowed || containsBorrow(arm.Value)) return true;
+            return false;
+        };
+        return containsBorrow(joined);
+    }
+
+bool LLVMBackend::JoinHasUnmovedUniqueAdoptionArm(const llvm::Value* joined) const
+{
+        std::unordered_set<const llvm::Value*> visited;
+        auto hasUnmovedUniqueOwner = [&](const llvm::Value* storage) {
+            if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(storage))
+                storage = load->getPointerOperand();
+            const auto* local = FindVariableByStorage(storage);
+            if (local == nullptr || local->IsElementAccess) return false;
+            if (local->TypeAndValue.IsUnique || IsCoreUniqueType(local->TypeAndValue.TypeName))
+                return true;
+            return local->IsOwning && local->TypeAndValue.IsMove
+                && IsFunctionParameter(FindVariableNameByStorage(storage));
+        };
+        std::function<bool(const llvm::Value*)> contains = [&](const llvm::Value* value) {
+            if (value == nullptr || !visited.insert(value).second) return false;
+            const NullCoalesceJoin* join = FindNullCoalesceJoin(value);
+            if (join == nullptr) return false;
+            for (const auto& joinArm : join->Arms)
+            {
+                const llvm::Value* arm = joinArm.Value;
+                if (arm != nullptr && !IsMovedOutPtrValue(const_cast<llvm::Value*>(arm)))
+                {
+                    if (joinArm.IsUnmovedUniqueField) return true;
+                    auto source = coreUniqueGetterSource_.find(arm);
+                    if (source != coreUniqueGetterSource_.end())
+                        if (hasUnmovedUniqueOwner(source->second)) return true;
+                    if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(arm);
+                        load != nullptr && hasUnmovedUniqueOwner(load->getPointerOperand()))
+                        return true;
+                }
+                if (contains(arm)) return true;
+            }
+            return false;
+        };
+        return contains(joined);
+}
 
 bool LLVMBackend::IsOwningValueStructValue(llvm::Value* value)
 {

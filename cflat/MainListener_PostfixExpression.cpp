@@ -1986,6 +1986,47 @@ static bool IsSoleCxxClassConstruction(const LLVMBackend& compiler,
         && compiler.IsForeignCxxClassWithConstructors(text.substr(0, open));
 }
 
+static bool IsLiteralOnlyTree(antlr4::tree::ParseTree* node);
+
+static bool IsSimpleCxxClassConstruction(const LLVMBackend& compiler,
+                                         antlr4::tree::ParseTree* node)
+{
+    auto* postfix = SoleCxxConstructionPostfix(node);
+    if (postfix == nullptr || postfix->primaryExpression() == nullptr) return false;
+    auto* generic = postfix->primaryExpression()->genericIdentifier();
+    if (generic == nullptr || generic->Identifier() == nullptr
+        || generic->genericTypeParameters() != nullptr
+        || NamesVisibleVariable(const_cast<LLVMBackend*>(&compiler),
+                               generic->Identifier()->getText()))
+        return false;
+    std::string constructor = generic->Identifier()->getText();
+    for (auto* member : postfix->memberNameToken()) constructor += "." + member->getText();
+    const std::string resolved = compiler.ResolveQualifiedName(constructor);
+    return compiler.IsForeignCxxClassWithConstructors(resolved);
+}
+
+static bool IsSimpleCxxBraceEvaluation(const LLVMBackend& compiler,
+                                       antlr4::tree::ParseTree* node)
+{
+    if (node == nullptr) return false;
+    if (IsLiteralOnlyTree(node)) return true;
+    auto* postfix = SolePostfixExpressionShape(node);
+    if (postfix == nullptr) return false;
+    auto* primary = postfix->primaryExpression();
+    auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
+    if (generic != nullptr && generic->Identifier() != nullptr
+        && generic->genericTypeParameters() == nullptr
+        && postfix->children.size() == 1)
+        return true;
+    if (!IsSimpleCxxClassConstruction(compiler, node)) return false;
+    for (auto* list : postfix->argumentExpressionList())
+        for (auto* argument : list->argumentNamedExpression())
+            if (argument->assignmentExpression() == nullptr
+                || !IsSimpleCxxBraceEvaluation(compiler, argument->assignmentExpression()))
+                return false;
+    return true;
+}
+
 static bool IsLiteralOnlyTree(antlr4::tree::ParseTree* node)
 {
     if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
@@ -12962,6 +13003,26 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         }
                                         else
                                         {
+                                            bool laterCallArgumentsQuiet = true;
+                                            for (size_t later = argIdx + 1;
+                                                 later < namedArgCtx.size(); ++later)
+                                            {
+                                                auto* laterArgument = namedArgCtx[later];
+                                                if (laterArgument->assignmentExpression() == nullptr
+                                                    || !IsCxxInertCallArgument(
+                                                        laterArgument->assignmentExpression()))
+                                                {
+                                                    laterCallArgumentsQuiet = false;
+                                                    break;
+                                                }
+                                            }
+                                            llvm::SaveAndRestore<bool> braceCallOrder(
+                                                cxxDirectConstructionHasLaterSibling_,
+                                                cxxDirectConstructionHasLaterSibling_
+                                                    || !laterCallArgumentsQuiet);
+                                            if (!laterCallArgumentsQuiet
+                                                && cxxDirectConstructionCallOrderSafe_ != nullptr)
+                                                *cxxDirectConstructionCallOrderSafe_ = false;
                                             LLVMBackend::CxxBraceArgument brace;
                                             brace.argumentIndex = arguments.size();
                                             brace.parameterIndex = declaredIdx[argIdx] < 0
@@ -12969,21 +13030,246 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                 : (size_t)declaredIdx[argIdx];
                                             brace.allIntegerLiterals = true;
                                             auto* list = namedArgument->initializerList();
+                                            std::vector<llvm::Value*> preparedBraceSlots;
+                                            if (!laterCallArgumentsQuiet && list != nullptr
+                                                && !list->fieldInit().empty()
+                                                && funcSym != nullptr && funcSym->IsCxx
+                                                && uniqueResolvedCallCandidate
+                                                && !Compiler(ctx)->HasCxxFunctionTemplate(functionName)
+                                                && structVar.BaseType == nullptr
+                                                && implicitCallReceiver.GetValue() == nullptr)
+                                            {
+                                                const size_t functionDot = functionName.rfind('.');
+                                                const bool cxxFreeFunction = functionDot != std::string::npos
+                                                    && Compiler(ctx)->IsCxxNamespace(
+                                                        functionName.substr(0, functionDot))
+                                                    && !Compiler(ctx)->IsDataStructure(
+                                                        functionName.substr(0, functionDot));
+                                                std::string preparedElementType;
+                                                if (cxxFreeFunction
+                                                    && Compiler(ctx)->GetUniqueCxxBraceFunctionClassElementType(
+                                                        functionName, brace.parameterIndex,
+                                                        namedArgCtx.size(), preparedElementType))
+                                                {
+                                                    auto constructionMatches = [&](auto* expression) {
+                                                        if (!IsSimpleCxxClassConstruction(
+                                                                *Compiler(ctx), expression)
+                                                            || !IsSimpleCxxBraceEvaluation(
+                                                                *Compiler(ctx), expression))
+                                                            return false;
+                                                        auto* construction =
+                                                            SoleCxxConstructionPostfix(expression);
+                                                        auto* primary = construction != nullptr
+                                                            ? construction->primaryExpression() : nullptr;
+                                                        auto* generic = primary != nullptr
+                                                            ? primary->genericIdentifier() : nullptr;
+                                                        if (generic == nullptr
+                                                            || generic->Identifier() == nullptr)
+                                                            return false;
+                                                        std::string sourceType =
+                                                            generic->Identifier()->getText();
+                                                        for (auto* member : construction->memberNameToken())
+                                                        {
+                                                            auto* identifier = member->Identifier();
+                                                            if (identifier == nullptr) return false;
+                                                            sourceType += "." + identifier->getText();
+                                                        }
+                                                        sourceType = Compiler(ctx)->ResolveTypeAlias(
+                                                            Compiler(ctx)->ResolveQualifiedName(sourceType));
+                                                        return sourceType == Compiler(ctx)->ResolveTypeAlias(
+                                                            preparedElementType);
+                                                    };
+                                                    bool exactClassElements = true;
+                                                    for (auto* element : list->fieldInit())
+                                                        if (element->initializerList() != nullptr
+                                                            || element->Identifier() != nullptr
+                                                            || element->Colon() != nullptr
+                                                            || element->assignmentExpression().size() != 1
+                                                            || !constructionMatches(
+                                                                element->assignmentExpression(0)))
+                                                        {
+                                                            exactClassElements = false;
+                                                            break;
+                                                        }
+                                                    if (exactClassElements)
+                                                    {
+                                                        LLVMBackend::TypeAndValue elementTv;
+                                                        elementTv.TypeName = preparedElementType;
+                                                        llvm::Type* elementTy = Compiler(ctx)->GetType(elementTv);
+                                                        if (elementTy != nullptr && elementTy->isSized())
+                                                        {
+                                                            const uint64_t align =
+                                                                Compiler(ctx)->GetEffectiveAlignmentForType(
+                                                                    preparedElementType, elementTy);
+                                                            auto* arrayTy = llvm::ArrayType::get(
+                                                                elementTy, list->fieldInit().size());
+                                                            auto* array = Compiler(ctx)->AllocaAtEntry(
+                                                                arrayTy, nullptr,
+                                                                "cxx.brace.early.array", align);
+                                                            for (size_t index = 0;
+                                                                 index < list->fieldInit().size(); ++index)
+                                                                preparedBraceSlots.push_back(
+                                                                    Compiler(ctx)->builder->CreateInBoundsGEP(
+                                                                        arrayTy, array,
+                                                                        { Compiler(ctx)->builder->getInt64(0),
+                                                                          Compiler(ctx)->builder->getInt64(index) },
+                                                                        "cxx.brace.early.element"));
+                                                            brace.preconstructedClassData =
+                                                                Compiler(ctx)->builder->CreateInBoundsGEP(
+                                                                    arrayTy, array,
+                                                                    { Compiler(ctx)->builder->getInt64(0),
+                                                                      Compiler(ctx)->builder->getInt64(0) },
+                                                                    "cxx.brace.early.data");
+                                                            brace.preconstructedClassElementType =
+                                                                preparedElementType;
+                                                            brace.hasPreconstructedClassBacking = true;
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             bool valid = true;
                                             if (list != nullptr)
-                                                for (auto* element : list->fieldInit())
+                                                for (size_t braceIndex = 0;
+                                                     braceIndex < list->fieldInit().size(); ++braceIndex)
                                                 {
-                                                    if (element->initializerList() != nullptr
-                                                        || element->Identifier() != nullptr
+                                                    auto* element = list->fieldInit()[braceIndex];
+                                                    if (element->Identifier() != nullptr
                                                         || element->Colon() != nullptr
-                                                        || element->assignmentExpression().size() != 1)
+                                                        || (element->initializerList() == nullptr
+                                                            && element->assignmentExpression().size() != 1))
                                                     {
                                                         LogErrorContext(element,
                                                             "nested brace lists cannot be passed to C++ yet");
                                                         valid = false;
                                                         break;
                                                     }
+                                                    if (auto* nestedList = element->initializerList())
+                                                    {
+                                                        LLVMBackend::NamedVariable nestedElement;
+                                                        nestedElement.IsRvalue = true;
+                                                        nestedElement.IsCxxDirectConstruction = true;
+                                                        nestedElement.CxxDirectConstructionUsesBraces = true;
+                                                        nestedElement.CxxDirectConstructionCopyListInit = true;
+                                                        bool nestedValid = true;
+                                                        for (auto* nestedField : nestedList->fieldInit())
+                                                        {
+                                                            if (nestedField->initializerList() != nullptr
+                                                                || nestedField->Identifier() != nullptr
+                                                                || nestedField->Colon() != nullptr
+                                                                || nestedField->assignmentExpression().size() != 1)
+                                                            {
+                                                                LogErrorContext(nestedField,
+                                                                    "nested C++ brace-list elements must be flat expressions");
+                                                                nestedValid = false;
+                                                                break;
+                                                            }
+                                                            auto* nestedExpression = nestedField->assignmentExpression(0);
+                                                            llvm::SaveAndRestore<bool> nestedCallArgument(
+                                                                inCxxCallArgument_, false);
+                                                            auto nestedValue = ParseAssignmentExpressionNamed(
+                                                                nestedExpression);
+                                                            if (nestedValue.TypeAndValue.TypeName.empty())
+                                                                if (auto* literalPostfix =
+                                                                        SolePostfixExpressionShape(nestedExpression);
+                                                                    literalPostfix != nullptr
+                                                                        && literalPostfix->children.size() == 1
+                                                                        && literalPostfix->primaryExpression() != nullptr)
+                                                                    if (auto* literal = literalPostfix->primaryExpression()->Constant())
+                                                                    {
+                                                                        const auto literalType =
+                                                                            ParseLiteralTypeAndValue(literal->getText());
+                                                                        nestedValue.TypeAndValue = literalType;
+                                                                        nestedValue.LiteralIdentity =
+                                                                            LLVMBackend::LiteralIdentityForOverload(
+                                                                                literal->getText(),
+                                                                                &nestedValue.LiteralIdentitySuffixed);
+                                                                    }
+                                                            llvm::Value* nestedPrimary = nestedValue.Primary
+                                                                ? nestedValue.Primary
+                                                                : LoadNamedVariable(nestedValue);
+                                                            if (nestedPrimary == nullptr)
+                                                            {
+                                                                nestedValid = false;
+                                                                break;
+                                                            }
+                                                            nestedValue.Primary = nestedPrimary;
+                                                            nestedValue.BaseType = nestedPrimary->getType();
+                                                            nestedValue.TypeAndValue.VariableName.clear();
+                                                            nestedElement.CxxDirectConstructionArguments.push_back(
+                                                                std::move(nestedValue));
+                                                        }
+                                                        if (!nestedValid)
+                                                        {
+                                                            valid = false;
+                                                            break;
+                                                        }
+                                                        brace.hasCxxClassElements = true;
+                                                        brace.hasNestedBraceElements = true;
+                                                        brace.elements.push_back(std::move(nestedElement));
+                                                        brace.allIntegerLiterals = false;
+                                                        ProcessPlusPlus();
+                                                        continue;
+                                                    }
                                                     auto* expression = element->assignmentExpression(0);
+                                                    bool quietTail = true;
+                                                    for (size_t later = braceIndex + 1;
+                                                         later < list->fieldInit().size(); ++later)
+                                                    {
+                                                        auto* laterElement = list->fieldInit()[later];
+                                                        if (laterElement->initializerList() != nullptr
+                                                            || laterElement->Identifier() != nullptr
+                                                            || laterElement->Colon() != nullptr
+                                                            || laterElement->assignmentExpression().size() != 1
+                                                            || !IsSimpleCxxBraceEvaluation(
+                                                                *Compiler(ctx),
+                                                                laterElement->assignmentExpression(0)))
+                                                        {
+                                                            quietTail = false;
+                                                            break;
+                                                        }
+                                                    }
+                                                    const bool directSlotConstruction =
+                                                        brace.hasPreconstructedClassBacking
+                                                        && IsSimpleCxxClassConstruction(
+                                                            *Compiler(ctx), expression)
+                                                        && IsSimpleCxxBraceEvaluation(
+                                                            *Compiler(ctx), expression);
+                                                    const bool safeConstruction =
+                                                        IsSimpleCxxClassConstruction(
+                                                            *Compiler(ctx), expression)
+                                                        && IsSimpleCxxBraceEvaluation(*Compiler(ctx), expression)
+                                                        && quietTail
+                                                        && !cxxDirectConstructionHasLaterSibling_
+                                                        && (cxxDirectConstructionCallOrderSafe_ == nullptr
+                                                            || *cxxDirectConstructionCallOrderSafe_);
+                                                    const bool outerConstructionSafe =
+                                                        cxxDirectConstructionCanDefer_
+                                                        && cxxDirectConstructionArgument_ == expression
+                                                        && !cxxDirectConstructionHasLaterSibling_
+                                                        && (cxxDirectConstructionCallOrderSafe_ == nullptr
+                                                            || *cxxDirectConstructionCallOrderSafe_);
+                                                    const bool armConstruction = safeConstruction
+                                                        || outerConstructionSafe
+                                                        || directSlotConstruction;
+                                                    llvm::SaveAndRestore<CFlatParser::AssignmentExpressionContext*>
+                                                        directConstructionArgument(
+                                                            cxxDirectConstructionArgument_,
+                                                            armConstruction ? expression
+                                                                : cxxDirectConstructionArgument_);
+                                                    llvm::SaveAndRestore<bool> directConstructionCanDefer(
+                                                        cxxDirectConstructionCanDefer_, armConstruction);
+                                                    llvm::SaveAndRestore<bool> directConstructionHasLaterSibling(
+                                                        cxxDirectConstructionHasLaterSibling_,
+                                                        (safeConstruction || directSlotConstruction) ? false
+                                                            : cxxDirectConstructionHasLaterSibling_);
+                                                    llvm::SaveAndRestore<bool*> directConstructionOrderSafe(
+                                                        cxxDirectConstructionCallOrderSafe_,
+                                                        (safeConstruction || directSlotConstruction) ? nullptr
+                                                            : cxxDirectConstructionCallOrderSafe_);
+                                                    llvm::SaveAndRestore<bool> directConstructionBraceElement(
+                                                        cxxDirectConstructionBraceElement_,
+                                                        armConstruction ? true
+                                                            : cxxDirectConstructionBraceElement_);
                                                     brace.allIntegerLiterals = brace.allIntegerLiterals
                                                         && JsonConstIntegerToken(expression->getText());
                                                     Compiler(ctx)->lastCxxRetTemp_ = nullptr;
@@ -13060,6 +13346,19 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                         Compiler(ctx)->lastCxxRetTemp_;
                                                     LLVMBackend::NamedVariable elementVar = elementNV;
                                                     elementVar.Primary = elementValue;
+                                                    const bool scalarLvalue = !cxxClassElement
+                                                        && elementNV.Storage != nullptr
+                                                        && !elementNV.IsRvalue
+                                                        && !elementNV.IsExplicitMove
+                                                        && !elementNV.TypeAndValue.IsConstObject()
+                                                        && !elementNV.IsCxxMacroGlobal
+                                                        && !elementNV.IsCxxMacroJoin
+                                                        && !Compiler(ctx)->IsNullPointerConstantArgument(
+                                                            elementNV, true)
+                                                        && !Compiler(ctx)->IsImportedEnumeratorStorage(
+                                                            elementNV.Storage)
+                                                        && (elementValue->getType()->isIntegerTy()
+                                                            || elementValue->getType()->isFloatingPointTy());
                                                     // Keep an lvalue's address for its C++ copy ctor. A
                                                     // class call result carries its sret temp and must use
                                                     // the move ctor before the ordinary temp destructor.
@@ -13073,6 +13372,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                         elementVar.IsRvalue = cxxRetTemp != nullptr
                                                             || elementNV.IsRvalue;
                                                     }
+                                                    else if (scalarLvalue)
+                                                        elementVar.Storage = elementNV.Storage;
                                                     else
                                                         elementVar.Storage = nullptr;
                                                     elementVar.BaseType = elementValue->getType();
@@ -13082,7 +13383,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                             expression->getText(),
                                                             &elementVar.LiteralIdentitySuffixed);
                                                     elementVar.TypeAndValue.VariableName.clear();
-                                                    if (!cxxClassElement) elementVar.IsRvalue = true;
+                                                    if (!cxxClassElement && !scalarLvalue)
+                                                        elementVar.IsRvalue = true;
                                                     // An imported enumerator or integer macro keeps its typed constant
                                                     // spelling: clang reads it as a constant expression, not a variable.
                                                     if (!cxxClassElement)
@@ -13090,6 +13392,21 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                         elementVar.CxxImportedLiteral =
                                                             Compiler(ctx)->CxxImportedConstantLiteral(elementNV);
                                                         Compiler(ctx)->RecordCxxConstantBraceElement(elementVar, elementValue);
+                                                    }
+                                                    std::string backingError;
+                                                    if (brace.hasPreconstructedClassBacking
+                                                        && !Compiler(ctx)->EmitCxxBraceElementToSlot(
+                                                            elementVar,
+                                                            brace.preconstructedClassElementType,
+                                                            preparedBraceSlots[braceIndex],
+                                                            "into a brace-list element",
+                                                            backingError, true))
+                                                    {
+                                                        LogErrorContext(element, backingError.empty()
+                                                            ? "cannot construct C++ brace-list element in its backing slot"
+                                                            : backingError);
+                                                        valid = false;
+                                                        break;
                                                     }
                                                     brace.elements.push_back(std::move(elementVar));
                                                     ProcessPlusPlus();
@@ -13193,11 +13510,20 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     {
                                         LLVMBackend::TypeAndValue ctorTarget;
                                         if (Compiler(ctx)->GetUniqueCxxConstructorParameter(
-                                                functionName, argIdx, namedArgCtx.size(), ctorTarget)
-                                            && isVoidPointerDestination(ctorTarget))
+                                                functionName, argIdx, namedArgCtx.size(), ctorTarget))
                                         {
-                                            argExpectedDest = ctorTarget;
-                                            uniqueVoidConstructorDestination = true;
+                                            const bool byValueClass = !ctorTarget.Pointer
+                                                && ctorTarget.PointerDepth == 0 && !ctorTarget.IsAlias
+                                                && !ctorTarget.IsRvalueRef
+                                            && !HasDefaultOnlyTernaryArm(argumentExpression)
+                                                && Compiler(ctx)->IsForeignNontrivialCxxClass(
+                                                    Compiler(ctx)->ResolveTypeAlias(ctorTarget.TypeName));
+                                            if (byValueClass || isVoidPointerDestination(ctorTarget))
+                                            {
+                                                argExpectedDest = ctorTarget;
+                                                uniqueVoidConstructorDestination =
+                                                    isVoidPointerDestination(ctorTarget);
+                                            }
                                         }
                                     }
                                     bool uniqueGenericVoidDestination = false;
@@ -13919,14 +14245,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         (cxxDirectConstructionSink || directConstructionParent)
                                         && IsSoleCxxClassConstruction(
                                             *Compiler(ctx), namedArgument->assignmentExpression());
+                                    const std::string directTemplateOwnerType = structVar.BaseType != nullptr
+                                        ? structVar.TypeAndValue.TypeName : std::string();
+                                    const std::string directTemplateName = directTemplateOwnerType.empty()
+                                        ? functionName : primaryIdentifier;
                                     const bool cxxTemplateDirectTypeParameter = cxxTemplateWrapper
-                                        && structVar.BaseType == nullptr
                                         && cxxDirectConstructionSink
                                         && Compiler(ctx)->IsCxxFunctionTemplateParameterDirectType(
-                                            structVar.BaseType != nullptr
-                                                ? primaryIdentifier : functionName,
-                                            structVar.BaseType != nullptr
-                                                ? structVar.TypeAndValue.TypeName : std::string(),
+                                            directTemplateName, directTemplateOwnerType,
                                             argIdx, namedArgCtx.size());
                                     auto isLiteralArgumentTree = [&](auto&& self,
                                                                      antlr4::tree::ParseTree* node) -> bool {
@@ -14014,6 +14340,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     }
                                     bool directConstructionHasMutableRefParameter = false;
                                     bool directConstructionHasNonSimpleArgument = false;
+                                    bool directConstructionHasClassParameter = false;
+                                    bool directConstructionHasScalarConstructor = false;
                                     const bool directConstructionIsImmovableTemplateArgument =
                                         cxxTemplateWrapper && directClassConstructionArgument
                                         && ((!argExpectedDest.TypeName.empty()
@@ -14040,39 +14368,64 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                 for (const auto& constructorArg : constructorArgs)
                                                 {
                                                     auto* expression = constructorArg->assignmentExpression();
-                                                    if (IsCxxInertCallArgument(expression)
-                                                        || IsCxxSideEffectFreeScalarExpression(expression))
-                                                        continue;
-                                                    if (isLiteralArgumentTree(isLiteralArgumentTree, expression))
-                                                        continue;
-                                                    auto* identifier = BareIdentifierInExpression(expression);
-                                                    const bool isVariable = identifier != nullptr
-                                                        && (Compiler(ctx)->GetScopedLocalOrArgument(
-                                                                identifier->getText()).Storage != nullptr
-                                                            || Compiler(ctx)->GetScopedLocalOrArgument(
-                                                                identifier->getText()).Primary != nullptr
-                                                            || Compiler(ctx)->HasMemberVariable(
-                                                                identifier->getText())
-                                                            || Compiler(ctx)->globalNamedVariable.contains(
-                                                                identifier->getText()));
-                                                    if (!isVariable)
+                                                    const bool isSimpleArgument =
+                                                        IsCxxInertCallArgument(expression)
+                                                        || IsCxxSideEffectFreeScalarExpression(expression)
+                                                        || isLiteralArgumentTree(isLiteralArgumentTree, expression);
+                                                    if (!isSimpleArgument)
                                                     {
-                                                        directConstructionHasNonSimpleArgument = true;
-                                                        break;
+                                                        auto* identifier = BareIdentifierInExpression(expression);
+                                                        bool isVariable = false;
+                                                        if (identifier != nullptr)
+                                                        {
+                                                            const std::string name = identifier->getText();
+                                                            const auto local =
+                                                                Compiler(ctx)->GetScopedLocalOrArgument(name);
+                                                            isVariable = !local.TypeAndValue.TypeName.empty();
+                                                            if (!isVariable)
+                                                            {
+                                                                const LLVMBackend::StructData* owner = nullptr;
+                                                                const LLVMBackend::BitfieldInfo* bitfield = nullptr;
+                                                                int fieldIndex = -1;
+                                                                if (Compiler(ctx)->FindImplicitThisField(
+                                                                        name, &owner, &fieldIndex, &bitfield) != nullptr)
+                                                                    isVariable = true;
+                                                                else
+                                                                    isVariable = Compiler(ctx)->globalVariableTypes
+                                                                        .contains(name)
+                                                                        || Compiler(ctx)->globalNamedVariable
+                                                                            .contains(name);
+                                                            }
+                                                        }
+                                                        if (!isVariable)
+                                                            directConstructionHasNonSimpleArgument = true;
                                                     }
                                                 }
                                                 for (const auto& ctor : info->constructors)
                                                 {
                                                     if (ctor.params.size() != constructorArgs.size() + 1) continue;
+                                                    bool scalarConstructor = true;
                                                     for (size_t i = 0; i < constructorArgs.size(); ++i)
                                                     {
                                                         const auto& param = ctor.params[i + 1];
+                                                        const bool classParameter = !param.TypeName.empty()
+                                                            && (param.IsCxxRef()
+                                                                || (!param.Pointer && param.PointerDepth == 0))
+                                                            && Compiler(ctx)->cxxRecordEntries_.contains(
+                                                                Compiler(ctx)->ResolveTypeAlias(
+                                                                    param.TypeName));
+                                                        if (classParameter)
+                                                            directConstructionHasClassParameter = true;
+                                                        if (!param.IsPrimitive() || param.Pointer)
+                                                            scalarConstructor = false;
                                                         if (!param.IsCxxRef() || param.CxxConstRef()
                                                             || param.IsRvalueRef)
                                                             continue;
                                                         directConstructionHasMutableRefParameter = true;
                                                         break;
                                                     }
+                                                    if (scalarConstructor)
+                                                        directConstructionHasScalarConstructor = true;
                                                     if (directConstructionHasMutableRefParameter) break;
                                                 }
                                             }
@@ -14086,7 +14439,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                     && !cxxConstructorCall
                                                     && cxxDirectConstructionSink)
                                                 || directConstructionHasMutableRefParameter
-                                                || directConstructionHasNonSimpleArgument
+                                                || (directConstructionHasNonSimpleArgument
+                                                    && directConstructionHasClassParameter
+                                                    && !directConstructionHasScalarConstructor)
                                                 || directConstructionIsImmovableTemplateArgument)
                                             && !hasLaterConstructionSibling
                                             && (cxxDirectConstructionCallOrderSafe_ == nullptr
@@ -14783,6 +15138,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
 
                                     if (argName)
                                         argVar.TypeAndValue.VariableName = argName->getText();
+                                    // Deferred direct construction consumes this value snapshot instead of
+                                    // re-evaluating the source expression after later arguments.
                                     argVar.Primary = argValue;
                                     argVar.BaseType = argValue->getType();
                                     argVar.IsCxxMacroGlobal = argNV.IsCxxMacroGlobal;
@@ -16053,7 +16410,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 if (cxxDirectConstructionTargetType_.TypeName.empty()
                                     || cxxDirectConstructionTargetType_.TypeName == "auto")
                                     return true;
-                                return compiler->GetType(cxxDirectConstructionTargetType_) == objectType;
+                                auto target = cxxDirectConstructionTargetType_;
+                                if (target.Pointer)
+                                {
+                                    if (target.ElemPointer || target.IsAlias || target.IsCxxRefToPointer
+                                        || target.PointerDepth > 1)
+                                        return false;
+                                    target.Pointer = false;
+                                    target.PointerDepth = 0;
+                                }
+                                return compiler->GetType(target) == objectType;
                             };
                             if (foreignCxxConstructor && !newFunctionalElisionHere
                                 && arguments.size() == 1
@@ -16108,6 +16474,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     deferred.IsRvalue = true;
                                     deferred.IsCxxDirectConstruction = true;
                                     deferred.CxxDirectConstructionType = functionName;
+                                    // Constructor operands were evaluated into argVar.Primary at their source positions.
                                     deferred.CxxDirectConstructionArguments = arguments;
                                 }
                                 // A brace element whose arguments cannot cross keeps the eager temp.
@@ -19371,6 +19738,65 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
                 nv.IsNullptrLiteral = true;
             }
             auto* loaded = LoadNamedVariable(nv);
+            const bool expectedStringElement = !expectedFields.empty()
+                && !expectedFields[i].Pointer
+                && compiler->ResolveTypeAlias(expectedFields[i].TypeName) == "string";
+            auto isNarrowStringLiteralOrJoin = [&](auto&& self,
+                    antlr4::tree::ParseTree* node) -> bool {
+                if (node == nullptr) return false;
+                if (auto literal = StringLiteralExpressionValue(node); literal.has_value())
+                    return literal->IsNarrow;
+                if (auto* expression = dynamic_cast<CFlatParser::ExpressionContext*>(node))
+                    return expression->assignmentExpression() != nullptr
+                        && self(self, expression->assignmentExpression());
+                if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
+                    return assignment->assignmentOperator() == nullptr
+                        && assignment->conditionalExpression() != nullptr
+                        && self(self, assignment->conditionalExpression());
+                if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node))
+                {
+                    if (conditional->Question() != nullptr)
+                        return conditional->expression() != nullptr
+                            && conditional->conditionalExpression() != nullptr
+                            && self(self, conditional->expression())
+                            && self(self, conditional->conditionalExpression());
+                }
+                auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+                return rule != nullptr && rule->children.size() == 1
+                    && self(self, rule->children.front());
+            };
+            auto* entryAssignment = entry->assignmentExpression();
+            auto* entryConditional = entryAssignment != nullptr
+                ? entryAssignment->conditionalExpression() : nullptr;
+            const bool stringLiteralConditional = expectedStringElement
+                && entryConditional != nullptr && entryConditional->Question() != nullptr
+                && entryConditional->expression() != nullptr
+                && entryConditional->conditionalExpression() != nullptr
+                && isNarrowStringLiteralOrJoin(isNarrowStringLiteralOrJoin,
+                    entryConditional->expression())
+                && isNarrowStringLiteralOrJoin(isNarrowStringLiteralOrJoin,
+                    entryConditional->conditionalExpression());
+            const bool charPointerElement = nv.TypeAndValue.Pointer
+                && nv.TypeAndValue.PointerDepth == 1
+                && compiler->ResolveTypeAlias(nv.TypeAndValue.TypeName) == "char";
+            if (loaded != nullptr && loaded->getType()->isPointerTy()
+                && ((expectedStringElement
+                        && (nv.IsStringLiteral || charPointerElement || stringLiteralConditional))
+                    || (expectedFields.empty() && nv.IsStringLiteral)))
+            {
+                auto* wrapped = compiler->WrapStringLiteralAsString(loaded);
+                auto* stringType = llvm::StructType::getTypeByName(*compiler->context, "string");
+                if (stringType != nullptr && wrapped != nullptr && wrapped->getType() == stringType)
+                {
+                    loaded = wrapped;
+                    nv.TypeAndValue = LLVMBackend::TypeAndValue{ .TypeName = "string" };
+                    nv.BaseType = stringType;
+                    nv.Primary = loaded;
+                    nv.Storage = nullptr;
+                    nv.IsRvalue = true;
+                    nv.IsStringLiteral = stringLiteralConditional;
+                }
+            }
             // Record the source element as a scalar call argument would carry it (width from the value).
             auto elementRecord = nv;
             if (elementRecord.BaseType == nullptr && loaded != nullptr)
@@ -19438,10 +19864,10 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
                         compiler->CanAdoptUniquePointerJoin(loaded);
                     const bool owned = IsOwnedUniqueInitializerSource(
                         compiler, nv, loaded, ownedUniquePointerJoin);
-                    // A non-adoptable join is borrowed only when the fallback has no ownership proof.
-                    const bool borrowedJoin = !moved && !owned
-                        && !compiler->JoinArmValues(loaded).empty()
-                        && !ownedUniquePointerJoin;
+                    // A proven borrowed arm stays borrowed even if `new` left ownership state set.
+                    const auto joinedArms = compiler->JoinArmValues(loaded);
+                    const bool borrowedJoin = !joinedArms.empty() && !ownedUniquePointerJoin
+                        && (compiler->JoinHasProvenBorrowedArm(loaded) || (!moved && !owned));
                     const std::string borrowedParamCall = BorrowedParameterCallName(nv, loaded);
                     // An explicit move of a proven borrow stays a borrow (declaration srcIsBorrowed rule).
                     const bool borrowedMove = moved && nv.IsBorrowed && !compiler->lastMovedFromContainerSlot;
@@ -19704,6 +20130,25 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
                 if (tupleTargetUse == TupleLiteralTargetUse::CallArgument)
                     compiler->RegisterOwnedStructTemp(gep, tupleElementOwnerTypes[i]);
             }
+            else if (!structData.StructFields[i].Pointer
+                && compiler->ResolveTypeAlias(structData.StructFields[i].TypeName) == "string"
+                && (tupleTargetUse == TupleLiteralTargetUse::CallArgument
+                    || tupleTargetUse == TupleLiteralTargetUse::Declaration
+                    || tupleTargetUse == TupleLiteralTargetUse::Assignment)
+                && (compiler->IsPendingOwnedStringTemp(elemValues[i])
+                    || tupleLiteralElements[i].IsExplicitMove))
+            {
+                compiler->UnregisterOwnedStringTemp(elemValues[i]);
+                if (tupleTargetUse == TupleLiteralTargetUse::CallArgument)
+                    compiler->RegisterOwnedStructTemp(gep, "string");
+            }
+            else if (compiler->IsPendingOwnedStringTemp(elemValues[i])
+                && !compiler->IsCopyableType(mangledName))
+            {
+                compiler->UnregisterOwnedStringTemp(elemValues[i]);
+                if (tupleTargetUse == TupleLiteralTargetUse::CallArgument)
+                    compiler->RegisterOwnedStructTemp(gep, structData.StructFields[i].TypeName);
+            }
         }
 
         LLVMBackend::NamedVariable result;
@@ -19712,6 +20157,9 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
         result.TypeAndValue = tupleType;
         result.IsTupleLiteral = true;
         result.TupleLiteralElements = std::move(tupleLiteralElements);
+        if (tupleTargetUse == TupleLiteralTargetUse::Declaration
+            || tupleTargetUse == TupleLiteralTargetUse::Assignment)
+            PrepareTupleLiteralStringsForAdoption(result, ctx);
         return result;
     }
 

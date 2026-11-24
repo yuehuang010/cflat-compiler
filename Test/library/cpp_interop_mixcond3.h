@@ -37,6 +37,13 @@ struct BV
     ~BV() noexcept { t513M3Sequence = t513M3Sequence * 10 + 7; }
 };
 
+struct W
+{
+    int v;
+    W(BV b) noexcept : v(b.v + 1000) {}
+    W(int x, BV b) noexcept : v(b.v + x + 1000) {}
+};
+
 inline A mkA(int value) noexcept { return A(value); }
 inline BV mkBV(int value = 20) noexcept { return BV(value); }
 inline int ctakeBV(BV value) noexcept { return value.v; }

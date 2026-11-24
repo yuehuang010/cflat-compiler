@@ -4428,30 +4428,13 @@ bool LLVMBackend::RequestCxxFunctionTemplateOnce(const std::string& functionName
                     arrayTy, array, { builder->getInt64(0), builder->getInt64(index) },
                     "cxx.tpl.brace.element");
                 NamedVariable& source = brace.elements[index];
-                auto* src = source.Storage;
-                if (src == nullptr && source.IsRvalue && source.Primary != nullptr
-                    && source.Primary->getType() == elementTy && elementTy->isStructTy()
-                    && HasTrivialCxxDtor(backed->second.second))
-                {
-                    src = AllocaAtEntry(elementTy, nullptr, "cxx.tpl.brace.source", align);
-                    builder->CreateStore(source.Primary, src);
-                }
-                if (src == nullptr
-                    || !EmitCxxCopyOrMoveConstruct(
-                        backed->second.second, dst, src, source.IsExplicitMove || source.IsRvalue,
-                        "into a function-template initializer_list element"))
-                {
-                    if (src == nullptr)
-                        error = std::format("cannot copy C++ class '{}' into a brace-list element: "
-                                            "the element is not addressable",
-                                            DisplayCxxClassName(backed->second.second));
+                if (!EmitCxxBraceElementToSlot(source, backed->second.second, dst,
+                        "into a function-template initializer_list element", error, false))
                     return false;
-                }
                 slots.push_back(dst);
             }
             if (IsForeignNontrivialCxxClass(backed->second.second))
-                for (auto it = slots.rbegin(); it != slots.rend(); ++it)
-                    RegisterOwnedStructTemp(*it, backed->second.second);
+                for (auto* slot : slots) RegisterOwnedStructTemp(slot, backed->second.second);
             auto* dataPtr = builder->CreateInBoundsGEP(
                 arrayTy, array, { builder->getInt64(0), builder->getInt64(0) },
                 "cxx.tpl.brace.data");
@@ -4514,31 +4497,31 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                 return false;
             }
         }
-        if (!infixOperator.empty() || adlCall || !braceGroups.empty() || !memberOwnerType.empty())
+        if (!infixOperator.empty() || !braceGroups.empty() || !memberOwnerType.empty())
             return true;
         return SwitchCxxDirectByValueCall(functionName, arguments, registeredName, error,
-                                          typeDefaultTrailing);
+                                          typeDefaultTrailing, nullptr, adlCall);
 }
 
 /*
- * T518: C++ copy-initializes a by-value class parameter at its argument's own position, before
- * the later arguments run. Through the generated wrapper (`T &pN` parameters) that copy would be
- * made inside the wrapper, after every argument. So a non-trivially-copyable class lvalue that a
- * later argument names is copy-constructed at its position behind a decision (the call site, see
- * CxxEarlyCopySlot), and when clang's selected callee takes it by value the call bypasses the
- * wrapper: the selected callee is called through its address (a generated getter), on the
- * by-value C++ ABI path, with that copy as the owned prvalue parameter - one copy, in order.
+ * A C++ by-value class parameter can outlive a generated forwarding wrapper's call expression.
+ * ADL calls with a selected callee symbol therefore bypass that wrapper on the C++ by-value ABI.
+ * T518 also uses this route when a caller-side early copy must precede a later argument that can
+ * mutate the source; that copy becomes the owned prvalue parameter.
  */
 bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
                                              std::vector<NamedVariable>& arguments,
                                              std::string& registeredName, std::string& error,
                                              bool typeDefaultTrailing,
-                                             const std::vector<size_t>* knownByValueArguments)
+                                             const std::vector<size_t>* knownByValueArguments,
+                                             bool adlCall)
 {
         if (lastCxxFreeWrapperLinkage_.empty()
             || std::none_of(arguments.begin(), arguments.end(), [&](const NamedVariable& a) {
                    return a.CxxEarlyCopySlot != nullptr
                        || (a.IsCxxPrvalueTemp && a.Storage != nullptr && !a.TypeAndValue.Pointer
+                           && IsCxxRecord(a.TypeAndValue.TypeName))
+                   || (adlCall && !a.IsCxxDirectConstruction && !a.TypeAndValue.Pointer
                            && IsCxxRecord(a.TypeAndValue.TypeName));
                }))
             return true;
@@ -4558,6 +4541,7 @@ bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
         const std::string calleeType = wrapperSig->selectedCalleeType;
         const std::string calleeOwner = wrapperSig->selectedCalleeOwner;
         const std::string calleeTemplateArgs = wrapperSig->selectedCalleeTemplateArgs;
+        const std::string calleeSymbol = wrapperSig->selectedCalleeSymbol;
         const std::vector<cflat_cinterop::RawDefaultArg> calleeDefaults = wrapperSig->selectedCalleeDefaults;
         const bool instanceWrapper = wrapperSig->isInstanceTemplateWrapper;
         const size_t argumentOffset = instanceWrapper ? 1 : 0;
@@ -4580,12 +4564,44 @@ bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
                 || (knownByValueArguments != nullptr
                     && std::find(knownByValueArguments->begin(), knownByValueArguments->end(), i)
                         != knownByValueArguments->end());
+            const bool adlClassByValue = adlCall && !arguments[i].IsCxxDirectConstruction
+                && !calleeSymbol.empty() && !calleeOwner.empty()
+                && !arguments[i].TypeAndValue.Pointer
+                && IsCxxRecord(arguments[i].TypeAndValue.TypeName);
             if (selectedByValue
                 && (arguments[i].CxxEarlyCopySlot != nullptr
                     || (arguments[i].IsCxxPrvalueTemp && arguments[i].Storage != nullptr
                         && !arguments[i].TypeAndValue.Pointer
-                        && IsCxxRecord(arguments[i].TypeAndValue.TypeName))))
+                        && IsCxxRecord(arguments[i].TypeAndValue.TypeName))
+                    || adlClassByValue))
                 byValue.push_back(i);
+        }
+        std::string noDtorByValueBindingPattern;
+        flat = 0;
+        for (size_t i = 0; i < arguments.size(); ++i)
+        {
+            const NamedVariable& argument = arguments[i];
+            const bool selectedByValue = (flat < bindKinds.size() && bindKinds[flat] == 'v')
+                || (knownByValueArguments != nullptr
+                    && std::find(knownByValueArguments->begin(), knownByValueArguments->end(), i)
+                        != knownByValueArguments->end());
+            if (selectedByValue && !argument.TypeAndValue.Pointer
+                && IsCxxRecord(argument.TypeAndValue.TypeName)
+                && !IsCxxTriviallyCopyableRecord(argument.TypeAndValue.TypeName))
+            {
+                if (HasTrivialCxxDtor(argument.TypeAndValue.TypeName))
+                {
+                    const bool inPlace = !argument.IsCxxDirectConstruction
+                        && (argument.CxxEarlyCopySlot != nullptr
+                            || (argument.IsRvalue && argument.IsCxxPrvalueTemp
+                                && argument.Storage != nullptr));
+                    if (!noDtorByValueBindingPattern.empty())
+                        noDtorByValueBindingPattern.push_back(',');
+                    noDtorByValueBindingPattern += std::to_string(i);
+                    noDtorByValueBindingPattern.push_back(inPlace ? 'I' : 'C');
+                }
+            }
+            flat += leaves(leaves, argument);
         }
         auto clearMarkers = [&] {
             for (NamedVariable& a : arguments)
@@ -4731,12 +4747,19 @@ bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
             if (receiver.TypeAndValue.Pointer) receiverSpelling += " *";
             else receiverSpelling += IsCxxObjectRvalue(receiver) ? " &&" : " &";
         }
+        const bool adlSymbol = adlCall && !calleeSymbol.empty() && !calleeOwner.empty();
+        const bool adlTemplateSymbol = adlSymbol && !calleeTemplateArgs.empty();
         const std::string directKey = instanceWrapper
             ? std::format("{}{}|{}|{}|{}|{}|{}", cxxBase, calleeTemplateArgs, calleeType,
                           owner->second.first, receiverSpelling, calleeOwnerSpelling,
                           wrapperSig->selectedCalleeSymbol)
-            : std::format("{}{}|{}|{}", cxxBase, calleeTemplateArgs, calleeType, owner->second.first);
-        const std::string name = std::format("__cflat_byval_{:016x}", HashWrapperKey(directKey));
+            : std::format("{}{}|{}|{}|{}", cxxBase, calleeTemplateArgs, calleeType,
+                          owner->second.first, adlSymbol ? calleeSymbol : std::string());
+        std::string directKeyWithNoDtorBinding = directKey;
+        if (!noDtorByValueBindingPattern.empty())
+            directKeyWithNoDtorBinding += "|NDTOR_INDIRECT|" + noDtorByValueBindingPattern;
+        const std::string name = std::format("__cflat_byval_{:016x}",
+                                             HashWrapperKey(directKeyWithNoDtorBinding));
         const std::string getter = name + "_fp";
         bool known = false;
         if (auto fit = functionTable.find(name); fit != functionTable.end())
@@ -4788,11 +4811,119 @@ bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
             }
             else
             {
-                source = "using " + name + "_t = " + calleeType + ";\n"
-                    + "extern \"C\" " + name + "_t " + name + ";\n";
-                if (!symbolNamed)
+                source = "using " + name + "_t = " + calleeType + ";\n";
+                if (adlSymbol && !symbolNamed && !adlTemplateSymbol
+                    && !calleeOwner.starts_with("::std::"))
+                {
+                    const size_t separator = calleeOwner.rfind("::");
+                    const std::string calleeName = separator == std::string::npos
+                        ? calleeOwner : calleeOwner.substr(separator + 2);
+                    std::string calleeNamespace = separator == std::string::npos
+                        ? std::string() : calleeOwner.substr(0, separator);
+                    if (calleeNamespace.starts_with("::")) calleeNamespace.erase(0, 2);
+                    if (!calleeName.empty() && calleeName.find("::") == std::string::npos)
+                    {
+                        const std::string declaration = name + "_t " + calleeName + ";\n";
+                        source += calleeNamespace.empty() ? declaration
+                            : "namespace " + calleeNamespace + " { " + declaration + " }\n";
+                    }
+                }
+                source += "extern \"C\" " + name + "_t " + name + ";\n";
+                if (adlTemplateSymbol && !symbolNamed)
+                {
+                    size_t parameterOpen = std::string::npos;
+                    int angleDepth = 0;
+                    int parenDepth = 0;
+                    for (size_t i = 0; i < calleeType.size(); ++i)
+                    {
+                        if (calleeType[i] == '<') ++angleDepth;
+                        else if (calleeType[i] == '>' && angleDepth > 0) --angleDepth;
+                        else if (calleeType[i] == '(')
+                        {
+                            if (angleDepth == 0 && parenDepth == 0)
+                            {
+                                parameterOpen = i;
+                                break;
+                            }
+                            ++parenDepth;
+                        }
+                        else if (calleeType[i] == ')' && parenDepth > 0)
+                            --parenDepth;
+                    }
+                    if (parameterOpen == std::string::npos)
+                        return refuse("the selected template parameter list cannot be named");
+                    angleDepth = 0;
+                    parenDepth = 0;
+                    size_t parameterClose = std::string::npos;
+                    for (size_t i = parameterOpen; i < calleeType.size(); ++i)
+                    {
+                        if (calleeType[i] == '<') ++angleDepth;
+                        else if (calleeType[i] == '>' && angleDepth > 0) --angleDepth;
+                        else if (calleeType[i] == '(') ++parenDepth;
+                        else if (calleeType[i] == ')' && --parenDepth == 0)
+                        {
+                            parameterClose = i;
+                            break;
+                        }
+                    }
+                    if (parameterClose == std::string::npos)
+                        return refuse("the selected template parameter list cannot be named");
+                    const std::string parameterList = calleeType.substr(
+                        parameterOpen + 1, parameterClose - parameterOpen - 1);
+                    std::vector<std::string> parameterTypes;
+                    if (!parameterList.empty() && parameterList != "void")
+                    {
+                        angleDepth = 0;
+                        parenDepth = 0;
+                        int bracketDepth = 0;
+                        size_t start = 0;
+                        for (size_t i = 0; i <= parameterList.size(); ++i)
+                        {
+                            const char c = i == parameterList.size() ? ',' : parameterList[i];
+                            if (c == '<') ++angleDepth;
+                            else if (c == '>' && angleDepth > 0) --angleDepth;
+                            else if (c == '(') ++parenDepth;
+                            else if (c == ')' && parenDepth > 0) --parenDepth;
+                            else if (c == '[') ++bracketDepth;
+                            else if (c == ']' && bracketDepth > 0) --bracketDepth;
+                            if (c == ',' && angleDepth == 0 && parenDepth == 0 && bracketDepth == 0)
+                            {
+                                parameterTypes.push_back(parameterList.substr(start, i - start));
+                                start = i + 1;
+                            }
+                        }
+                    }
+                    const size_t calleeSeparator = calleeOwner.rfind("::");
+                    const std::string calleeName = calleeSeparator == std::string::npos
+                        ? calleeOwner : calleeOwner.substr(calleeSeparator + 2);
+                    if (calleeName.empty())
+                        return refuse("the selected template has no callable name");
+                    const std::string demandName = name + "_demand";
+                    std::string demandParameters;
+                    std::string demandArguments;
+                    for (size_t i = 0; i < parameterTypes.size(); ++i)
+                    {
+                        if (i != 0)
+                        {
+                            demandParameters += ", ";
+                            demandArguments += ", ";
+                        }
+                        const std::string parameter = "p" + std::to_string(i);
+                        demandParameters += parameterTypes[i] + " " + parameter;
+                        demandArguments += "static_cast<decltype(" + parameter + ") &&>(" + parameter + ")";
+                    }
+                    source += "static void " + demandName + "(" + demandParameters + ") { (void)"
+                        + calleeName + calleeTemplateArgs + "(" + demandArguments + "); }\n"
+                        + "extern \"C\" __attribute__((weak)) void* " + getter
+                        + "() { return reinterpret_cast<void*>(&" + demandName + "); }\n";
+                }
+                else if (!symbolNamed)
+                {
+                    const std::string addressTarget = adlSymbol
+                        ? calleeOwner : cxxBase + calleeTemplateArgs;
                     source += "extern \"C\" __attribute__((weak)) void* " + getter + "() { return reinterpret_cast<void*>("
-                        + "static_cast<" + name + "_t*>(&" + cxxBase + calleeTemplateArgs + ")); }\n";
+                        + "static_cast<" + name + "_t*>(&" + addressTarget + ")); }\n";
+                }
                 else
                 {
                     // The call targets the symbol; the getter keeps k, whose ADL call reaches the selected
@@ -4815,7 +4946,37 @@ bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
             }
             direct.defaultArgs = calleeDefaults;
             direct.name = name;
-            direct.prvalueOnlyByValue = knownByValueArguments != nullptr;
+            bool indirectNoDtorByValueAbi = direct.abi.valid;
+            bool foundNoDtorByValueAbi = false;
+            flat = 0;
+            for (size_t i = 0; i < arguments.size(); ++i)
+            {
+                const NamedVariable& argument = arguments[i];
+                const bool selectedByValue = (flat < bindKinds.size() && bindKinds[flat] == 'v')
+                    || (knownByValueArguments != nullptr
+                        && std::find(knownByValueArguments->begin(), knownByValueArguments->end(), i)
+                            != knownByValueArguments->end());
+                if (selectedByValue && !argument.TypeAndValue.Pointer
+                    && IsCxxRecord(argument.TypeAndValue.TypeName)
+                    && !IsCxxTriviallyCopyableRecord(argument.TypeAndValue.TypeName)
+                    && HasTrivialCxxDtor(argument.TypeAndValue.TypeName))
+                {
+                    foundNoDtorByValueAbi = true;
+                    const size_t abiIndex = i;
+                    if (!direct.abi.valid || abiIndex >= direct.abi.params.size())
+                        indirectNoDtorByValueAbi = false;
+                    else
+                    {
+                        const int kind = direct.abi.params[abiIndex].kind;
+                        const bool indirectSlot = kind == cflat_cinterop::RawAbiSlot::Indirect
+                            || kind == cflat_cinterop::RawAbiSlot::IndirectAliased;
+                        indirectNoDtorByValueAbi = indirectNoDtorByValueAbi && indirectSlot;
+                    }
+                }
+                flat += leaves(leaves, argument);
+            }
+            direct.allowsDirectNontrivialByValue = knownByValueArguments != nullptr
+                || (indirectNoDtorByValueAbi && foundNoDtorByValueAbi);
             RegisterCSignatures({ direct }, group.headers.front());
             known = false;
             if (auto fit = functionTable.find(name); fit != functionTable.end())
@@ -4826,7 +4987,8 @@ bool LLVMBackend::SwitchCxxDirectByValueCall(const std::string& functionName,
         cxxDirectCalleeGetters_[name] = getter;
         if (instanceWrapper && receiverAdjustment != 0)
             cxxDirectCalleeThisAdjust_[name] = receiverAdjustment;
-        if (symbolNamed) cxxDirectCalleeSymbols_[name] = wrapperSig->selectedCalleeSymbol;
+        if (symbolNamed || adlTemplateSymbol)
+            cxxDirectCalleeSymbols_[name] = wrapperSig->selectedCalleeSymbol;
         const FunctionSymbol* directSymbol = nullptr;
         if (auto directFunctions = functionTable.find(name); directFunctions != functionTable.end())
             for (const FunctionSymbol& symbol : directFunctions->second)
@@ -5073,6 +5235,7 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
         static constexpr std::string_view kArrayReferenceParameterMarker =
             "(&cflat_array_argument_marker)";
         const bool memberCall = !memberOwnerType.empty();
+        const char* const freeRequestTag = adlCall ? "FREE_ADL3" : "FREE";
         const std::string memberName = memberCall
             ? functionName.substr(functionName.rfind('.') == std::string::npos
                 ? 0 : functionName.rfind('.') + 1)
@@ -6371,7 +6534,7 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
                 + name + "(" + parameters + ") noexcept(noexcept(" + makeTarget(firstWrapper.calls)
                 + ")) { " + body + " return " + target + "; }\n";
             CSigEntry backed;
-            if (!RequestGeneratedCxxWrapper(group, source, name, "FREE", backed, backedError))
+            if (!RequestGeneratedCxxWrapper(group, source, name, freeRequestTag, backed, backedError))
             {
                 backedError = FirstCxxErrorLine(backedError);
                 return -1;
@@ -6537,7 +6700,7 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
                 const FreeWrapper& wrapper = wrappers[attempt];
                 CSigEntry bound;
                 std::string wrapperError;
-                if (!RequestGeneratedCxxWrapper(group, wrapper.source, wrapper.name, "FREE",
+                if (!RequestGeneratedCxxWrapper(group, wrapper.source, wrapper.name, freeRequestTag,
                                                  bound, wrapperError))
                 {
                     if (typeDefaultTrailing)
@@ -6667,7 +6830,7 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
                     }
                     CSigEntry retargetBound;
                     if (!RequestGeneratedCxxWrapper(group, retargeted.source, retargeted.name,
-                                                     "FREE", retargetBound, wrapperError))
+                                                     freeRequestTag, retargetBound, wrapperError))
                     {
                         const int scopeScore = cxxProbeScopeScore(group.primary, wrapperError);
                         if (shouldReplaceCxxProbeError(scopeScore, attempt, wrapperError))
@@ -6699,7 +6862,7 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
                             },
                             [&](const std::string& name, const std::string& input, CSigEntry& out,
                                 std::string& requestError) {
-                                return RequestGeneratedCxxWrapper(group, input, name, "FREE", out,
+                                return RequestGeneratedCxxWrapper(group, input, name, freeRequestTag, out,
                                                                   requestError);
                             },
                             functionName, boundName, retargetError))
@@ -7183,6 +7346,50 @@ bool LLVMBackend::RequestCxxFreeBraceCall(const std::string& functionName,
         return true;
 }
 
+bool LLVMBackend::GetUniqueCxxBraceFunctionClassElementType(
+    const std::string& functionName, size_t parameterIndex, size_t arity,
+    std::string& elementType)
+{
+        elementType.clear();
+        auto signatures = cxxFunctionSignatures_.find(functionName);
+        if (signatures == cxxFunctionSignatures_.end()) return false;
+
+        const CSigEntry* selected = nullptr;
+        for (const auto& signature : signatures->second)
+        {
+            if (!signature.isCxx) continue;
+            const size_t fixed = signature.paramSpellings.size();
+            if (arity > fixed && !signature.variadic) continue;
+            if (arity < fixed)
+            {
+                bool defaultsCoverOmitted = true;
+                for (size_t i = arity; i < fixed; ++i)
+                    if (i >= signature.defaultArgs.size()
+                        || signature.defaultArgs[i].kind.empty())
+                    {
+                        defaultsCoverOmitted = false;
+                        break;
+                    }
+                if (!defaultsCoverOmitted) continue;
+            }
+            if (selected != nullptr || signature.variadic || fixed != arity)
+                return false;
+            selected = &signature;
+        }
+        if (selected == nullptr || parameterIndex >= selected->paramSpellings.size()) return false;
+
+        const std::string& parameter = selected->paramSpellings[parameterIndex];
+        if (CxxBraceContainerKindOf(parameter) != CxxBraceContainerKind::InitializerList)
+            return false;
+        const std::string spelling = CxxBraceTargetElementSpelling(parameter);
+        TypeAndValue mapped;
+        if (spelling.empty() || !MapCTypeToTypeAndValue(spelling, mapped, true)
+            || mapped.Pointer || mapped.ElemPointer || !IsCxxRecord(mapped.TypeName))
+            return false;
+        elementType = mapped.TypeName;
+        return true;
+}
+
 bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                                           const std::string& ownerType,
                                           const std::string& memberName,
@@ -7270,12 +7477,21 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
         auto classElementsNeedConversion = [&](const CxxBraceArgument& brace,
                                                 const std::string& parameter) {
             if (!brace.hasCxxClassElements) return false;
+            if (brace.hasNestedBraceElements) return false;
             if (brace.hasMixedElements) return true;
             const std::string target = targetElementSpelling(parameter);
             if (target.empty() || brace.cxxElementType.empty()) return false;
             std::string source;
             return !CxxSpellingForCflatType(brace.cxxElementType, source)
                 || source != target;
+        };
+        auto hasClassPrvalueElement = [&](const CxxBraceArgument& brace) {
+            return std::any_of(brace.elements.begin(), brace.elements.end(), [&](const auto& element) {
+                return element.IsCxxDirectConstruction
+                    || (element.IsRvalue && !element.TypeAndValue.Pointer
+                        && !element.TypeAndValue.ElemPointer
+                        && IsCxxRecord(element.TypeAndValue.TypeName));
+            });
         };
         auto nonBraceArgumentsFit = [&](const std::vector<std::string>& params,
                                         bool instance) {
@@ -7383,7 +7599,10 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                         }
                     }
                     if (brace.hasCxxClassElements
-                        && !classElementsNeedConversion(brace, targetParameter))
+                        && !classElementsNeedConversion(brace, targetParameter)
+                        && (CxxBraceContainerKindOf(targetParameter)
+                                != CxxBraceContainerKind::InitializerList
+                            || !hasClassPrvalueElement(brace)))
                     {
                         if (initializerListRefusal.empty())
                         {
@@ -8212,6 +8431,23 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                             error = "C++ brace-list parameter has no recoverable element class type";
                             return false;
                         }
+                        if (effectiveKind == CxxBraceContainerKind::InitializerList)
+                        {
+                            const size_t dataIndex = flatParameterIndex++;
+                            parameterSpellings.push_back("const " + elementType + " *");
+                            const size_t countIndex = flatParameterIndex++;
+                            parameterSpellings.push_back("size_t");
+                            classWrapperParams[brace->argumentIndex] = { dataIndex, countIndex };
+                            const std::string listType = "std::initializer_list<" + elementType + ">";
+                            const std::string il = "__cflat_converted_il_"
+                                + std::to_string(brace->argumentIndex);
+                            wrapperNeedsInitializerList = true;
+                            wrapperBodyPrefix += CxxInitializerListOverStorage(
+                                listType, il, "p" + std::to_string(dataIndex),
+                                "p" + std::to_string(countIndex));
+                            callArguments.push_back(listType + "(" + il + ")");
+                            continue;
+                        }
                         std::string braceContainer = StripCxxRefAndCv(targetParameter);
                         while (!braceContainer.empty() && braceContainer.back() == '*')
                         {
@@ -8302,21 +8538,33 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                         }
                         continue;
                     }
-                    if (brace->hasMixedElements || brace->cxxElementType.empty())
+                    if (brace->hasMixedElements
+                        || (brace->cxxElementType.empty() && !brace->hasNestedBraceElements))
                     {
                         error = "brace arguments must contain values of one C++ class type";
                         return false;
                     }
                     if (effectiveKind == CxxBraceContainerKind::InitializerList)
                     {
-                        const std::string parameterName = i < selected.paramNames.size()
-                            && !selected.paramNames[i].empty()
-                            ? selected.paramNames[i] : std::format("#{}", i);
-                        error = std::format(
-                            "C++ parameter '{}' of '{}' takes std::initializer_list, which "
-                            "cannot be formed from a materialized CFlat brace list; provide an "
-                            "ArrayRef, IListRef or vector overload", parameterName, functionName);
-                        return false;
+                        const std::string elementType = targetElementSpelling(targetParameter);
+                        if (elementType.empty())
+                        {
+                            error = "C++ initializer_list parameter has no recoverable element class type";
+                            return false;
+                        }
+                        const size_t dataIndex = flatParameterIndex++;
+                        parameterSpellings.push_back("const " + elementType + " *");
+                        const size_t countIndex = flatParameterIndex++;
+                        parameterSpellings.push_back("size_t");
+                        classWrapperParams[brace->argumentIndex] = { dataIndex, countIndex };
+                        const std::string listType = "std::initializer_list<" + elementType + ">";
+                        const std::string il = "__cflat_il_" + std::to_string(i);
+                        wrapperNeedsInitializerList = true;
+                        wrapperBodyPrefix += CxxInitializerListOverStorage(
+                            listType, il, "p" + std::to_string(dataIndex),
+                            "p" + std::to_string(countIndex));
+                        callArguments.push_back(listType + "(" + il + ")");
+                        continue;
                     }
                     std::string braceType = CxxBraceElementSpelling(*brace, targetParameter);
                     if (braceType.empty())
@@ -8544,8 +8792,11 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
         {
             const std::string targetParameter = brace.parameterIndex < selected.paramTypes.size()
                 ? selected.paramTypes[brace.parameterIndex] : std::string();
+            const bool initializerListTarget = CxxBraceContainerKindOf(targetParameter)
+                == CxxBraceContainerKind::InitializerList;
             if (!brace.hasCxxClassElements
-                || classElementsNeedConversion(brace, targetParameter))
+                || (classElementsNeedConversion(brace, targetParameter)
+                    && !initializerListTarget))
                 continue;
             auto params = classWrapperParams.find(brace.argumentIndex);
             if (params == classWrapperParams.end()
@@ -8555,8 +8806,16 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                 error = "the generated C++ brace wrapper has an unexpected parameter layout";
                 return false;
             }
+            const std::string targetElement = targetElementSpelling(targetParameter);
             TypeAndValue elementTv;
-            elementTv.TypeName = brace.cxxElementType;
+            if (targetElement.empty()
+                || !MapCTypeToTypeAndValue(targetElement, elementTv, true)
+                || elementTv.Pointer)
+            {
+                error = std::format("C++ brace-list element type '{}' has no class layout",
+                                    targetElement);
+                return false;
+            }
             llvm::Type* elementTy = GetType(elementTv);
             if (elementTy == nullptr || !elementTy->isSized())
             {
@@ -8564,49 +8823,42 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                                     brace.cxxElementType);
                 return false;
             }
-            const uint64_t align = GetEffectiveAlignmentForType(brace.cxxElementType, elementTy);
-            auto* arrayTy = llvm::ArrayType::get(elementTy, brace.elements.size());
-            auto* array = AllocaAtEntry(arrayTy, nullptr, "cxx.brace.array", align);
-            std::vector<llvm::Value*> slots;
-            slots.reserve(brace.elements.size());
-            for (size_t element = 0; element < brace.elements.size(); ++element)
+            llvm::Value* dataPtr = nullptr;
+            if (brace.hasPreconstructedClassBacking)
             {
-                auto* dst = builder->CreateInBoundsGEP(
-                    arrayTy, array, { builder->getInt64(0), builder->getInt64(element) },
-                    "cxx.brace.element");
-                auto* src = brace.elements[element].Storage;
-                if (src == nullptr && brace.elements[element].IsRvalue
-                    && brace.elements[element].Primary != nullptr
-                    && brace.elements[element].Primary->getType() == elementTy
-                    && elementTy->isStructTy()
-                    && HasTrivialCxxDtor(brace.cxxElementType))
+                if (ResolveTypeAlias(brace.preconstructedClassElementType)
+                    != ResolveTypeAlias(elementTv.TypeName)
+                    || brace.preconstructedClassData == nullptr)
                 {
-                    // Direct-ABI class results have a value but no sret temp. Spill them so
-                    // the ordinary C++ copy constructor still receives an address.
-                    src = AllocaAtEntry(elementTy, nullptr, "cxx.brace.source", align);
-                    builder->CreateStore(brace.elements[element].Primary, src);
-                }
-                if (src == nullptr)
-                {
-                    error = std::format(
-                        "cannot copy C++ class '{}' into a brace-list element: the element is "
-                        "not an addressable lvalue or C++ call result",
-                        DisplayCxxClassName(brace.cxxElementType));
+                    error = "the preconstructed C++ brace backing has a different element type";
                     return false;
                 }
-                if (!EmitCxxCopyOrMoveConstruct(
-                        brace.cxxElementType, dst, src, brace.elements[element].IsExplicitMove,
-                        "into a brace-list element"))
-                    return false;
-                slots.push_back(dst);
+                dataPtr = brace.preconstructedClassData;
             }
-            if (IsForeignNontrivialCxxClass(brace.cxxElementType))
-                for (auto it = slots.rbegin(); it != slots.rend(); ++it)
-                    RegisterOwnedStructTemp(*it, brace.cxxElementType);
+            else
+            {
+                const uint64_t align = GetEffectiveAlignmentForType(elementTv.TypeName, elementTy);
+                auto* arrayTy = llvm::ArrayType::get(elementTy, brace.elements.size());
+                auto* array = AllocaAtEntry(arrayTy, nullptr, "cxx.brace.array", align);
+                std::vector<llvm::Value*> slots;
+                slots.reserve(brace.elements.size());
+                for (size_t element = 0; element < brace.elements.size(); ++element)
+                {
+                    auto* dst = builder->CreateInBoundsGEP(
+                        arrayTy, array, { builder->getInt64(0), builder->getInt64(element) },
+                        "cxx.brace.element");
+                    if (!EmitCxxBraceElementToSlot(brace.elements[element], elementTv.TypeName, dst,
+                            "into a brace-list element", error, false))
+                        return false;
+                    slots.push_back(dst);
+                }
+                if (IsForeignNontrivialCxxClass(elementTv.TypeName))
+                    for (auto* slot : slots) RegisterOwnedStructTemp(slot, elementTv.TypeName);
 
-            auto* dataPtr = builder->CreateInBoundsGEP(
-                arrayTy, array, { builder->getInt64(0), builder->getInt64(0) },
-                "cxx.brace.data");
+                dataPtr = builder->CreateInBoundsGEP(
+                    arrayTy, array, { builder->getInt64(0), builder->getInt64(0) },
+                    "cxx.brace.data");
+            }
             NamedVariable data;
             data.TypeAndValue = bound.params[params->second.first];
             data.TypeAndValue.VariableName.clear();
@@ -8665,8 +8917,8 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                 slots.push_back(dst);
             }
             if (IsForeignNontrivialCxxClass(elementType.TypeName))
-                for (auto it = slots.rbegin(); it != slots.rend(); ++it)
-                    RegisterOwnedStructTemp(*it, elementType.TypeName);
+                for (auto* slot : slots)
+                    RegisterOwnedStructTemp(slot, elementType.TypeName);
             auto* dataPtr = builder->CreateInBoundsGEP(
                 arrayTy, array, { builder->getInt64(0), builder->getInt64(0) },
                 "cxx.brace.converted.data");

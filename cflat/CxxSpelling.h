@@ -67,6 +67,8 @@ bool CxxArrayReferenceParameter(const std::string& parameter, std::string& eleme
                                        std::string& extent);
 std::string CxxInitializerListOverStorage(const std::string& listType, const std::string& il,
                                                  const std::string& p, size_t count);
+std::string CxxInitializerListOverStorage(const std::string& listType, const std::string& il,
+                                                 const std::string& p, const std::string& count);
 bool CxxBraceElementsAllScalar(const LLVMBackend::CxxBraceArgument& brace);
 std::string CxxZeroLiteralSpelling(const std::string& identity);
 std::string CxxFunctionPointerReferentParameter(const std::string& parameter);

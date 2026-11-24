@@ -3795,27 +3795,41 @@ namespace cflat_cinterop
                     sig.ctorSelectedParams = WrapperSelectedConstructorParams(ctx, fd);
                     sig.resultBorrowsBraceList = WrapperResultBorrowsBraceList(
                         ctx, fd, sig.braceListElementTypes);
-                    sig.paramBindKinds = WrapperParameterBindKinds(fd);
                     sig.conditionalArgumentKinds = WrapperConditionalArgumentKinds(fd);
                     sig.closureKeptParams = WrapperClosureKeptParams(fd);
-                    /*
-                     * T518: the outermost free call's selected callee - its canonical function
-                     * type and default arguments - so a by-value class argument can be built at
-                     * its own position and the callee called through its address.
-                     */
-                    if (const Stmt* wrapperBody = fd->getBody())
-                    {
-                        const CallExpr* outer = nullptr;
+                    auto firstCall = [](const Stmt* body) {
+                        const CallExpr* result = nullptr;
                         auto findCall = [&](auto&& self, const Stmt* s) -> void {
-                            if (s == nullptr || outer != nullptr) return;
+                            if (s == nullptr || result != nullptr) return;
                             if (const auto* call = llvm::dyn_cast<CallExpr>(s))
                             {
-                                outer = call;
+                                result = call;
                                 return;
                             }
                             for (const Stmt* child : s->children()) self(self, child);
                         };
-                        findCall(findCall, wrapperBody);
+                        findCall(findCall, body);
+                        return result;
+                    };
+                    const FunctionDecl* selectedCallFunction = fd;
+                    if (const CallExpr* wrapperCall = firstCall(fd->getBody()))
+                        if (const FunctionDecl* helper = wrapperCall->getDirectCallee())
+                            if (const auto* helperNamespace =
+                                    llvm::dyn_cast<NamespaceDecl>(helper->getDeclContext());
+                                helperNamespace != nullptr && helper->getNameAsString() == "call"
+                                && helperNamespace->getNameAsString()
+                                    == fd->getNameAsString() + "_adl")
+                                if (const CallExpr* nestedCall = firstCall(helper->getBody());
+                                    nestedCall != nullptr && nestedCall->getDirectCallee() != nullptr)
+                                    selectedCallFunction = helper;
+                    sig.paramBindKinds = WrapperParameterBindKinds(selectedCallFunction);
+                    /*
+                     * Record the selected native callee, even when an ADL lookup helper sits
+                     * between the generated wrapper and that call.
+                     */
+                    if (const Stmt* wrapperBody = selectedCallFunction->getBody())
+                    {
+                        const CallExpr* outer = firstCall(wrapperBody);
                         const FunctionDecl* callee = outer != nullptr
                                 && !llvm::isa<UserDefinedLiteral>(outer)
                             ? outer->getDirectCallee() : nullptr;
@@ -3867,6 +3881,23 @@ namespace cflat_cinterop
                                     ownerType.getCanonicalType().getAsString(policy));
                                 sig.selectedCalleeOwnerIsReceiver = objectRecord != nullptr
                                     && objectRecord->getCanonicalDecl() == method->getParent()->getCanonicalDecl();
+                            }
+                            else if (selectedCallFunction != fd)
+                            {
+                                const auto* functionNamespace =
+                                    llvm::dyn_cast<NamespaceDecl>(callee->getDeclContext());
+                                if (functionNamespace != nullptr && functionNamespace->isInline())
+                                {
+                                    std::string qualified = callee->getNameAsString();
+                                    for (const DeclContext* dc = callee->getDeclContext(); dc != nullptr;
+                                         dc = dc->getParent())
+                                        if (const auto* ns = llvm::dyn_cast<NamespaceDecl>(dc);
+                                            ns != nullptr && !ns->isAnonymousNamespace())
+                                            qualified = ns->getNameAsString() + "::" + qualified;
+                                    sig.selectedCalleeOwner = "::" + qualified;
+                                }
+                                else
+                                    sig.selectedCalleeOwner = "::" + callee->getQualifiedNameAsString();
                             }
                             // The selected specialization's own arguments: the getter names exactly it.
                             if (const TemplateArgumentList* targs = callee->getTemplateSpecializationArgs())

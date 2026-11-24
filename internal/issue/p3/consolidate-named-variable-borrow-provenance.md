@@ -79,3 +79,26 @@ on PRECISE source provenance (advisor call 2026-09-04) - preserve that when migr
 
 Sequencing: refactor last, after the doors above are stable; behaviour unchanged, full host
 suite as the bar.
+
+## COALBORROW round-2 residual
+
+- Imported C++ class pointers are not classified as proven borrows by the `??` unique-initializer
+  join path and compiles before double-destroying (`rc=133`); its `?:` twin is refused. Repro:
+  `r18_cpp_ptr.cb` contains:
+
+  ```cflat
+  import cpp "memory";
+  import cpp "k.hpp";
+  int f(K* p) { unique K* t = p ?? new K(); return 1; }
+  int main() { K* a = new K(); int v = f(a); delete a; return v; }
+  ```
+
+  The complete `k.hpp` is `struct K { int v = 4; ~K() {} };`. The coalesce proof deliberately
+  excludes C++ record parameters; determine their ownership provenance and route this unique
+  initializer through a safe rejection before changing that classification.
+- Moving or implicitly reading a `unique` field as a `??` operand fails with an unrelated
+  "cannot store a pointer value into struct storage" error (PRE-EXISTING, master too). Both
+  `unique O* t = move h.u ?? new O();` (h is `struct UH { unique O* u = default; }`) and, in
+  `struct S { unique O* u = default; int m() { unique O* t = u ?? new O(); return 1; } }`, the
+  implicit-this `u ?? new O()` hit it, as does `move u ?? new O()`. With `struct O { int value = 23; ~O() {} };`.
+  Expected: the move form transfers the field (field nulled), the implicit-this form refuses like `h.u ?? new O()`.

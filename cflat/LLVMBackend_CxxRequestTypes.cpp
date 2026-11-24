@@ -1470,13 +1470,14 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
         for (const auto& element : elements) elementTypes.push_back(element.TypeAndValue);
         const bool scalarReferenceSet = CxxCtorSetRankedByCflat(typeName, elementTypes, &elements);
         std::string selectedWhy;
-        const auto* rankedConstructor = scalarReferenceSet
-            ? SelectCxxConstructor(typeName, elementTypes, selectedWhy, true, &elements)
-            : nullptr;
+        const auto* selectedConstructor =
+            SelectCxxConstructor(typeName, elementTypes, selectedWhy, true, &elements);
+        const auto* rankedConstructor = scalarReferenceSet ? selectedConstructor : nullptr;
         auto rankedParameterSpelling = [&](size_t index, std::string& spelling) {
-            if (rankedConstructor == nullptr || index + 1 >= rankedConstructor->params.size())
+            if (selectedConstructor == nullptr
+                || index + 1 >= selectedConstructor->params.size())
                 return false;
-            const TypeAndValue& parameter = rankedConstructor->params[index + 1];
+            const TypeAndValue& parameter = selectedConstructor->params[index + 1];
             if (!RankedCxxParameterBaseSpelling(parameter, spelling)) return false;
             if (parameter.Pointer && !parameter.ElemPointer)
             {
@@ -1485,6 +1486,42 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
                 else if (parameter.IsAlias) spelling += " &";
                 else spelling += " *";
             }
+            return true;
+        };
+        auto uniqueMutableScalarReferenceSpelling = [&](size_t index, std::string& spelling) {
+            const auto* info = GetCxxClassInfoWithConstructors(typeName);
+            if (info == nullptr || info->hasCtorTemplate || index >= elements.size()) return false;
+            const CxxClassInfo::Structor* match = nullptr;
+            for (const auto& ctor : info->constructors)
+            {
+                if (ctor.isDeleted || ctor.access != cflat_cinterop::AccessPublic
+                    || ctor.isCopyCtor || ctor.isMoveCtor || ctor.params.empty())
+                    continue;
+                const size_t parameterCount = ctor.params.size() - 1;
+                if (elements.size() > parameterCount) continue;
+                bool defaultsCover = true;
+                for (size_t missing = elements.size(); missing < parameterCount; ++missing)
+                    if (missing + 1 >= ctor.defaultArgs.size()
+                        || ctor.defaultArgs[missing + 1].kind.empty())
+                    {
+                        defaultsCover = false;
+                        break;
+                    }
+                if (!defaultsCover) continue;
+                if (match != nullptr) return false;
+                match = &ctor;
+            }
+            if (match == nullptr || index + 1 >= match->params.size()) return false;
+            const TypeAndValue& parameter = match->params[index + 1];
+            if (!parameter.IsCxxRef() || parameter.CxxConstRef() || parameter.IsRvalueRef)
+                return false;
+            std::string parameterBase;
+            std::string sourceBase;
+            if (!RankedCxxParameterBaseSpelling(parameter, parameterBase)
+                || !CxxSpellingForCflatType(elements[index].TypeAndValue.TypeName, sourceBase)
+                || SqueezeCxxSpelling(parameterBase) != SqueezeCxxSpelling(sourceBase))
+                return false;
+            spelling = parameterBase + " &";
             return true;
         };
         std::string narrowingChecks;
@@ -1739,12 +1776,24 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
             size_t at = 0;
             std::string replacement = param;
             std::string rankedType;
-            if (scalarReferenceSet && scalarElement && rankedParameterSpelling(i, rankedType))
+            const bool hasRankedType = scalarElement
+                && (rankedParameterSpelling(i, rankedType)
+                    || uniqueMutableScalarReferenceSpelling(i, rankedType));
+            if (hasRankedType)
             {
-                // Ruling (MIX18 r3): a brace element narrows as list-init judges the ORIGINAL argument.
-                narrowingChecks += "(void)[&]() { " + RankedReferentSpelling(rankedType) + " narrowed"
-                    + std::to_string(i) + "{ " + param + " }; }; ";
-                replacement = "static_cast<" + rankedType + ">( " + param + " )";
+                const bool mutableLvalueReference = CxxBraceFieldIsReference(rankedType)
+                    && !CxxBraceFieldIsRvalueReference(rankedType)
+                    && rankedType.find("const") == std::string::npos;
+                if (mutableLvalueReference && elements[i].Storage != nullptr
+                    && !elements[i].IsRvalue && !elements[i].IsExplicitMove)
+                    parameterTypes[elementParameterTypes[i]] = rankedType;
+                if (scalarReferenceSet)
+                {
+                    // Ruling (MIX18 r3): a brace element narrows as list-init judges the ORIGINAL argument.
+                    narrowingChecks += "(void)[&]() { " + RankedReferentSpelling(rankedType) + " narrowed"
+                        + std::to_string(i) + "{ " + param + " }; }; ";
+                    replacement = "static_cast<" + rankedType + ">( " + param + " )";
+                }
             }
             if (pointerXvalue)
             {
@@ -1803,6 +1852,156 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
             error = "the generated C++ direct-brace constructor wrapper could not be registered";
             return false;
         }
+        return true;
+}
+
+bool LLVMBackend::EmitCxxBraceElementToSlot(const NamedVariable& source,
+                                           const std::string& elementType,
+                                           llvm::Value* destination,
+                                           const char* context,
+                                           std::string& error,
+                                           bool registerDestinationDtor)
+{
+        if (destination == nullptr || elementType.empty()) return false;
+        const std::string resolvedElementType = ResolveTypeAlias(elementType);
+        const std::string resolvedSourceType = ResolveTypeAlias(source.TypeAndValue.TypeName);
+        const bool sameClass = !source.TypeAndValue.Pointer && !source.TypeAndValue.ElemPointer
+            && !resolvedSourceType.empty() && resolvedSourceType == resolvedElementType;
+        if (source.IsCxxDirectConstruction && !sameClass
+            && !source.TypeAndValue.TypeName.empty()
+            && IsCxxRecord(source.TypeAndValue.TypeName))
+        {
+            TypeAndValue sourceType;
+            sourceType.TypeName = source.TypeAndValue.TypeName;
+            auto* sourceTy = GetType(sourceType);
+            if (sourceTy == nullptr || !sourceTy->isSized())
+            {
+                error = std::format("C++ brace-list source type '{}' has no class layout",
+                                    DisplayCxxClassName(sourceType.TypeName));
+                return false;
+            }
+            auto* sourceSlot = AllocaAtEntry(sourceTy, nullptr, "cxx.brace.source",
+                GetEffectiveAlignmentForType(sourceType.TypeName, sourceTy));
+            if (!EmitCxxBraceElementToSlot(source, sourceType.TypeName, sourceSlot,
+                    "to preserve a converted brace-list source temporary", error))
+                return false;
+            NamedVariable materialized;
+            materialized.TypeAndValue = source.TypeAndValue;
+            materialized.Primary = builder->CreateLoad(sourceTy, sourceSlot, "cxx.brace.source.value");
+            materialized.BaseType = sourceTy;
+            materialized.Storage = sourceSlot;
+            materialized.IsRvalue = true;
+            materialized.IsExplicitMove = true;
+            if (!EmitCxxBraceElementToSlot(materialized, elementType, destination, context,
+                                           error, false))
+                return false;
+            return true;
+        }
+        TypeAndValue elementTypeValue;
+        elementTypeValue.TypeName = elementType;
+        auto* elementTy = GetType(elementTypeValue);
+        if (sameClass && !source.IsCxxDirectConstruction)
+        {
+            if (source.Storage != nullptr)
+            {
+                if (!EmitCxxCopyOrMoveConstruct(elementType, destination, source.Storage,
+                        source.IsExplicitMove || source.IsRvalue, context))
+                    return false;
+                if (registerDestinationDtor && IsForeignNontrivialCxxClass(elementType))
+                    RegisterOwnedStructTemp(destination, elementType);
+                return true;
+            }
+            if (source.IsRvalue && source.Primary != nullptr
+                && source.Primary->getType() == elementTy && elementTy->isStructTy()
+                && HasTrivialCxxDtor(elementType))
+            {
+                builder->CreateStore(source.Primary, destination);
+                return true;
+            }
+            error = std::format("cannot construct C++ brace-list element '{}' in its backing slot",
+                                DisplayCxxClassName(elementType));
+            return false;
+        }
+
+        std::vector<NamedVariable> constructorArguments;
+        std::string initializer;
+        bool copyListInit = true;
+        if (source.IsCxxDirectConstruction
+            && (sameClass || source.TypeAndValue.TypeName.empty()))
+        {
+            constructorArguments = source.CxxDirectConstructionArguments;
+            const char* open = source.CxxDirectConstructionUsesBraces ? "{" : "(";
+            const char* close = source.CxxDirectConstructionUsesBraces ? "}" : ")";
+            initializer = open;
+            for (size_t i = 0; i < constructorArguments.size(); ++i)
+            {
+                if (i != 0) initializer += ", ";
+                initializer += "__cflat_arg_" + std::to_string(i) + "__";
+            }
+            initializer += close;
+            copyListInit = source.CxxDirectConstructionCopyListInit;
+        }
+        else
+        {
+            constructorArguments.push_back(source);
+            initializer = "(__cflat_arg_0__)";
+        }
+        for (auto& argument : constructorArguments)
+            if (argument.TypeAndValue.TypeName.empty()
+                && !argument.TypeAndValue.Pointer && !argument.TypeAndValue.ElemPointer)
+            {
+                llvm::Type* valueType = argument.Primary != nullptr
+                    ? argument.Primary->getType() : argument.BaseType;
+                    std::string inferred = !argument.LiteralIdentity.empty()
+                        ? argument.LiteralIdentity : CxxArithIdentityForArgument(argument, valueType);
+                    if (inferred.empty())
+                        inferred = DeclaredPrimitiveIdentityForCxxArgument(argument, valueType);
+                if (!inferred.empty()) argument.TypeAndValue.TypeName = std::move(inferred);
+            }
+
+        std::string wrapperName;
+        std::vector<size_t> forwarded;
+        std::vector<std::vector<NamedVariable>> deferredArguments;
+        if (!RequestCxxDirectBraceConstructor(elementType, constructorArguments, initializer,
+                copyListInit, wrapperName, error, true, &forwarded, nullptr, &deferredArguments))
+        {
+            if (error.empty())
+                error = std::format("cannot construct C++ brace-list element '{}' in its backing slot",
+                                    DisplayCxxClassName(elementType));
+            return false;
+        }
+        NamedVariable self;
+        self.Primary = destination;
+        self.BaseType = destination->getType();
+        self.TypeAndValue.TypeName = elementType;
+        self.TypeAndValue.Pointer = true;
+        self.IsRvalue = true;
+        std::vector<NamedVariable> wrapperArguments;
+        wrapperArguments.reserve(forwarded.size() + 1);
+        wrapperArguments.push_back(std::move(self));
+        for (size_t index : forwarded)
+        {
+            if (index >= constructorArguments.size())
+            {
+                error = "the generated C++ brace constructor has an unexpected parameter layout";
+                return false;
+            }
+            if (constructorArguments[index].IsCxxDirectConstruction)
+            {
+                if (index >= deferredArguments.size())
+                {
+                    error = "the generated C++ brace constructor has an unexpected parameter layout";
+                    return false;
+                }
+                wrapperArguments.insert(wrapperArguments.end(), deferredArguments[index].begin(),
+                                        deferredArguments[index].end());
+            }
+            else
+                wrapperArguments.push_back(constructorArguments[index]);
+        }
+        CreateOverloadedFunctionCall(wrapperName, wrapperArguments);
+        if (registerDestinationDtor && IsForeignNontrivialCxxClass(elementType))
+            RegisterOwnedStructTemp(destination, elementType);
         return true;
 }
 

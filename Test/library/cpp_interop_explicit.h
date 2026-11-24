@@ -914,6 +914,22 @@ inline int convrest_amb(ConvPtrRAmb r) { return r.value; }
 inline int convrest_pp(ConvRestPP q) { return q.value; }
 inline int convrest_ppn(ConvRestPPN q) { return q.value; }
 inline int convrest_counts() { return convrest_ctor * 100 + convrest_dtor; }
+// IFACECOPY: constructor and destructor counts for C++ class arguments through interfaces.
+inline int& rv_ctor_counter() { static int value = 0; return value; }
+inline int& rv_copy_ctor_counter() { static int value = 0; return value; }
+inline int& rv_dtor_counter() { static int value = 0; return value; }
+struct RvFoo { int value = 3; };
+struct RvR { int value; RvR(const RvFoo* p) : value(p ? p->value : 0) {} };
+struct RvRN {
+    int value;
+    RvRN(const RvFoo* p) : value(p ? p->value : 0) { ++rv_ctor_counter(); }
+    RvRN(const RvRN& o) : value(o.value) { ++rv_ctor_counter(); ++rv_copy_ctor_counter(); }
+    ~RvRN() { ++rv_dtor_counter(); }
+};
+inline void rv_reset() { rv_ctor_counter() = rv_copy_ctor_counter() = rv_dtor_counter() = 0; }
+inline int rv_counts() {
+    return rv_ctor_counter() * 100 + rv_copy_ctor_counter() * 10 + rv_dtor_counter();
+}
 // PTRSAFE: class-pointer conversions clang refuses or offsets. PtrSafeF sits past T305R4Pad in
 // PtrSafeD; PtrSafeM reaches PtrSafeF twice (ambiguous); PtrSafePriv has a private PtrSafeF.
 struct PtrSafeB0 { int b = 2; };

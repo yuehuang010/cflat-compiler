@@ -8,6 +8,7 @@
 import "string.cb";
 import cpp "../library/cpp_interop_ternaryref.h";
 import cpp "../library/cpp_interop_mixcond3.h";
+import cpp "../library/cpp_t480_ternleft4_ptrref.hpp";
 
 struct T513VarA { int value = 1; };
 struct T513VarB { int value = 2; };
@@ -277,5 +278,32 @@ expect_error("ternary branches have incompatible types 't513mix.A' and 't513mix.
 expect_error("ternary branches have incompatible types 'pointer' and 't513mix.SS'") {
     int t513MixresStringLeafNested(bool k, bool j) {
         return t513mix.takeSS(k ? (j ? "abc" : t513mix.mkSS("xy")) : t513mix.mkSS("w"));
+    }
+}
+
+// TERNLEFT4 r2: discarded pointer/class-prvalue arms are incompatible, including T*& calls.
+expect_error("ternary branches have incompatible types 'pointer' and 'cppbv.TernaryCnt'") {
+    void t480DiscardPointerPrvalue(bool k) {
+        cppbv.TernaryCnt* px = nullptr;
+        k ? px : cppbv.mk(9);
+    }
+}
+
+expect_error("ternary branches have incompatible types 'pointer' and 'cppbv.TernaryCnt'") {
+    void t480DiscardPointerRefPrvalue(bool k) {
+        k ? cppbv.gpref() : cppbv.mk(9);
+    }
+}
+
+expect_error("ternary branches have incompatible types 'cppbv.TernaryCnt' and 'pointer'") {
+    void t480DiscardPrvaluePointer(bool k) {
+        cppbv.TernaryCnt* px = nullptr;
+        k ? cppbv.mk(9) : px;
+    }
+}
+
+expect_error("ternary branches have incompatible types 'cppbv.TernaryCnt' and 'pointer'") {
+    void t480DiscardPrvaluePointerRef(bool k) {
+        k ? cppbv.mk(9) : cppbv.gpref();
     }
 }

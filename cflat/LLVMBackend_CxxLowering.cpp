@@ -3959,17 +3959,33 @@ LLVMBackend::CxxTernaryVerdict LLVMBackend::ClassifyCxxTernary(const TypeAndValu
         const bool trueIsPrvalue = trueCategory == CxxArmCategory::Prvalue;
         const bool falseIsPrvalue = falseCategory == CxxArmCategory::Prvalue;
         CxxTernaryVerdict verdict;
-        if (trueArm.Pointer || falseArm.Pointer || trueArm.IsArrayView || falseArm.IsArrayView
-            || trueArm.IsInterface || falseArm.IsInterface || trueArm.IsUnique || falseArm.IsUnique)
+        if (trueArm.IsArrayView || falseArm.IsArrayView || trueArm.IsInterface || falseArm.IsInterface
+            || trueArm.IsUnique || falseArm.IsUnique)
             return verdict;
         const std::string trueName = ResolveTypeAlias(trueArm.TypeName);
         const std::string falseName = ResolveTypeAlias(falseArm.TypeName);
-        if (trueName.empty() || falseName.empty()
-            || !IsCxxRecord(trueName) || !IsCxxRecord(falseName))
+        const bool trueNullptr = trueArm.IsCxxNullptrT;
+        const bool falseNullptr = falseArm.IsCxxNullptrT;
+        const bool nullptrClassPair = trueNullptr != falseNullptr
+            && ((trueNullptr && IsCxxRecord(falseName))
+                || (falseNullptr && IsCxxRecord(trueName)));
+        if (!nullptrClassPair
+            && (trueName.empty() || falseName.empty()
+                || !IsCxxRecord(trueName) || !IsCxxRecord(falseName)))
             return verdict;
-        const bool trueConst = CxxTernaryArmConst(trueArm);
-        const bool falseConst = CxxTernaryArmConst(falseArm);
-        if (trueName == falseName)
+        auto isPlainClassPointer = [&](const TypeAndValue& arm, const std::string& name) {
+            return arm.Pointer && !arm.IsRvalueRef && !arm.ElemPointer
+                && arm.PointerDepth <= 1 && IsCxxRecord(name);
+        };
+        const bool truePointer = isPlainClassPointer(trueArm, trueName);
+        const bool falsePointer = isPlainClassPointer(falseArm, falseName);
+        const bool pointerClassPair = truePointer != falsePointer
+            && (trueArm.Pointer || falseArm.Pointer);
+        if ((trueArm.Pointer || falseArm.Pointer) && !pointerClassPair)
+            return verdict;
+        const bool trueConst = truePointer ? trueArm.PointeeConstBit() : CxxTernaryArmConst(trueArm);
+        const bool falseConst = falsePointer ? falseArm.PointeeConstBit() : CxxTernaryArmConst(falseArm);
+        if (trueName == falseName && !pointerClassPair)
         {
             if (trueCategory == falseCategory)
                 verdict.kind = trueCategory == CxxArmCategory::Lvalue
@@ -3981,43 +3997,65 @@ LLVMBackend::CxxTernaryVerdict LLVMBackend::ClassifyCxxTernary(const TypeAndValu
                 verdict.kind = CxxTernaryVerdict::Kind::Prvalue;
             // The composite cv is the union of both arms. The selected arm supplies the metadata.
             verdict.resultIsTrue = trueConst || !falseConst;
+            verdict.resultIsClass = true;
             return verdict;
         }
-        const std::string key = trueName + (trueConst ? "|const|" : "||")
-            + CxxArmCategoryTag(trueCategory) + "|" + falseName + (falseConst ? "|const|" : "||")
-            + CxxArmCategoryTag(falseCategory);
+        auto armKey = [&](const TypeAndValue& arm, const std::string& name, bool isConst,
+                          CxxArmCategory category) {
+            return name + (arm.IsCxxNullptrT ? "|nullptr|"
+                : arm.Pointer ? std::format("|ptr{}|", arm.PointerDepth) : "|obj|")
+                + (isConst ? "const|" : "|") + CxxArmCategoryTag(category);
+        };
+        const std::string key = armKey(trueArm, trueName, trueConst, trueCategory) + "|"
+            + armKey(falseArm, falseName, falseConst, falseCategory);
         if (auto known = cxxTernaryVerdicts_.find(key); known != cxxTernaryVerdicts_.end())
             return known->second;
         std::string trueSpelling;
         std::string falseSpelling;
-        auto trueOwner = cxxTypeOwnerGroup_.find(trueName);
-        auto falseOwner = cxxTypeOwnerGroup_.find(falseName);
-        if (!CxxSpellingForCflatType(trueName, trueSpelling)
-            || !CxxSpellingForCflatType(falseName, falseSpelling)
-            || trueOwner == cxxTypeOwnerGroup_.end() || falseOwner == cxxTypeOwnerGroup_.end())
-            return verdict;
-        CxxRequestGroup group = MakeCxxClassRequestGroup(trueOwner->second, trueName,
-                                                         CxxTypeOwnerGroupsOf({ falseName }));
+        if (trueNullptr) trueSpelling = "decltype(nullptr)";
+        else if (!CxxSpellingForCflatType(trueName, trueSpelling)) return verdict;
+        if (falseNullptr) falseSpelling = "decltype(nullptr)";
+        else if (!CxxSpellingForCflatType(falseName, falseSpelling)) return verdict;
+        CxxRequestGroup group;
+        if (nullptrClassPair)
+        {
+            const std::string& className = trueNullptr ? falseName : trueName;
+            auto owner = cxxTypeOwnerGroup_.find(className);
+            if (owner == cxxTypeOwnerGroup_.end()) return verdict;
+            group = MakeCxxClassRequestGroup(owner->second, className);
+        }
+        else
+        {
+            auto trueOwner = cxxTypeOwnerGroup_.find(trueName);
+            auto falseOwner = cxxTypeOwnerGroup_.find(falseName);
+            if (trueOwner == cxxTypeOwnerGroup_.end() || falseOwner == cxxTypeOwnerGroup_.end())
+                return verdict;
+            group = MakeCxxClassRequestGroup(trueOwner->second, trueName,
+                                             CxxTypeOwnerGroupsOf({ falseName }));
+        }
         if (group.headers.empty()) return verdict;
-        const std::string trueCv = (trueConst ? "const " : "") + trueSpelling;
-        const std::string falseCv = (falseConst ? "const " : "") + falseSpelling;
+        const std::string trueCv = (trueConst ? "const " : "") + trueSpelling
+            + (truePointer ? " *" : "");
+        const std::string falseCv = (falseConst ? "const " : "") + falseSpelling
+            + (falsePointer ? " *" : "");
         // Declared names are per pair: every probe of one TU shares the declarations' scope.
         const uint64_t pairHash = HashWrapperKey(key);
         const std::string trueCall = std::format("__cflat_ternary_pv_t_{:016x}", pairHash);
         const std::string falseCall = std::format("__cflat_ternary_pv_f_{:016x}", pairHash);
         std::string decls;
-        if (trueIsPrvalue) decls += trueCv + " " + trueCall + "(); ";
-        if (falseIsPrvalue) decls += falseCv + " " + falseCall + "(); ";
+        if (trueIsPrvalue && !truePointer) decls += trueCv + " " + trueCall + "(); ";
+        if (falseIsPrvalue && !falsePointer) decls += falseCv + " " + falseCall + "(); ";
         // An xvalue arm is the caller's object cast to an rvalue reference, never a temporary.
         auto armExpr = [](CxxArmCategory category, const std::string& call,
-                          const std::string& cv, const char* object) {
+                          const std::string& cv, const char* object, bool pointer) {
+            if (pointer) return std::string(object);
             if (category == CxxArmCategory::Prvalue) return call + "()";
             if (category == CxxArmCategory::Xvalue)
                 return "static_cast<" + cv + " &&>(" + object + ")";
             return std::string(object);
         };
-        const std::string trueExpr = armExpr(trueCategory, trueCall, trueCv, "*p0");
-        const std::string falseExpr = armExpr(falseCategory, falseCall, falseCv, "*p1");
+        const std::string trueExpr = armExpr(trueCategory, trueCall, trueCv, "*p0", truePointer);
+        const std::string falseExpr = armExpr(falseCategory, falseCall, falseCv, "*p1", falsePointer);
         const std::string conditional = "true ? " + trueExpr + " : " + falseExpr;
         std::string lastError;
         auto probe = [&](const std::string& tag, const std::string& check) {
@@ -4047,8 +4085,54 @@ LLVMBackend::CxxTernaryVerdict LLVMBackend::ClassifyCxxTernary(const TypeAndValu
             verdict.kind = Kind::Prvalue;
         if (verdict.kind == Kind::LvalueRef || verdict.kind == Kind::XvalueRef
             || verdict.kind == Kind::Prvalue)
-            verdict.resultIsTrue = probe("true_result", "static_assert(std::is_same_v<"
-                "std::remove_cvref_t<R>, " + trueSpelling + ">, \"\");");
+        {
+            if (pointerClassPair)
+            {
+                const std::string& classSpelling = truePointer ? falseSpelling : trueSpelling;
+                verdict.resultIsClass = probe("class_result", "static_assert(std::is_same_v<"
+                    "std::remove_cvref_t<R>, " + classSpelling + ">, \"\");");
+                if (verdict.resultIsClass)
+                    verdict.resultIsTrue = !truePointer;
+                else
+                    verdict.resultIsTrue = probe("true_result", "static_assert(std::is_same_v<"
+                        "std::remove_cvref_t<R>, " + trueCv + ">, \"\");");
+            }
+            else if (nullptrClassPair)
+            {
+                const bool classIsTrue = !trueNullptr;
+                const std::string& classSpelling = classIsTrue ? trueSpelling : falseSpelling;
+                verdict.resultIsClass = probe("class_result", "static_assert(std::is_same_v<"
+                    "std::remove_cvref_t<R>, " + classSpelling + ">, \"\");");
+                verdict.resultIsTrue = verdict.resultIsClass
+                    ? classIsTrue
+                    : probe("true_result", "static_assert(std::is_same_v<"
+                        "std::remove_cvref_t<R>, " + trueCv + ">, \"\");");
+            }
+            else
+            {
+                verdict.resultIsClass = true;
+                verdict.resultIsTrue = probe("true_result", "static_assert(std::is_same_v<"
+                    "std::remove_cvref_t<R>, " + trueCv + ">, \"\");");
+            }
+        }
+        if ((pointerClassPair || nullptrClassPair) && !verdict.resultIsClass)
+        {
+            const std::string resultName = std::format("__cflat_ternary_result_{:016x}", pairHash);
+            const std::string source = "#include <type_traits>\n" + decls
+                + "extern \"C\" __attribute__((weak)) auto " + resultName + "(" + trueCv + " * p0, "
+                + falseCv + " * p1) -> decltype(" + conditional + ") { return nullptr; }\n";
+            CxxRequestGroupScope groupScope(*this, &group);
+            CSigEntry signature;
+            std::string error;
+            if (RequestGeneratedCxxWrapper(group, source, resultName, "TERNARY_RESULT_TYPE",
+                                           signature, error)
+                && signature.ret.Pointer && signature.ret.PointerDepth <= 1
+                && !signature.ret.ElemPointer)
+            {
+                verdict.resultType = signature.ret;
+                verdict.hasResultType = true;
+            }
+        }
         cxxTernaryVerdicts_[key] = verdict;
         return verdict;
 }
@@ -4087,21 +4171,43 @@ bool LLVMBackend::LowerCxxTernaryArm(NamedVariable& arm, const TypeAndValue& tru
         if (resultSlot == nullptr && callSink == nullptr && armName == resultName
             && (refResult || armIsPrvalue))
             return true;
+        if (armType.IsCxxNullptrT && resultSlot != nullptr && !refResult)
+        {
+            NamedVariable converted = arm;
+            std::string refusal;
+            const auto ctorResult = ConvertThroughCxxConvertingCtor(
+                converted, resultName, resultSlot, refusal);
+            if (ctorResult != CxxConvertingCtorResult::Converted)
+                return false;
+            arm = std::move(converted);
+            arm.TypeAndValue = TypeAndValue{ .TypeName = resultName };
+            arm.IsRvalue = true;
+            arm.BaseType = GetType(TypeAndValue{ .TypeName = resultName });
+            return arm.BaseType != nullptr;
+        }
         std::string armSpelling;
         std::string otherSpelling;
         std::string resultSpelling;
-        if (!CxxSpellingForCflatType(armName, armSpelling)
-            || !CxxSpellingForCflatType(otherName, otherSpelling)
-            || !CxxSpellingForCflatType(resultName, resultSpelling))
-            return false;
+        if (armType.IsCxxNullptrT) armSpelling = "decltype(nullptr)";
+        else if (!CxxSpellingForCflatType(armName, armSpelling)) return false;
+        if (otherType.IsCxxNullptrT) otherSpelling = "decltype(nullptr)";
+        else if (!CxxSpellingForCflatType(otherName, otherSpelling)) return false;
+        if (!CxxSpellingForCflatType(resultName, resultSpelling)) return false;
         auto armOwner = cxxTypeOwnerGroup_.find(armName);
         auto otherOwner = cxxTypeOwnerGroup_.find(otherName);
         auto resultOwner = cxxTypeOwnerGroup_.find(resultName);
-        if (armOwner == cxxTypeOwnerGroup_.end() || otherOwner == cxxTypeOwnerGroup_.end()
+        if ((armOwner == cxxTypeOwnerGroup_.end() && !armType.IsCxxNullptrT)
+            || (otherOwner == cxxTypeOwnerGroup_.end() && !otherType.IsCxxNullptrT)
             || resultOwner == cxxTypeOwnerGroup_.end())
             return false;
-        const std::string armCv = (CxxTernaryArmConst(armType) ? "const " : "") + armSpelling;
-        const std::string otherCv = (CxxTernaryArmConst(otherType) ? "const " : "") + otherSpelling;
+        const std::string armCv = (armType.Pointer
+                ? (armType.PointeeConstBit() ? "const " : "") :
+                    (CxxTernaryArmConst(armType) ? "const " : ""))
+            + armSpelling + (armType.Pointer ? " *" : "");
+        const std::string otherCv = (otherType.Pointer
+                ? (otherType.PointeeConstBit() ? "const " : "") :
+                    (CxxTernaryArmConst(otherType) ? "const " : ""))
+            + otherSpelling + (otherType.Pointer ? " *" : "");
         if (resultSlot != nullptr && !refResult && armName != resultName)
         {
             llvm::Value* sourceSlot = arm.Storage;

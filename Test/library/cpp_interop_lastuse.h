@@ -372,6 +372,19 @@ namespace t518bound
 
 namespace rv
 {
+    struct C
+    {
+        static int live;
+        int v;
+        explicit C(int x) : v(x) { ++live; }
+        C(const C& other) : v(other.v) { ++live; }
+        C(C&& other) noexcept : v(other.v) { ++live; }
+        ~C() { --live; }
+    };
+    inline int C::live = 0;
+    inline int rr(C value) { return value.v; }
+    inline int rr_adlwrap(C value) { return value.v; }
+    inline int liveC() { return C::live; }
     inline t418::Val g1{7};
     inline int pure() { return 2; }
     inline int wam() { *t418::aimed->p = 9; return 2; }
@@ -388,6 +401,237 @@ namespace rv
         inline int f2(t418::Val v, int b)
         { return v.value() * 100 + b; }
     }
+}
+
+namespace adlwrap2
+{
+    struct H
+    {
+        static int ctor;
+        static int copies;
+        static int moves;
+        static int dtors;
+        static int alive;
+        int value;
+        explicit H(int x) : value(x) { ++ctor; ++alive; }
+        H(const H& other) : value(other.value + 100) { ++copies; ++alive; }
+        ~H() { ++dtors; --alive; }
+        static void reset() { ctor = copies = moves = dtors = alive = 0; }
+        friend int hf(H value) { return value.value; }
+    };
+    inline int H::ctor = 0;
+    inline int H::copies = 0;
+    inline int H::moves = 0;
+    inline int H::dtors = 0;
+    inline int H::alive = 0;
+    inline void resetH() { H::reset(); }
+    inline int hiddenPack(int value)
+    {
+        return value * 100000 + H::ctor * 10000 + H::copies * 1000
+            + H::moves * 100 + H::dtors * 10 + H::alive;
+    }
+
+    struct N
+    {
+        int value;
+        explicit N(int x) : value(x) {}
+    };
+    inline int nestedTarget(N value, int add) { return value.value * 1000 + add; }
+    inline int nestedBody(N value, int add = 9) { return nestedTarget(value, 1) + add; }
+}
+
+namespace ad
+{
+    struct HFT
+    {
+        static int ctor;
+        static int copies;
+        static int moves;
+        static int dtors;
+        static int alive;
+        static int calls;
+        int value;
+        explicit HFT(int x) : value(x) { ++ctor; ++alive; }
+        HFT(const HFT& other) : value(other.value + 100) { ++copies; ++alive; }
+        HFT(HFT&& other) noexcept : value(other.value + 10) { ++moves; ++alive; }
+        ~HFT() { ++dtors; --alive; }
+        static void reset()
+        {
+            ctor = copies = moves = dtors = alive = calls = 0;
+        }
+        template<class T> friend int hft(HFT value, T add)
+        {
+            ++calls;
+            return value.value + static_cast<int>(add);
+        }
+    };
+    inline int HFT::ctor = 0;
+    inline int HFT::copies = 0;
+    inline int HFT::moves = 0;
+    inline int HFT::dtors = 0;
+    inline int HFT::alive = 0;
+    inline int HFT::calls = 0;
+    inline void resetHft() { HFT::reset(); }
+    inline int hftPack(int value)
+    {
+        return value * 100000 + HFT::calls * 10000 + HFT::ctor * 1000
+            + HFT::copies * 100 + HFT::moves * 10 + HFT::dtors + HFT::alive * 10000000;
+    }
+
+    inline namespace v1
+    {
+        struct I
+        {
+            static int ctor;
+            static int copies;
+            static int dtors;
+            static int alive;
+            static int calls;
+            int value;
+            explicit I(int x) : value(x) { ++ctor; ++alive; }
+            I(const I& other) : value(other.value + 100) { ++copies; ++alive; }
+            ~I() { ++dtors; --alive; }
+        };
+        inline int I::ctor = 0;
+        inline int I::copies = 0;
+        inline int I::dtors = 0;
+        inline int I::alive = 0;
+        inline int I::calls = 0;
+        inline int itake(I value) { ++I::calls; return value.value; }
+    }
+    inline void resetI()
+    {
+        I::ctor = I::copies = I::dtors = I::alive = I::calls = 0;
+    }
+    inline int iPack(int value)
+    {
+        return value * 100000 + I::calls * 10000 + I::ctor * 1000
+            + I::copies * 100 + I::dtors + I::alive * 10;
+    }
+}
+
+// ADLWRAP3 r2: non-trivial copy/move constructors with trivial destructors.
+namespace ad3
+{
+    struct H
+    {
+        inline static int ctor = 0;
+        inline static int copies = 0;
+        inline static int moves = 0;
+        inline static int calls = 0;
+        inline static int qualifiedCalls = 0;
+        int value;
+        explicit H(int x) : value(x) { ++ctor; }
+        H(const H& other) : value(other.value + 100) { ++copies; }
+        H(H&& other) : value(other.value + 10) { ++moves; }
+        template<class T> friend int hft(H value, T add)
+        {
+            ++calls;
+            return value.value + static_cast<int>(add);
+        }
+    };
+    inline void resetH()
+    {
+        H::ctor = H::copies = H::moves = H::calls = H::qualifiedCalls = 0;
+    }
+    inline int hPack(int value)
+    {
+        return value * 100000 + (H::calls + H::qualifiedCalls) * 10000
+            + H::ctor * 1000 + H::copies * 100 + H::moves * 10;
+    }
+    inline int qtake(H value) { ++H::qualifiedCalls; return value.value; }
+
+    // ADLMIX: mixed by-value call probes and exact copy/destruction counters.
+    struct D
+    {
+        inline static int copies = 0;
+        inline static int moves = 0;
+        inline static int dtors = 0;
+        inline static int live = 0;
+        int value;
+        explicit D(int x) : value(x) { ++live; }
+        D(const D& other) : value(other.value + 100) { ++copies; ++live; }
+        D(D&& other) : value(other.value + 10) { ++moves; ++live; }
+        ~D() { ++dtors; --live; }
+    };
+    inline int mixCalls = 0;
+    inline int mixdCalls = 0;
+    inline int mix3Calls = 0;
+    inline int methodCalls = 0;
+    inline int mix(H a, H b) { ++mixCalls; return a.value * 1000 + b.value; }
+    inline int adlMix(H a, H b) { ++mixCalls; return a.value * 1000 + b.value; }
+    inline int mixd(H a, D b) { ++mixdCalls; return a.value * 1000 + b.value; }
+    inline int adlMixd(H a, D b) { ++mixdCalls; return a.value * 1000 + b.value; }
+    inline int mix3(int lead, H a, D b)
+    {
+        ++mix3Calls;
+        return lead * 100000 + a.value * 1000 + b.value;
+    }
+    inline int adlMix3(int lead, H a, D b)
+    {
+        ++mix3Calls;
+        return lead * 100000 + a.value * 1000 + b.value;
+    }
+    struct MixHost
+    {
+        int method(H a, D b)
+        {
+            ++methodCalls;
+            return a.value * 1000 + b.value;
+        }
+    };
+    inline void resetMixed()
+    {
+        H::ctor = H::copies = H::moves = H::calls = H::qualifiedCalls = 0;
+        D::copies = D::moves = D::dtors = D::live = 0;
+        mixCalls = mixdCalls = mix3Calls = methodCalls = 0;
+    }
+    inline int mixPack(int value)
+    {
+        return value * 1000 + H::copies * 100 + H::moves * 10 + mixCalls;
+    }
+    inline int mixdPack(int value)
+    {
+        return value * 1000 + H::copies * 100 + H::moves * 10
+            + D::copies * 5 + D::moves * 3 + D::dtors * 2 + D::live + mixdCalls;
+    }
+    inline int mix3Pack(int value)
+    {
+        return value * 1000 + H::copies * 100 + H::moves * 10
+            + D::copies * 5 + D::moves * 3 + D::dtors * 2 + D::live + mix3Calls;
+    }
+    inline int methodPack(int value)
+    {
+        return value * 1000 + H::copies * 100 + H::moves * 10
+            + D::copies * 5 + D::moves * 3 + D::dtors * 2 + D::live + methodCalls;
+    }
+
+    inline namespace v1
+    {
+        struct I
+        {
+            inline static int ctor = 0;
+            inline static int copies = 0;
+            inline static int calls = 0;
+            int value;
+            explicit I(int x) : value(x) { ++ctor; }
+            I(const I& other) : value(other.value + 100) { ++copies; }
+        };
+        inline void resetI() { I::ctor = I::copies = I::calls = 0; }
+        inline int iPack(int value)
+        {
+            return value * 100000 + I::calls * 10000 + I::ctor * 1000 + I::copies * 100;
+        }
+        inline int itake(I value) { ++I::calls; return value.value; }
+    }
+
+    struct Reg { int value; };
+    inline int regCalls = 0;
+    inline int intCalls = 0;
+    inline void resetReg() { regCalls = intCalls = 0; }
+    inline int take(Reg value) { ++regCalls; return value.value + 100; }
+    inline int take(int value) { ++intCalls; return value + 200; }
+    inline int regPack(int value) { return value * 100 + regCalls * 10 + intCalls; }
 }
 
 // DIRORD: a by-value C++ class lvalue argument of a constructor is copied at its position, before a
@@ -431,6 +675,47 @@ namespace dirord
     inline int guard(Callback fn)
     {
         try { return fn(); } catch (...) { return -1; }
+    }
+}
+
+// BVPARAM2: by-value wrapper parameters keep direct-construction temporaries alive to the full-expression end.
+namespace bvparam2
+{
+    inline int events[32];
+    inline int count = 0;
+    inline int liveObjects = 0;
+    inline int GA[4] = { 2, 3, 4, 5 };
+    inline int* p = GA;
+    inline void reset() { count = 0; }
+    inline void record(int value) { events[count++] = value; }
+    inline int size() { return count; }
+    inline int at(int index) { return events[index]; }
+    inline int live() { return liveObjects; }
+    struct C
+    {
+        int value;
+        explicit C(int x) : value(x) { ++liveObjects; record(x); }
+        C(const C& other) : value(other.value) { ++liveObjects; record(10 + value); }
+        C(C&& other) noexcept : value(other.value) { ++liveObjects; record(20 + value); }
+        ~C() { --liveObjects; record(30 + value); }
+    };
+    inline int g() { record(70); return 2; }
+    inline int one(C value) { record(50); return value.value; }
+    inline int cref2(const C& first, const C& second)
+    { record(60); return first.value * 10 + second.value; }
+    template <class T> inline int templateOne(T value) { record(52); return value.value; }
+    struct Host
+    {
+        int memberOne(C value) { record(51); return value.value; }
+        template <class T> int memberTemplateOne(T value) { record(53); return value.value; }
+    };
+    struct Add { int value; };
+    inline Add addA{1};
+    inline Add addB{1};
+    inline int operator+(Add first, Add second)
+    {
+        record(80);
+        return first.value + second.value;
     }
 }
 

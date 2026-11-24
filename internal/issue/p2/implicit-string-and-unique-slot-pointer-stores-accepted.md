@@ -44,3 +44,8 @@ refuses, then drop the exclusions for the store path only; for the compare, reco
 name the way UnrelatedPointeePair does (InferSourceTypeName for a fixed-array source).
 
 Acceptance: each cell above gets a decision (refuse, or a recorded ruling); test.sh green.
+
+- (TUPSTR review 2, pre-existing) a `string` declaration accepts ANY data pointer as its initializer and reads
+  the pointee as text: `int v = 7; int* ip = &v; string s = ip;` compiles and `s.length()` is garbage; the same
+  for `char**`, `unsigned char*`, `u8*`, `void*`, `string*`. Only a string literal or a `char*` / `const char*`
+  should convert (the `(int, string)` tuple element already refuses the rest since TUPSTR).

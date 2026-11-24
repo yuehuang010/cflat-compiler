@@ -1,5 +1,6 @@
 #include <set>
 #include <tuple>
+#include "CxxSpelling.h"
 #include "MainListener.h"
 #include "MainListener_ExpressionsShared.h"
 #include <llvm/Analysis/ValueTracking.h>
@@ -8365,13 +8366,29 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
              * BRACEPRV: a leaf `T(args)` element is deferred into the wrapper (built in place, as
              * clang does) when every later leaf is quiet, so no later evaluation can observe its
              * constructor running after it. Aggregates with reference members keep the temp path; a
-             * non-aggregate class defers only a sole element (`S x = { S(7) }`), so an
-             * initializer_list expansion (`vector<T> v{T(1), T(2)}`) keeps its pinned counts.
+             * non-aggregate class defers a sole element or an initializer_list expansion.
              */
             std::unordered_set<CFlatParser::FieldInitContext*> deferrableBraceLeaves;
             const bool soleElement = fields.size() == 1 && fields.front()->initializerList() == nullptr;
+            bool hasInitializerListConstructor = false;
+            if (const auto* info = compiler->GetCxxClassInfoWithConstructors(typeName))
+                for (const auto& ctor : info->constructors)
+                    for (size_t parameter = 1; parameter < ctor.params.size(); ++parameter)
+                    {
+                        const auto& type = ctor.params[parameter];
+                        std::string spelling = type.TypeName;
+                        if (spelling.empty() || CxxBraceContainerKindOf(spelling)
+                                != CxxBraceContainerKind::InitializerList)
+                            if (!compiler->CxxSpellingForCflatType(type.TypeName, spelling)
+                                || CxxBraceContainerKindOf(spelling)
+                                    != CxxBraceContainerKind::InitializerList)
+                                continue;
+                        hasInitializerListConstructor = true;
+                        break;
+                    }
             if (!HasForeignCxxAggregateReferenceMember(typeName, errorContext)
-                && (compiler->IsForeignCxxAggregateClass(typeName) || soleElement))
+                && (compiler->IsForeignCxxAggregateClass(typeName) || soleElement
+                    || hasInitializerListConstructor))
             {
                 std::vector<CFlatParser::FieldInitContext*> leaves;
                 std::unordered_map<CFlatParser::FieldInitContext*, std::string> leafTargetTypes;
@@ -10160,6 +10177,29 @@ cxx_dtor_ready:
                     ctorValueCallArgumentScope.emplace(inCallArgument_, ternaryCallArgumentDepth_, callArgDestinationUnique_, false);
                     ctorValueExpectedScope.emplace(&declExpectedType, ctorValueDest, true);
                     ctorValueCxxExpectedScope.emplace(cxxCallArgumentExpectedType_, ctorValueDest);
+                }
+                LLVMBackend::TypeAndValue ctorMixedClassDest;
+                const bool ctorMixedClassTernary = ctorArgExpected.TypeName.empty()
+                    && !HasDefaultOnlyTernaryArm(argAssign)
+                    && ctorConditional != nullptr && ctorConditional->Question() != nullptr
+                    && !HasAssignmentOperator(argAssign) && !ctorVoidPointerTernary
+                    && !ctorValueTernary
+                    && compiler->GetUniqueCxxConstructorValueParameter(
+                        typeName, ctorArguments.size(), ctorArgs->argumentNamedExpression().size(),
+                        ctorMixedClassDest, /*constRef*/ false)
+                    && !ctorMixedClassDest.Pointer && ctorMixedClassDest.PointerDepth == 0
+                    && !ctorMixedClassDest.IsAlias && !ctorMixedClassDest.IsRvalueRef
+                    && compiler->IsForeignNontrivialCxxClass(ctorMixedClassDest.TypeName);
+                std::optional<CallArgumentScope> ctorMixedClassCallArgumentScope;
+                std::optional<DeclExpectedTypeScope> ctorMixedClassExpectedScope;
+                std::optional<CxxCallArgumentExpectedTypeScope> ctorMixedClassCxxExpectedScope;
+                if (ctorMixedClassTernary)
+                {
+                    ctorMixedClassCallArgumentScope.emplace(
+                        inCallArgument_, ternaryCallArgumentDepth_, callArgDestinationUnique_, false);
+                    ctorMixedClassExpectedScope.emplace(&declExpectedType, ctorMixedClassDest, true);
+                    ctorMixedClassCxxExpectedScope.emplace(
+                        cxxCallArgumentExpectedType_, ctorMixedClassDest);
                 }
                 // T459: a `?:` with a `default` arm into a `const T&` parameter joins a temporary of the class.
                 LLVMBackend::TypeAndValue ctorRefDest;
@@ -16631,7 +16671,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // moved-out value (cflat value-type move = zero source, not skip dtor)
                                 // and a is marked moved for the use-after-move diagnostic.
                                 AssignSourceKind kind;
-                                right = ClassifyOwningAssignSource(right, typeAndValue.TypeName, false, direct, kind);
+                                llvm::Value* tupleStageValue = right;
+                                right = ClassifyOwningAssignSource(right, typeAndValue.TypeName,
+                                    initializerSourceNV.IsTupleLiteral, direct, kind);
+                                if (kind == AssignSourceKind::Copy)
+                                    DestroyConditionalTupleStageAfterCopy(
+                                        initializer->assignmentExpression(),
+                                        tupleStageValue, typeAndValue.TypeName);
                                 if (kind == AssignSourceKind::Move && haveInitializerSourceNV
                                     && RejectImplicitConsumeOfOutlivingOwner(
                                         compiler, initializerSourceNV, false, direct))
@@ -19647,7 +19693,8 @@ bool MainListener::RejectMixedOwnershipPointerTernaryJoin(
         llvm::Value* trueValue, llvm::Value* falseValue, llvm::Value* joined,
         llvm::Value* trueStorage, llvm::Value* falseStorage,
         antlr4::ParserRuleContext* trueCtx, antlr4::ParserRuleContext* falseCtx,
-        antlr4::ParserRuleContext* ctx, std::string* deferredDiagnostic) {
+        antlr4::ParserRuleContext* ctx, std::string* deferredDiagnostic,
+        bool borrowProvenByCaller, bool isNullCoalesce) {
         auto* compiler = Compiler(ctx);
         if (joined == nullptr || !joined->getType()->isPointerTy()) return false;
         // A null arm carries no block at all: `c ? buf : nullptr` allocates nothing on either
@@ -19666,7 +19713,8 @@ bool MainListener::RejectMixedOwnershipPointerTernaryJoin(
         // `T* owner = new T(); c ? owner : new T();`, which the corpus relies on.
         llvm::Value* borrowValue   = trueOwns ? falseValue   : trueValue;
         llvm::Value* borrowStorage = trueOwns ? falseStorage : trueStorage;
-        if (!compiler->TernaryArmIsProvenBorrow(borrowValue, borrowStorage)) return false;
+        if (!borrowProvenByCaller
+            && !compiler->TernaryArmIsProvenBorrow(borrowValue, borrowStorage)) return false;
         // Original source slice, not getText(): the parse tree drops whitespace, so `move x`
         // would otherwise be quoted back at the user as 'movex'.
         auto armText = [](antlr4::ParserRuleContext* armCtx) {
@@ -19682,12 +19730,21 @@ bool MainListener::RejectMixedOwnershipPointerTernaryJoin(
         };
         antlr4::ParserRuleContext* owningCtx = trueOwns ? trueCtx : falseCtx;
         antlr4::ParserRuleContext* borrowCtx = trueOwns ? falseCtx : trueCtx;
-        std::string diagnostic = compiler->LocalizeMessage(
-            "'?:' arms differ in ownership: '{}' allocates a value the join cannot own and '{}' "
-            "is a borrow of an existing value, so the allocating arm leaks whenever it is taken. "
-            "Either 'move' the borrowed side into a fresh value so both arms own, or allocate "
-            "into a named owner before the '?:' and make both arms borrows.",
-            { armText(owningCtx), armText(borrowCtx) });
+        std::string diagnostic;
+        if (isNullCoalesce)
+            diagnostic = compiler->LocalizeMessage(
+                "'\?" "?' operands differ in ownership: '{}' allocates a value the join cannot own and '{}' "
+                "is a borrow of an existing value, so the allocating operand leaks whenever it is taken. "
+                "Either 'move' the borrowed operand into a fresh value so both operands own, or allocate "
+                "into a named owner before the '\?" "?' and make both operands borrows.",
+                { armText(owningCtx), armText(borrowCtx) });
+        else
+            diagnostic = compiler->LocalizeMessage(
+                "'?:' arms differ in ownership: '{}' allocates a value the join cannot own and '{}' "
+                "is a borrow of an existing value, so the allocating arm leaks whenever it is taken. "
+                "Either 'move' the borrowed side into a fresh value so both arms own, or allocate "
+                "into a named owner before the '?:' and make both arms borrows.",
+                { armText(owningCtx), armText(borrowCtx) });
         if (deferredDiagnostic != nullptr)
         {
             *deferredDiagnostic = std::move(diagnostic);

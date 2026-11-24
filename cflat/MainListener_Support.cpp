@@ -5258,6 +5258,8 @@ bool MainListener::IsOwnedUniqueInitializerSource(LLVMBackend* compiler,
         const LLVMBackend::NamedVariable& source, llvm::Value* value, bool additionalOwnedProof)
 {
     if (compiler == nullptr) return false;
+    if ((compiler->JoinHasProvenBorrowedArm(value) && !source.IsExplicitMove)
+        || (!source.IsExplicitMove && compiler->JoinHasUnmovedUniqueAdoptionArm(value))) return false;
     const bool ownedConditionalMove = std::any_of(
         source.ConditionalMoveSources.begin(), source.ConditionalMoveSources.end(),
         [&](const auto& moveSource) {

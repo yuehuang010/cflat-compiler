@@ -1700,12 +1700,21 @@ void LLVMBackend::ApplyFuncPtrSinkTransfer(const std::string& functionName,
 
 void LLVMBackend::LogBorrowedPointerMoveSinkError(const std::string& sourceDescription,
         const std::string& parameterName, const std::string& functionName,
-        const std::string& declaredName) const
+        const std::string& declaredName, bool suggestMoveParameter) const
 {
+        if (!suggestMoveParameter)
+        {
+            LogErrorMessage(
+                "cannot move {} into move parameter '{}' of '{}' - the caller may still "
+                "own this pointer and will free it on scope exit. Move it from its actual "
+                "owner instead.",
+                { sourceDescription, parameterName, functionName });
+            return;
+        }
         LogErrorMessage(
             "cannot move {} into move parameter '{}' of '{}' - the caller may still "
-            "own this pointer and will free it on scope exit. Move it out of the "
-            "owning slot instead (e.g. 'move parent->children[i]'), or declare "
+            "own this pointer and will free it on scope exit. Move it from its actual "
+            "owner instead, or declare "
             "'{}' as 'move {}' if this function owns it.",
             { sourceDescription, parameterName, functionName, declaredName, declaredName });
 }
@@ -3741,6 +3750,7 @@ LLVM_ATTRIBUTE_NOINLINE void LLVMBackend::CheckConditionalMoveParamDiagnostics(
 {
         const auto borrowedArm = std::find_if(arg.ConditionalMoveSources.begin(),
             arg.ConditionalMoveSources.end(), [](const auto& source) {
+                // `move` syntax cannot turn a proven borrowed arm into an owned sink source.
                 return source.MoveParamSinkArgument && source.BorrowedPointer;
             });
         const bool paramIsMoveSink = param.IsMove
@@ -3751,7 +3761,11 @@ LLVM_ATTRIBUTE_NOINLINE void LLVMBackend::CheckConditionalMoveParamDiagnostics(
             const std::string borrowOrigin = borrowedArm->BorrowedOrigin;
             const bool copiedBorrow = !directBorrowParam && !borrowOrigin.empty()
                 && IsFunctionParameter(borrowOrigin);
-            if (borrowedArm->BorrowedFromOwningLocal)
+            if (borrowedArm->RootIsBorrowedThisField)
+                LogBorrowedPointerMoveSinkError(
+                    std::format("borrowed field '{}'", borrowedArm->CallerName),
+                    param.VariableName, SpellFunctionSymbol(*this, functionName), "", false);
+            else if (borrowedArm->BorrowedFromOwningLocal)
                 LogOwningLocalCopyMoveSinkError(borrowedArm->CallerName, borrowOrigin,
                     param.VariableName, SpellFunctionSymbol(*this, functionName));
             else if (directBorrowParam || copiedBorrow)
@@ -3764,6 +3778,19 @@ LLVM_ATTRIBUTE_NOINLINE void LLVMBackend::CheckConditionalMoveParamDiagnostics(
                 const std::string declaredName = directBorrowParam
                     ? borrowedArm->CallerName : borrowOrigin;
                 LogBorrowedPointerMoveSinkError(sourceDescription, param.VariableName,
+                    SpellFunctionSymbol(*this, functionName), declaredName);
+            }
+            else
+            {
+                std::string sourceName = borrowedArm->CallerName;
+                if (!borrowedArm->FieldName.empty())
+                    sourceName += (borrowedArm->FieldName.front() == '[' ? "" : ".")
+                        + borrowedArm->FieldName;
+                if (sourceName.empty()) sourceName = "expression";
+                const std::string declaredName = borrowedArm->CallerName.empty()
+                    ? sourceName : borrowedArm->CallerName;
+                LogBorrowedPointerMoveSinkError(
+                    std::format("borrowed value '{}'", sourceName), param.VariableName,
                     SpellFunctionSymbol(*this, functionName), declaredName);
             }
         }
@@ -6588,7 +6615,10 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
                     && ResolveTypeAlias(nv.TypeAndValue.TypeName)
                         == ResolveTypeAlias(param.TypeName);
                 const bool cxxObject = IsForeignNontrivialCxxClass(param.TypeName);
-                if (cxxObject && forwardedDefaultParam)
+                const bool ownedCxxPrvalue = cxxObject && !param.IsMove && !nv.IsExplicitMove
+                    && IsOwnedCxxPrvalueArgument(
+                        nv, cxxSretRecipe.paramSlots[recipeIndex].structTy);
+                if (cxxObject && (ownedCxxPrvalue || forwardedDefaultParam))
                 {
                     if (IsCxxParamDestroyedInCallee(param.TypeName))
                     {

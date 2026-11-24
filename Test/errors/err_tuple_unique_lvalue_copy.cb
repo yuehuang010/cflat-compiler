@@ -236,3 +236,178 @@ expect_error("borrowed value") {
         return (choose ? r : tupsafeBorrowedTupleGlobal, 4);
     }
 }
+
+// COALBORROW: tuple elements use the same all-arm ownership rule as declarations.
+expect_error("borrowed value") {
+    void tupsafeUniqueCoalesceParamDecl(TupsafeTupleOwner* p)
+    {
+        unique TupsafeTupleOwner* t = p ?? new TupsafeTupleOwner();
+    }
+}
+
+expect_error("borrowed value") {
+    void tupsafeUniqueCoalesceFieldDecl(TupsafeBorrowedTupleHolder holder)
+    {
+        unique TupsafeTupleOwner* t = holder.p ?? new TupsafeTupleOwner();
+    }
+}
+
+expect_error("borrowed value") {
+    void tupsafeUniqueCoalesceGlobalDecl()
+    {
+        unique TupsafeTupleOwner* t =
+            tupsafeBorrowedTupleGlobal ?? new TupsafeTupleOwner();
+    }
+}
+
+expect_error("borrowed value") {
+    void tupsafeUniqueCoalesceRawLocalDecl(TupsafeTupleOwner* p)
+    {
+        TupsafeTupleOwner* q = p;
+        unique TupsafeTupleOwner* t = q ?? new TupsafeTupleOwner();
+    }
+}
+
+expect_error("borrowed value") {
+    void tupsafeUniqueCoalesceParamAssign(TupsafeTupleOwner* p)
+    {
+        unique TupsafeTupleOwner* t = nullptr;
+        t = p ?? new TupsafeTupleOwner();
+    }
+}
+
+expect_error("borrowed value") {
+    void tupsafeUniqueCoalesceFieldAssign(TupsafeBorrowedTupleHolder holder)
+    {
+        unique TupsafeTupleOwner* t = nullptr;
+        t = holder.p ?? new TupsafeTupleOwner();
+    }
+}
+
+expect_error("borrowed value") {
+    void tupsafeUniqueCoalesceGlobalAssign()
+    {
+        unique TupsafeTupleOwner* t = nullptr;
+        t = tupsafeBorrowedTupleGlobal ?? new TupsafeTupleOwner();
+    }
+}
+
+expect_error("borrowed value") {
+    void tupsafeUniqueCoalesceRawLocalAssign(TupsafeTupleOwner* p)
+    {
+        TupsafeTupleOwner* q = p;
+        unique TupsafeTupleOwner* t = nullptr;
+        t = q ?? new TupsafeTupleOwner();
+    }
+}
+
+void tupsafeUniqueCoalesceSink(move TupsafeTupleOwner* p) { }
+
+expect_error("cannot move borrowed") {
+    void tupsafeUniqueCoalesceFieldSink(TupsafeBorrowedTupleHolder holder)
+    {
+        tupsafeUniqueCoalesceSink(holder.p ?? new TupsafeTupleOwner());
+    }
+}
+
+expect_error("cannot move borrowed") {
+    void tupsafeUniqueCoalesceGlobalSink()
+    {
+        tupsafeUniqueCoalesceSink(
+            tupsafeBorrowedTupleGlobal ?? new TupsafeTupleOwner());
+    }
+}
+
+expect_error("borrowed value") {
+    void tupsafeTupleCoalesceParam(TupsafeTupleOwner* p)
+    {
+        (unique TupsafeTupleOwner*, int) tuple = (p ?? new TupsafeTupleOwner(), 4);
+    }
+}
+
+expect_error("borrowed value") {
+    void tupsafeTupleCoalesceField(TupsafeBorrowedTupleHolder holder)
+    {
+        (unique TupsafeTupleOwner*, int) tuple = (holder.p ?? new TupsafeTupleOwner(), 4);
+    }
+}
+
+expect_error("borrowed value") {
+    void tupsafeTupleCoalesceGlobal()
+    {
+        (unique TupsafeTupleOwner*, int) tuple =
+            (tupsafeBorrowedTupleGlobal ?? new TupsafeTupleOwner(), 4);
+    }
+}
+
+expect_error("borrowed value") {
+    void tupsafeTupleCoalesceRawLocal(TupsafeTupleOwner* p)
+    {
+        TupsafeTupleOwner* q = p;
+        (unique TupsafeTupleOwner*, int) tuple = (q ?? new TupsafeTupleOwner(), 4);
+    }
+}
+
+expect_error("cannot initialize unique") {
+    struct TupsafeImplicitThisCoalesceHolder
+    {
+        TupsafeTupleOwner* p = default;
+        void reject()
+        {
+            unique TupsafeTupleOwner* t = p ?? new TupsafeTupleOwner();
+        }
+    };
+}
+
+expect_error("allocates a value") {
+    void tupsafeUniqueCoalesceExplicitMoveParamDecl(TupsafeTupleOwner* p)
+    {
+        unique TupsafeTupleOwner* t = move p ?? new TupsafeTupleOwner();
+    }
+}
+
+expect_error("cannot move borrowed parameter 'p'") {
+    void tupsafeUniqueCoalesceExplicitMoveSink(TupsafeTupleOwner* p)
+    {
+        tupsafeUniqueCoalesceSink(move p ?? new TupsafeTupleOwner());
+    }
+}
+
+expect_error("cannot initialize unique") {
+    void tupsafeUniqueCoalesceUniqueLocalDecl()
+    {
+        unique TupsafeTupleOwner* u = new TupsafeTupleOwner();
+        unique TupsafeTupleOwner* t = u ?? new TupsafeTupleOwner();
+    }
+}
+
+expect_error("cannot initialize unique") {
+    void tupsafeUniqueCoalesceUniqueFieldDecl()
+    {
+        TupsafeRawTupleHolder h = default;
+        h.a = new TupsafeTupleOwner();
+        unique TupsafeTupleOwner* t = h.a ?? new TupsafeTupleOwner();
+    }
+}
+
+expect_error("cannot initialize unique") {
+    void tupsafeUniqueCoalesceOwnedMoveParamDecl(move TupsafeTupleOwner* p)
+    {
+        unique TupsafeTupleOwner* t = p ?? new TupsafeTupleOwner();
+    }
+}
+
+expect_error("'??' operands differ in ownership") {
+    void tupsafeUniqueCoalesceMixedMoveParamDiagnostic(TupsafeTupleOwner* p)
+    {
+        unique TupsafeTupleOwner* t = move p ?? new TupsafeTupleOwner();
+    }
+}
+
+expect_error("cannot move borrowed field 'this.p'") {
+    struct TupsafeThisFieldCoalesceSink
+    {
+        TupsafeTupleOwner* p = default;
+        void reject() { tupsafeUniqueCoalesceSink(p ?? new TupsafeTupleOwner()); }
+    };
+}

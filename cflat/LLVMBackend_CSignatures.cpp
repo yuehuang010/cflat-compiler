@@ -264,7 +264,7 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
                 // A record by value needs the aggregate ABI arrangement, which is not part of
                 // this prototype - refuse at registration so the LSP sees the same answer.
                 // A refused declaration still proves its namespace exists - seed before the drop.
-                if (!e.prvalueOnlyByValue && RejectCxxRecordByValue(e))
+                if (!e.allowsDirectNontrivialByValue && RejectCxxRecordByValue(e))
                 {
                     SeedCxxNamespacesOfDottedName(e.name);
                     continue;

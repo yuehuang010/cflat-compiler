@@ -717,7 +717,8 @@ LLVMBackend::TypedValue MainListener::TypedValueOfNamedOperand(LLVMBackend::Name
         result.stackCharBufferScopeDepth = namedVar.StackCharBufferScopeDepth;
         result.sourceCallerName = namedVar.CallerName.empty()
             ? namedVar.TypeAndValue.VariableName : namedVar.CallerName;
-        result.sourceFieldName = namedVar.FieldName;
+        result.sourceFieldName = namedVar.FieldName.empty() && namedVar.RootIsBorrowedThisField
+            ? namedVar.ThisFieldPath : namedVar.FieldName;
         result.bitfieldStorage = namedVar.BitfieldStorage;
         result.sourceMovePathKey = namedVar.MovePathKey;
         result.sourceMovePathHasDynamicIndex = namedVar.MovePathHasDynamicIndex;

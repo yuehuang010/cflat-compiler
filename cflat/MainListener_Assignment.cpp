@@ -327,6 +327,43 @@ bool MainListener::IsWholeCxxCallArgumentShape(
 {
         if (ctx == nullptr) return false;
         if (IsDirectCallArgument(ctx) || IsCallArgumentThroughParens(ctx)) return true;
+        if (inCxxCallArgument_)
+        {
+            antlr4::tree::ParseTree* node = ctx->parent;
+            while (node != nullptr)
+            {
+                if (dynamic_cast<CFlatParser::ArgumentNamedExpressionContext*>(node) != nullptr)
+                    break;
+                if (auto* field = dynamic_cast<CFlatParser::FieldInitContext*>(node))
+                {
+                    if (field->Identifier() != nullptr || field->Colon() != nullptr
+                        || field->initializerList() != nullptr
+                        || field->assignmentExpression().size() != 1)
+                        break;
+                    auto* assignment = field->assignmentExpression(0);
+                    if (SoleTernaryExpression(assignment) != ctx) break;
+                    auto* list = dynamic_cast<CFlatParser::InitializerListContext*>(field->parent);
+                    if (list == nullptr) break;
+                    auto* owner = dynamic_cast<antlr4::ParserRuleContext*>(list->parent);
+                    if (dynamic_cast<CFlatParser::NewExpressionContext*>(owner) != nullptr)
+                        return true;
+                    break;
+                }
+                auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+                if (rule == nullptr) break;
+                bool passThrough = rule->children.size() == 1;
+                if (!passThrough && rule->children.size() == 3)
+                {
+                    auto* left = dynamic_cast<antlr4::tree::TerminalNode*>(rule->children[0]);
+                    auto* right = dynamic_cast<antlr4::tree::TerminalNode*>(rule->children[2]);
+                    passThrough = left != nullptr && right != nullptr
+                        && left->getSymbol()->getType() == CFlatParser::LeftParen
+                        && right->getSymbol()->getType() == CFlatParser::RightParen;
+                }
+                if (!passThrough) break;
+                node = rule->parent;
+            }
+        }
         if (expected.TypeName.empty() || expected.Pointer || expected.PointerDepth > 0
             || cxxCallArgumentExpectedType_.TypeName.empty()
             || cxxCallArgumentExpectedType_.Pointer || cxxCallArgumentExpectedType_.PointerDepth > 0
@@ -537,6 +574,108 @@ static CFlatParser::TupleExpressionContext* BareTupleLiteralCast(CFlatParser::Ca
     auto* primary = postfix->primaryExpression();
     if (primary == nullptr || primary->children.size() != 1) return nullptr;
     return primary->tupleExpression();
+}
+
+void MainListener::PrepareTupleLiteralStringsForAdoption(
+        LLVMBackend::NamedVariable& value, antlr4::ParserRuleContext* ctx) {
+        auto* compiler = Compiler(ctx);
+        auto prepare = [&](auto&& self, LLVMBackend::NamedVariable& tuple) -> bool {
+            if (!tuple.IsTupleLiteral || tuple.Storage == nullptr
+                || tuple.TypeAndValue.TypeName.empty())
+                return false;
+            const std::string typeName = compiler->ResolveTypeAlias(tuple.TypeAndValue.TypeName);
+            const auto data = compiler->GetDataStructure(typeName);
+            auto* tupleType = data.StructType;
+            if (tupleType == nullptr || data.StructFields.size() != tuple.TupleLiteralElements.size())
+                return false;
+            auto* stringType = llvm::StructType::getTypeByName(*compiler->context, "string");
+            bool changed = false;
+            for (size_t i = 0; i < data.StructFields.size(); ++i)
+            {
+                auto& element = tuple.TupleLiteralElements[i];
+                const auto& field = data.StructFields[i];
+                auto* slot = compiler->CreateStructGEP(tupleType, tuple.Storage,
+                    static_cast<uint32_t>(i));
+                if (!field.Pointer && stringType != nullptr
+                    && compiler->ResolveTypeAlias(field.TypeName) == "string")
+                {
+                    if (compiler->IsPendingOwnedStringTemp(element.Primary))
+                        compiler->UnregisterOwnedStringTemp(element.Primary);
+                    const bool sourceIsNamedBorrow = element.Storage != nullptr
+                        && !element.CallerName.empty() && !element.IsRvalue
+                        && !element.IsStringLiteral && !element.IsExplicitMove
+                        && !element.TypeAndValue.IsMove;
+                    if (sourceIsNamedBorrow)
+                    {
+                        auto* current = compiler->builder->CreateLoad(stringType, slot);
+                        auto* copied = compiler->EmitOwnedStringDeepCopy(current);
+                        if (copied != current)
+                        {
+                            compiler->builder->CreateStore(copied, slot);
+                            changed = true;
+                        }
+                    }
+                }
+                else if (element.IsTupleLiteral
+                    && self(self, element))
+                {
+                    auto* nestedType = compiler->GetType(element.TypeAndValue);
+                    if (nestedType != nullptr && element.Storage != nullptr)
+                    {
+                        auto* nestedValue = compiler->builder->CreateLoad(nestedType, element.Storage);
+                        compiler->builder->CreateStore(nestedValue, slot);
+                        changed = true;
+                    }
+                }
+            }
+            if (changed)
+            {
+                tuple.Primary = compiler->builder->CreateLoad(tupleType, tuple.Storage,
+                    "tuple.adopt");
+                tuple.BaseType = tupleType;
+            }
+            return changed;
+        };
+        prepare(prepare, value);
+}
+
+bool MainListener::ConditionalTupleHasLiteralArms(antlr4::tree::ParseTree* node) {
+        auto isTupleLiteral = [&](auto&& self, antlr4::tree::ParseTree* expression) -> bool {
+            if (dynamic_cast<CFlatParser::TupleExpressionContext*>(expression) != nullptr)
+                return true;
+            auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(expression);
+            if (rule == nullptr) return false;
+            if (rule->children.size() == 1)
+                return self(self, rule->children.front());
+            if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(rule);
+                primary != nullptr && primary->expression() != nullptr
+                && primary->children.size() == 3)
+                return self(self, primary->expression());
+            return false;
+        };
+        auto* rhs = node;
+        if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node);
+            assignment != nullptr && assignment->assignmentOperator() != nullptr)
+            rhs = assignment->assignmentExpression();
+        auto* conditional = SoleTernaryExpression(rhs);
+        return conditional != nullptr && conditional->expression() != nullptr
+            && conditional->conditionalExpression() != nullptr
+            && isTupleLiteral(isTupleLiteral, conditional->expression())
+            && isTupleLiteral(isTupleLiteral, conditional->conditionalExpression());
+}
+
+void MainListener::DestroyConditionalTupleStageAfterCopy(antlr4::tree::ParseTree* node,
+        llvm::Value* stageValue, const std::string& typeName) {
+        auto* compiler = Compiler(dynamic_cast<antlr4::ParserRuleContext*>(node));
+        if (stageValue == nullptr || !stageValue->getType()->isStructTy()
+            || !ConditionalTupleHasLiteralArms(node)
+            || !compiler->IsOwningValueType(typeName))
+            return;
+        auto* destructor = compiler->GetOrCreateFullDestructor(typeName);
+        if (destructor == nullptr) return;
+        auto* stage = compiler->CreateAlloca(stageValue->getType());
+        compiler->builder->CreateStore(stageValue, stage);
+        compiler->builder->CreateCall(destructor->getFunctionType(), destructor, { stage });
 }
 
 LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFlatParser::AssignmentExpressionContext* ctx,
@@ -7952,6 +8091,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     !namedVar.TypeAndValue.Pointer && compiler->IsCxxRecord(namedVar.TypeAndValue.TypeName));
                 return ParseAssignmentExpressionNamed(assignCtx);
             }();
+            if (operatorText == "=" && rightNV.IsTupleLiteral)
+            {
+                rightNV.TypeAndValue.IsMove = true;
+            }
             // A `?:` string join that owns its buffer (moved arms, copied place arms) is a fresh
             // temp: its storage join names the arm sources, not an lvalue to copy from.
             if (operatorText == "=" && rightNV.Primary != nullptr
@@ -9078,6 +9221,28 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                             "cannot assign {} '{}' from borrowed value '{}' - the source "
                             "still owns it; use 'new', a 'move' expression, or a move-returning call",
                             uniqueType, destName, borrowedParamCall));
+                    return finishStore(right);
+                }
+
+                const bool uniqueFieldOwnsCopyJoin = destinationIsField
+                    && compiler->FindOwningLocalCopyJoinArm(rightNV.Primary) != nullptr;
+                if (compiler->JoinHasProvenBorrowedArm(right) && !uniqueFieldOwnsCopyJoin)
+                {
+                    if (destinationIsField)
+                        LogErrorContext(ctx, std::format(
+                            "cannot assign a borrowed value to unique field '{}' - the source "
+                            "still owns it; use 'new', a 'move' expression, or a move-returning call",
+                            DescribeUniqueFieldOwner(namedVar)));
+                    else
+                    {
+                        const std::string uniqueType = SpellType(*compiler, namedVar.TypeAndValue);
+                        const std::string destName = namedVar.CallerName.empty()
+                            ? namedVar.TypeAndValue.VariableName : namedVar.CallerName;
+                        LogErrorContext(ctx, std::format(
+                            "cannot reset {} '{}' from a borrowed value - the source still owns it; "
+                            "use 'new', a 'move' expression, or a move-returning call",
+                            uniqueType, destName));
+                    }
                     return finishStore(right);
                 }
 
@@ -11720,8 +11885,12 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 // above). On a Move, zero the moved-out source so its always-run scope-exit destructor
                 // is a no-op (cflat value-type move = zero the source) and mark it moved.
                 AssignSourceKind kind;
+                llvm::Value* tupleStageValue = right;
                 llvm::Value* toStore = ClassifyOwningAssignSource(
                     right, rightNV.TypeAndValue.TypeName, rightNV.TypeAndValue.IsMove, ctx, kind);
+                if (kind == AssignSourceKind::Copy)
+                    DestroyConditionalTupleStageAfterCopy(ctx, tupleStageValue,
+                        rightNV.TypeAndValue.TypeName);
                 // Only a MOVE consumes the field; a copyable owner (`t = h->name`) copies.
                 if (kind == AssignSourceKind::Move
                     && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
@@ -11778,6 +11947,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 AssignSourceKind kind;
                 llvm::Value* toStore = ClassifyOwningAssignSource(
                     right, namedVar.TypeAndValue.TypeName, rightNV.TypeAndValue.IsMove, ctx, kind);
+                if (kind == AssignSourceKind::Copy)
+                    DestroyConditionalTupleStageAfterCopy(ctx, right,
+                        namedVar.TypeAndValue.TypeName);
                 if (kind == AssignSourceKind::Move
                     && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
                     return finishStore(right);
@@ -11854,6 +12026,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 AssignSourceKind kind;
                 llvm::Value* toStore = ClassifyOwningAssignSource(
                     right, rightNV.TypeAndValue.TypeName, rightNV.TypeAndValue.IsMove, ctx, kind);
+                if (kind == AssignSourceKind::Copy)
+                    DestroyConditionalTupleStageAfterCopy(ctx, right,
+                        rightNV.TypeAndValue.TypeName);
                 if (kind == AssignSourceKind::Move
                     && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
                     return finishStore(right);
@@ -11955,6 +12130,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 {
                     toStore = ClassifyOwningAssignSource(
                         right, namedVar.TypeAndValue.TypeName, rightNV.TypeAndValue.IsMove, ctx, kind);
+                    if (kind == AssignSourceKind::Copy)
+                        DestroyConditionalTupleStageAfterCopy(ctx, right,
+                            namedVar.TypeAndValue.TypeName);
                     if (kind == AssignSourceKind::Move
                         && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
                         return finishStore(right);
@@ -12374,6 +12552,21 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     return finishStore(right);
                 }
 
+                if (compiler->JoinHasProvenBorrowedArm(rightNV.Primary != nullptr
+                        ? rightNV.Primary : right))
+                {
+                    const std::string uniqueType = std::format("unique<{}>",
+                        SpellType(*compiler, LLVMBackend::TypeAndValue{
+                            .TypeName = namedVar.TypeAndValue.TypeName }));
+                    const std::string destName = namedVar.CallerName.empty()
+                        ? namedVar.TypeAndValue.VariableName : namedVar.CallerName;
+                    LogErrorContext(ctx, std::format(
+                        "cannot reset {} '{}' from a borrowed value - the source still owns it; "
+                        "use 'new', a 'move' expression, or a move-returning call",
+                        uniqueType, destName));
+                    return finishStore(right);
+                }
+
                 // A direct CFlat raw-pointer return is borrowed unless its declaration carries
                 // owned/alias provenance. Assignment must enforce the same rule as declaration.
                 RejectRawHeapArrayIntoUniqueLocal(
@@ -12725,6 +12918,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 AssignSourceKind slotKind;
                 llvm::Value* toStore = ClassifyOwningAssignSource(
                     right, slotElemType, rightNV.TypeAndValue.IsMove, ctx, slotKind);
+                if (slotKind == AssignSourceKind::Copy)
+                    DestroyConditionalTupleStageAfterCopy(ctx, right, slotElemType);
                 if (slotKind == AssignSourceKind::Move
                     && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
                     return finishStore(right);

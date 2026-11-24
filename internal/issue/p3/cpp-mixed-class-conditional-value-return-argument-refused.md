@@ -18,17 +18,11 @@ struct BV { int v; BV(int n) noexcept; BV(A a) noexcept /* v = a.v + 100 */; BV(
 inline A mkA(int value) noexcept { return A(value); }
 inline BV mkBV(int value = 20) noexcept { return BV(value); }
 inline int ctakeBV(BV value) noexcept { return value.v; }
-struct W { int v; W(BV b) noexcept : v(b.v + 1000) {} };   // repro-only, not in the test header
+struct W { int v; W(BV b) noexcept : v(b.v + 1000) {} W(int x, BV b) noexcept : v(b.v + x + 1000) {} };
 }
 ```
 
 ## Still refused (clang accepts)
-- C++ CONSTRUCTOR call argument: any mixed conditional, prvalue arms included, is refused ("ternary branches
-  have incompatible types 't513mix.BV' and 't513mix.A'"), master and MIXRES alike:
-  `t513mix.W w = t513mix.W(k ? t513mix.mkBV(9) : t513mix.mkA(3));` (clang 1103, trace 1674),
-  `t513mix.W(k ? a : t513mix.mkBV(20))` (clang 1103 / 126744), nested `t513mix.W(k ? (j ? mkA(1) : mkBV(2)) : mkA(3))`.
-  Root cause (unverified): the ctor-call argument path does not enter the call-argument mixed join
-  (`callArgument` in lowerMixedCxxValueJoin) - no expected parameter type reaches the `?:`.
 - Nested mixed `?:` into a GENERIC CFlat callee is refused ("ternary branches have incompatible types
   't513mix.BV' and 't513mix.A'"); the flat form `gg(k ? mkBV(1) : mkA(2))` works (= clang 1/57, 102/1674).
   clang (`template<class T> int gg(T v)`) gives 1 102 3 3 for (k,j) = 11,10,01,00:
@@ -39,6 +33,35 @@ struct W { int v; W(BV b) noexcept : v(b.v + 1000) {} };   // repro-only, not in
   `ctakeBV(k ? a : mkBV(3))` (clang 107 107 3 3); the direct import works (pre-existing).
 - Nested mixed `?:` into a `std::string` (or other class) parameter whose leaves are non-class values beside
   class leaves stays refused (legacy, pre-existing).
+
+## MIXCOND4 round-2 residuals (measured against the round-1 worktree, frozen master, and clang++)
+Repro-only classes (not in the test header), same trace digits as above; value and `t513M3Sequence` are read
+right after construction, k=false first, then k=true:
+
+```cpp
+namespace rv { using namespace t513mix;
+struct W2 { int v; W2(BV b) noexcept : v(b.v + 1000) {} W2(A a) noexcept : v(a.v + 2000) {} };
+struct W6 { int v; W6(BV b) noexcept : v(b.v + 1000) {} template <class T> W6(T, int) noexcept : v(6) {} };
+struct C10 { int v; C10(A a) noexcept : v(a.v + 10000) {} C10(BV b) noexcept : v(b.v + 20000) {}
+             C10(const C10& o) noexcept : v(o.v) {} ~C10() noexcept {} };
+struct W10 { int v; W10(C10 c) noexcept : v(c.v) {} };
+struct W12 { int v; W12(BV b) noexcept : v(b.v + 1000) {} W12(int x) noexcept : v(x) {} };
+}
+```
+- Local brace initialization `t513mix.W w{k ? t513mix.mkBV(9) : t513mix.mkA(3)};` is refused by both CFlat
+  binaries; clang gives `1103/1674` and `1009/57`. This is the separate brace-elements path in
+  `MainListener_Declarations.cpp`; round 1's trial expected-type extension added a BV move/dtor.
+- `new rv.W10(k ? t513mix.mkBV(9) : t513mix.mkA(3))` gives CFlat `20103/169774`, `20009/5977` on both
+  binaries, while clang gives `20103/1674`, `20009/57` (extra BV move/dtor).
+- Overloaded by-value `rv.W2(BV)` / `rv.W2(A)` refuses on both CFlat binaries; clang gives `1103/1674`,
+  `1009/57`.
+- Overloaded by-value `rv.W12(BV)` / `rv.W12(int)` refuses on both CFlat binaries; clang gives `1103/1674`,
+  `1009/57`.
+- Template-ctor class `rv.W6` refuses on both CFlat binaries; clang gives `1103/1674`, `1009/57`.
+- Paren construction `rv.W10(k ? t513mix.mkBV(9) : t513mix.mkA(3))` refuses on both CFlat binaries; clang
+  gives `20103/1674`, `20009/57`.
+- `new t513mix.W{(t513mix.BV)(k ? t513mix.mkBV(9) : t513mix.mkA(3))}` refuses on both CFlat binaries;
+  clang gives `1103/1674`, `1009/57`.
 
 ## Count / order (values match clang, no leak)
 - Moved lvalue arm `k ? move a : mkBV(20)` with `BV(A a)`: CFlat relocates `a` into the by-value `A` parameter

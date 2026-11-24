@@ -8606,6 +8606,12 @@ int tupownRawSink(move (unique TupownRawOwner*, int) value)
 {
     return value.item_0->value * 10 + value.item_1;
 }
+int tupownRawUniqueSink(move TupownRawOwner* value)
+{
+    int result = value->value;
+    delete value;
+    return result;
+}
 bool tupownTestMovedJoinTuple(bool choose)
 {
     tupownRawDtorCount = 0;
@@ -8764,6 +8770,47 @@ bool tupownTestRawCoalesceTuple()
     result &= Test("tupown raw-coalesce tuple dtor once", tupownRawDtorCount, 1);
     return result;
 }
+bool tupownTestCoalesceAcceptSet()
+{
+    bool result = true;
+    int value = 0;
+
+    tupownRawDtorCount = 0;
+    { TupownRawOwner* a = new TupownRawOwner();
+      a->value = 31;
+      unique TupownRawOwner* t = move a ?? new TupownRawOwner();
+      value = t->value; }
+    result &= Test("tupown coalborrow moved-local value", value, 31);
+    result &= Test("tupown coalborrow moved-local dtor once", tupownRawDtorCount, 1);
+
+    tupownRawDtorCount = 0;
+    { unique TupownRawOwner* t = tupownRawMake(47) ?? new TupownRawOwner();
+      value = t->value; }
+    result &= Test("tupown coalborrow move-call value", value, 47);
+    result &= Test("tupown coalborrow move-call dtor once", tupownRawDtorCount, 1);
+
+    tupownRawDtorCount = 0;
+    { TupownRawOwner* a = new TupownRawOwner();
+      a->value = 53;
+      unique TupownRawOwner* t = a ?? new TupownRawOwner();
+      value = t->value; }
+    result &= Test("tupown coalborrow owned-local value", value, 53);
+    result &= Test("tupown coalborrow owned-local dtor once", tupownRawDtorCount, 1);
+
+    tupownRawDtorCount = 0;
+    { unique TupownRawOwner* u = new TupownRawOwner();
+      u->value = 59;
+      value = tupownRawUniqueSink(u ?? new TupownRawOwner()); }
+    result &= Test("tupown coalborrow unique-local sink value", value, 59);
+    result &= Test("tupown coalborrow unique-local sink dtor once", tupownRawDtorCount, 1);
+
+    tupownRawDtorCount = 0;
+    { unique TupownRawOwner* t = nullptr ?? new TupownRawOwner();
+      value = t->value; }
+    result &= Test("tupown coalborrow nullptr-left value", value, 23);
+    result &= Test("tupown coalborrow nullptr-left dtor once", tupownRawDtorCount, 1);
+    return result;
+}
 
 struct TlcUnused { int k = 0; TlcUnused((int, int) x) { } };
 struct TlcUse { int k = 0; TlcUse((int, int) x) { k = x.item_1; } };
@@ -8870,6 +8917,7 @@ bool testTupleLambdaParamsAndDtors()
     result &= tupownTestNestedNewNullJoinTuple(true, false);
     result &= tupownTestNestedNewNullJoinTuple(false, true);
     result &= tupownTestRawCoalesceTuple();
+    result &= tupownTestCoalesceAcceptSet();
     result &= tupownTestMoveCallJoinTuple(true, 0);
     result &= tupownTestMoveCallJoinTuple(false, 0);
     result &= tupownTestMoveCallJoinTuple(true, 1);
@@ -9555,6 +9603,41 @@ int tupleLiteralWideningOverloadB((double, int) value) { return 2; }
 int tupleLiteralWideningOverloadB((i64, int) value) { return 1; }
 int tupleArrayFunctionPointerTarget((int, int)* q) { return q[1].item_0; }
 int tupleLiteralFunctionPointerTarget((i64, int) pair) { return (int)pair.item_0 + pair.item_1; }
+(int, string) tupleLiteralStringReturnValue() { return (6, "return"); }
+int tupleLiteralStringCallTarget((int, string) value)
+{
+    return value.item_0 + (value.item_1 == "s" ? 100 : 0);
+}
+move string tupleLiteralStringCallResult() { return toString(123); }
+int tupleStringJoinDtorCount = 0;
+bool tupleStringJoinSelectedIntact = false;
+bool tupleStringJoinSourcesIntact = false;
+struct TupleStringJoinOwner
+{
+    int v = 7;
+    ~TupleStringJoinOwner() { tupleStringJoinDtorCount++; }
+};
+struct TupleLiteralFieldHolder { (int, string) p = default; };
+struct TupleLiteralMethodFieldHolder
+{
+    (int, string) p = default;
+    void setp() { p = (3, tupleLiteralStringCallResult()); }
+    void setp2() { this.p = (4, tupleLiteralStringCallResult()); }
+};
+int tupleStringJoinProbe(bool c)
+{
+    string s1 = "s";
+    string s2 = "q";
+    int value = 0;
+    {
+        (unique TupleStringJoinOwner*, int, string) t =
+            (c ? new TupleStringJoinOwner() : nullptr, 4, c ? s1 : s2);
+        value = (t.item_0 == nullptr ? 0 : t.item_0->v) * 100 + t.item_1;
+        tupleStringJoinSelectedIntact = c ? t.item_2 == "s" : t.item_2 == "q";
+    }
+    tupleStringJoinSourcesIntact = s1 == "s" && s2 == "q";
+    return value;
+}
 
 bool testTupleLiteralElementConversions()
 {
@@ -9670,5 +9753,229 @@ bool testTupleLiteralElementConversions()
     int sideEffectSize = sizeof (sideEffectCount++, 4);
     result &= Test("sizeof tuple literal does not evaluate", sideEffectCount, 0);
     result &= Test("sizeof tuple literal side-effect size", sideEffectSize, 8);
+
+    (int, string) stringLiteralTuple = (4, "s");
+    result &= Test("tuple string literal value", stringLiteralTuple.item_0, 4);
+    result &= Test("tuple string literal contents", stringLiteralTuple.item_1 == "s", true);
+    (string, int) reverseStringLiteralTuple = ("r", 6);
+    result &= Test("tuple leading string literal", reverseStringLiteralTuple.item_0 == "r", true);
+    result &= Test("tuple trailing integer after string", reverseStringLiteralTuple.item_1, 6);
+
+    string namedTupleString = "named";
+    (int, string) namedStringTuple = (4, namedTupleString);
+    result &= Test("tuple named string value", namedStringTuple.item_1 == "named", true);
+
+    (int, string) returnedStringTuple = tupleLiteralStringReturnValue();
+    result &= Test("tuple string return value", returnedStringTuple.item_0, 6);
+    result &= Test("tuple string return contents", returnedStringTuple.item_1 == "return", true);
+    (int, string) assignedStringTuple = (0, "old");
+    assignedStringTuple = (5, "new");
+    result &= Test("tuple string assignment value", assignedStringTuple.item_0, 5);
+    result &= Test("tuple string assignment contents", assignedStringTuple.item_1 == "new", true);
+
+    result &= Test("tuple string literal call argument",
+        tupleLiteralStringCallTarget((4, "s")), 104);
+    ((int, string), int) nestedStringTuple = ((4, "s"), 2);
+    result &= Test("nested tuple string literal value", nestedStringTuple.item_0.item_0, 4);
+    result &= Test("nested tuple string literal contents",
+        nestedStringTuple.item_0.item_1 == "s", true);
+    result &= Test("nested tuple trailing value", nestedStringTuple.item_1, 2);
+
+    bool tupleStringCondition = true;
+    string tupleStringLeft = "left";
+    string tupleStringRight = "right";
+    {
+        (int, string) ternaryStringTuple =
+            (4, tupleStringCondition ? tupleStringLeft : tupleStringRight);
+        result &= Test("tuple string ternary selected value",
+            ternaryStringTuple.item_1 == "left", true);
+    }
+    result &= Test("tuple string ternary keeps both sources",
+        tupleStringLeft == "left" && tupleStringRight == "right", true);
+    tupleStringCondition = false;
+    {
+        (int, string) ternaryStringTuple =
+            (4, tupleStringCondition ? tupleStringLeft : tupleStringRight);
+        result &= Test("tuple string ternary false value",
+            ternaryStringTuple.item_1 == "right", true);
+    }
+
+    HeapAudit.enable();
+    u64 tupleStringHeapBaseline = HeapAudit.reportLeaks();
+    {
+        (int, string) callResultStringTuple = (8, tupleLiteralStringCallResult());
+        result &= Test("tuple call result string", callResultStringTuple.item_1 == "123", true);
+    }
+    result &= Test("tuple call result string freed", HeapAudit.reportLeaks(), tupleStringHeapBaseline);
+    tupleStringHeapBaseline = HeapAudit.reportLeaks();
+    {
+        string movedTupleString = toString(321);
+        (int, string) movedStringTuple = (9, move movedTupleString);
+        result &= Test("tuple moved string contents", movedStringTuple.item_1 == "321", true);
+    }
+    result &= Test("tuple moved string freed", HeapAudit.reportLeaks(), tupleStringHeapBaseline);
+
+    tupleStringHeapBaseline = HeapAudit.reportLeaks();
+    {
+        TupleLiteralFieldHolder holder;
+        holder.p = (1, tupleLiteralStringCallResult());
+        result &= Test("tuple field call result value", holder.p.item_0, 1);
+        result &= Test("tuple field call result contents", holder.p.item_1 == "123", true);
+    }
+    result &= Test("tuple field call result freed", HeapAudit.reportLeaks(), tupleStringHeapBaseline);
+
+    tupleStringHeapBaseline = HeapAudit.reportLeaks();
+    {
+        TupleLiteralMethodFieldHolder holder;
+        holder.setp();
+        result &= Test("tuple method field implicit value", holder.p.item_0, 3);
+        result &= Test("tuple method field implicit contents", holder.p.item_1 == "123", true);
+        holder.setp2();
+        result &= Test("tuple method this field value", holder.p.item_0, 4);
+        result &= Test("tuple method this field contents", holder.p.item_1 == "123", true);
+    }
+    result &= Test("tuple method field strings freed", HeapAudit.reportLeaks(), tupleStringHeapBaseline);
+
+    tupleStringHeapBaseline = HeapAudit.reportLeaks();
+    {
+        string fieldSourceString = toString(321);
+        TupleLiteralFieldHolder holder;
+        holder.p = (7, fieldSourceString);
+        result &= Test("tuple field named string value", holder.p.item_0, 7);
+        result &= Test("tuple field named string copy", holder.p.item_1 == "321", true);
+        result &= Test("tuple field named string source remains", fieldSourceString == "321", true);
+    }
+    result &= Test("tuple field named string freed", HeapAudit.reportLeaks(), tupleStringHeapBaseline);
+
+    tupleStringHeapBaseline = HeapAudit.reportLeaks();
+    {
+        bool tupleBranch = false;
+        (int, string) ternaryTuple = tupleBranch
+            ? (1, tupleLiteralStringCallResult()) : (2, tupleLiteralStringCallResult());
+        result &= Test("tuple ternary declaration selected value", ternaryTuple.item_0, 2);
+        result &= Test("tuple ternary declaration selected string", ternaryTuple.item_1 == "123", true);
+    }
+    result &= Test("tuple ternary declaration staged allocation freed",
+        HeapAudit.reportLeaks(), tupleStringHeapBaseline);
+
+    tupleStringHeapBaseline = HeapAudit.reportLeaks();
+    {
+        bool tupleBranch = false;
+        (int, string) ternaryTupleAssignment = (0, "old");
+        ternaryTupleAssignment = tupleBranch
+            ? (1, tupleLiteralStringCallResult()) : (2, tupleLiteralStringCallResult());
+        result &= Test("tuple ternary assignment selected value", ternaryTupleAssignment.item_0, 2);
+        result &= Test("tuple ternary assignment selected string",
+            ternaryTupleAssignment.item_1 == "123", true);
+    }
+    result &= Test("tuple ternary assignment staged allocation freed",
+        HeapAudit.reportLeaks(), tupleStringHeapBaseline);
+
+    tupleStringHeapBaseline = HeapAudit.reportLeaks();
+    {
+        bool tupleBranch = true;
+        (int, string) mixedTernaryTuple = tupleBranch
+            ? (1, "a") : (2, tupleLiteralStringCallResult());
+        result &= Test("tuple mixed ternary literal arm value", mixedTernaryTuple.item_0, 1);
+        result &= Test("tuple mixed ternary literal arm string", mixedTernaryTuple.item_1 == "a", true);
+        tupleBranch = false;
+        mixedTernaryTuple = tupleBranch
+            ? (1, "b") : (2, tupleLiteralStringCallResult());
+        result &= Test("tuple mixed ternary call arm value", mixedTernaryTuple.item_0, 2);
+        result &= Test("tuple mixed ternary call arm string", mixedTernaryTuple.item_1 == "123", true);
+    }
+    result &= Test("tuple mixed ternary staged allocation freed",
+        HeapAudit.reportLeaks(), tupleStringHeapBaseline);
+
+    bool tupleLiteralBranch = true;
+    (int, string) tupleLiteralTernary = (4, tupleLiteralBranch ? "left" : "right");
+    result &= Test("tuple literal ternary true value", tupleLiteralTernary.item_1 == "left", true);
+    tupleLiteralBranch = false;
+    (int, string) tupleLiteralTernaryFalse = (4,
+        tupleLiteralBranch ? "left" : "right");
+    result &= Test("tuple literal ternary false value", tupleLiteralTernaryFalse.item_1 == "right", true);
+
+    tupleStringHeapBaseline = HeapAudit.reportLeaks();
+    {
+        (int, string) assignedCallResultTuple = (0, "old");
+        assignedCallResultTuple = (5, tupleLiteralStringCallResult());
+        result &= Test("tuple call assignment value", assignedCallResultTuple.item_0, 5);
+        result &= Test("tuple call assignment contents",
+            assignedCallResultTuple.item_1 == "123", true);
+    }
+    result &= Test("tuple call assignment string freed",
+        HeapAudit.reportLeaks(), tupleStringHeapBaseline);
+
+    tupleStringHeapBaseline = HeapAudit.reportLeaks();
+    {
+        ((int, string), int) nestedCallResultTuple =
+            ((1, tupleLiteralStringCallResult()), 2);
+        result &= Test("nested tuple call value", nestedCallResultTuple.item_0.item_0, 1);
+        result &= Test("nested tuple call contents",
+            nestedCallResultTuple.item_0.item_1 == "123", true);
+        result &= Test("nested tuple call tail", nestedCallResultTuple.item_1, 2);
+    }
+    result &= Test("nested tuple call string freed",
+        HeapAudit.reportLeaks(), tupleStringHeapBaseline);
+
+    tupleStringJoinDtorCount = 0;
+    tupleStringHeapBaseline = HeapAudit.reportLeaks();
+    int tupleStringJoinTrueValue = tupleStringJoinProbe(true);
+    int tupleStringJoinTrueDtorCount = tupleStringJoinDtorCount;
+    result &= Test("tuple unique string ternary true value", tupleStringJoinTrueValue, 704);
+    result &= Test("tuple unique string ternary true selected string",
+        tupleStringJoinSelectedIntact, true);
+    result &= Test("tuple unique string ternary true source strings",
+        tupleStringJoinSourcesIntact, true);
+    result &= Test("tuple unique string ternary true owner dtor",
+        tupleStringJoinTrueDtorCount, 1);
+    result &= Test("tuple unique string ternary true heap stable",
+        HeapAudit.reportLeaks(), tupleStringHeapBaseline);
+    tupleStringJoinDtorCount = 0;
+    tupleStringHeapBaseline = HeapAudit.reportLeaks();
+    int tupleStringJoinFalseValue = tupleStringJoinProbe(false);
+    result &= Test("tuple unique string ternary false value", tupleStringJoinFalseValue, 4);
+    result &= Test("tuple unique string ternary false selected string",
+        tupleStringJoinSelectedIntact, true);
+    result &= Test("tuple unique string ternary false source strings",
+        tupleStringJoinSourcesIntact, true);
+    result &= Test("tuple unique string ternary false owner dtor",
+        tupleStringJoinDtorCount, 0);
+    result &= Test("tuple unique string ternary false heap stable",
+        HeapAudit.reportLeaks(), tupleStringHeapBaseline);
+
+    tupleStringJoinDtorCount = 0;
+    tupleStringHeapBaseline = HeapAudit.reportLeaks();
+    {
+        (unique TupleStringJoinOwner*, int, string) literalOwnerTuple =
+            (new TupleStringJoinOwner(), 4, "s");
+        result &= Test("tuple unique string literal contents", literalOwnerTuple.item_2 == "s", true);
+    }
+    result &= Test("tuple unique string literal owner dtor", tupleStringJoinDtorCount, 1);
+    result &= Test("tuple unique string literal heap stable",
+        HeapAudit.reportLeaks(), tupleStringHeapBaseline);
+
+    tupleStringJoinDtorCount = 0;
+    tupleStringHeapBaseline = HeapAudit.reportLeaks();
+    {
+        (unique TupleStringJoinOwner*, int, string) callOwnerTuple =
+            (new TupleStringJoinOwner(), 4, tupleLiteralStringCallResult());
+        result &= Test("tuple unique call result string", callOwnerTuple.item_2 == "123", true);
+    }
+    result &= Test("tuple unique call result owner dtor", tupleStringJoinDtorCount, 1);
+    result &= Test("tuple unique call result heap stable",
+        HeapAudit.reportLeaks(), tupleStringHeapBaseline);
+
+    tupleStringJoinDtorCount = 0;
+    tupleStringHeapBaseline = HeapAudit.reportLeaks();
+    string movedUniqueTupleString = toString(456);
+    {
+        (unique TupleStringJoinOwner*, int, string) moveOwnerTuple =
+            (new TupleStringJoinOwner(), 4, move movedUniqueTupleString);
+        result &= Test("tuple unique moved string", moveOwnerTuple.item_2 == "456", true);
+    }
+    result &= Test("tuple unique moved string owner dtor", tupleStringJoinDtorCount, 1);
+    result &= Test("tuple unique moved string heap stable",
+        HeapAudit.reportLeaks(), tupleStringHeapBaseline);
     return result;
 }
