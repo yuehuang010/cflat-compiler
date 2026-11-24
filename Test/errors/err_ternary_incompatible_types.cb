@@ -194,11 +194,6 @@ expect_error("cannot initialize C++ class 'T513R7LB' from this expression") {
     }
 }
 
-// T513 r5 (S3): a by-value parameter lvalue arm that converts is refused in return position.
-expect_error("cannot return C++ class 'T513V10B' from this conditional expression") {
-    T513V10B t513V10ReturnParam(bool k, T513V10A a) { return k ? a : t513V10MakeB(); }
-}
-
 // MIXCOND2 r2: prefix arguments with a narrowing conversion refuse the conditional sink.
 expect_error("ternary branches have incompatible types 'T513V10A' and 'T513V10B'") {
     int t513M2LongCall(int x, T513V10B value) { return x + value.value; }
@@ -270,3 +265,17 @@ expect_error("ternary branches have incompatible types 'ternref.T459Derived' and
 }
 
 extern int main() { return 0; }
+
+// MIXRES r2: a refused nested mixed `?:` call argument reports the inner arm clash (explicit EB(A)).
+expect_error("ternary branches have incompatible types 't513mix.A' and 't513mix.EB'") {
+    int t513MixresExplicitNested(bool k, bool j) {
+        return t513mix.takeEB(k ? (j ? t513mix.mkA(1) : t513mix.mkEB(2)) : t513mix.mkEB(3));
+    }
+}
+
+// MIXRES r2: a string leaf beside a class leaf in a nested call-argument `?:` keeps the clash text.
+expect_error("ternary branches have incompatible types 'pointer' and 't513mix.SS'") {
+    int t513MixresStringLeafNested(bool k, bool j) {
+        return t513mix.takeSS(k ? (j ? "abc" : t513mix.mkSS("xy")) : t513mix.mkSS("w"));
+    }
+}

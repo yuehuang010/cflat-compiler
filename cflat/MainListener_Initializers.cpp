@@ -4466,6 +4466,9 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
             // with, so this reads fixedElemTV, not the array's own type.
             RejectStringLiteralIntoStructPointer(fi, fixedElemTV, val,
                                         std::format("element {} of '{}'", i, name));
+            // A C++ class pointer element converts like any store (base offset, downcast refused).
+            val = compiler->AdjustCxxPointerForStore(fixedElemTV, nv.TypeAndValue, val,
+                                                     std::format("element {} of '{}'", i, name));
 
             // Thin sibling of the widen elsewhere: positional fixed-array brace-init into a
             // thin function<> element fed a raw pointer (spelled or generic-encoded).
@@ -5185,6 +5188,8 @@ void MainListener::EmitGlobalFixedArrayInit(
                             val = compiler->BareFunctionToThinValue(val, gclo);
                         compiler->RejectImplicitIntegerPointeePointerConversion(nv.TypeAndValue, globalElemTV);
                         RejectConstDiscardingConversion(fi, nv, val, globalElemTV);
+                        val = compiler->AdjustCxxPointerForStore(globalElemTV, nv.TypeAndValue, val,
+                            std::format("element {} of '{}'", leafIndices[i], name));
                         if (compiler->CodeValueIntoDataDestination(nv, globalElemTV))
                         {
                             codeValueElem = fi;
@@ -5485,6 +5490,8 @@ void MainListener::EmitGlobalFixedArrayInit(
                     val = compiler->BareFunctionToThinValue(val, gclo);
                 compiler->RejectImplicitIntegerPointeePointerConversion(nv.TypeAndValue, globalElemTV);
                 RejectConstDiscardingConversion(fi, nv, val, globalElemTV);
+                val = compiler->AdjustCxxPointerForStore(globalElemTV, nv.TypeAndValue, val,
+                                                         std::format("element {} of '{}'", i, name));
                 if (codeValueElem == nullptr
                     && compiler->CodeValueIntoDataDestination(nv, globalElemTV))
                 {
@@ -6211,6 +6218,8 @@ void MainListener::EmitArrayViewInferredInit(
             // with, so this reads elemTV, not the array's own type.
             RejectStringLiteralIntoStructPointer(fi, elemTV, val,
                                         std::format("element {} of '{}'", i, name));
+            val = compiler->AdjustCxxPointerForStore(elemTV, nv.TypeAndValue, val,
+                                                     std::format("element {} of '{}'", i, name));
 
             // Thin sibling of the widen elsewhere: array-view brace-init into a thin
             // function<> element fed a raw pointer (spelled or generic-encoded).

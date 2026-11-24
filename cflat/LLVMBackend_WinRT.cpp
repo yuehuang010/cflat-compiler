@@ -5951,6 +5951,11 @@ int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const 
                     safelyLowerableScalars = conversion == ScalarArgConversion::Exact
                         || conversion == ScalarArgConversion::Widen;
                     auto* targetType = GetType(firstMethod.Parameters[i]);
+                    // A native call never converts an integer to floating point (direct call refuses it).
+                    if (safelyLowerableScalars && diagnosticArgs[i].BaseType != nullptr
+                        && diagnosticArgs[i].BaseType->isIntegerTy()
+                        && targetType != nullptr && targetType->isFloatingPointTy())
+                        safelyLowerableScalars = false;
                     if (safelyLowerableScalars && diagnosticArgs[i].BaseType != nullptr
                         && diagnosticArgs[i].BaseType->isFloatingPointTy())
                     {
@@ -6296,6 +6301,16 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
                         argumentType, ifaceName, methodName));
                     return nullptr;
                 }
+            }
+            // A proven C++ record pointer builds a by-value C++ class parameter through its ctor.
+            if (nv.AllowCxxClassPointerCtorConversion && nv.TypeAndValue.Pointer && !param.Pointer
+                && !param.IsAlias && IsCxxRecord(param.TypeName)
+                && !MaterializeImplicitCxxClassArgument(nv, param, nullptr))
+            {
+                LogError(std::format(
+                    "cannot materialize implicit C++ class argument '{}' for interface method '{}.{}'",
+                    argumentType, ifaceName, methodName));
+                return nullptr;
             }
             const size_t firstCallArg = callArgs.size();
 

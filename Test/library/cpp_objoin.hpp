@@ -15,6 +15,7 @@ struct Obj {
     Obj& operator=(Obj&& o) noexcept { v = o.v; o.v = -1; ++mvasg; return *this; }
     ~Obj() noexcept { ++dtors; --live; }
     Obj operator+(Obj rhs) const noexcept { return Obj(v * 10 + rhs.v); }
+    const Obj& cref() const noexcept { return *this; }
     int v;
 };
 inline Obj mk(int x) noexcept { return Obj(x); }
@@ -26,4 +27,22 @@ struct CHolder {
     int value() const noexcept { return o.v; }
     Obj o;
 };
+// CONSTJOIN: const place arms, and a class whose copy-assign is deleted (clang refuses the join).
+inline const Obj& cref(const Obj& o) noexcept { return o; }
+inline int useCref(const Obj& o) noexcept { return o.v; }
+struct CHHolder { CHolder ch; int value() const noexcept { return ch.value(); } };
+inline int pick(const Obj&) noexcept { return 1; }
+inline int pick(Obj&&) noexcept { return 2; }
+inline const Holder& hcref(const Holder& h) noexcept { return h; }
+struct NoCa {
+    explicit NoCa(int x) noexcept : v(x) {}
+    NoCa(const NoCa& o) noexcept : v(o.v) {}
+    NoCa(NoCa&& o) noexcept : v(o.v) {}
+    NoCa& operator=(const NoCa&) = delete;
+    NoCa& operator=(NoCa&& o) noexcept { v = o.v; return *this; }
+    ~NoCa() noexcept {}
+    const NoCa& cref() const noexcept { return *this; }
+    int v;
+};
+inline NoCa mkNoCa(int x) noexcept { return NoCa(x); }
 }

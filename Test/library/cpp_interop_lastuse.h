@@ -463,3 +463,23 @@ namespace callpar
         template <class T> int adlt(T, A b) { return b.v + 3; }
     }
 }
+
+// CALLRES: ADL targets beside a visible CFlat overload of the same name (one candidate set, ranked by clang).
+namespace cpptw
+{
+    inline int callres_take(Twin value) { return value.value(); }
+    inline int callres_after(Twin value) { return value.value(); }
+    inline int callres_bool(Twin value) { return value.value(); }
+    inline int callres_ptr(Twin value) { return value.value(); }
+    inline int callres_def(Twin value) { return value.value(); }
+    inline int callres_take2(Twin first, Twin second) { return first.value() + second.value(); }
+    inline int callres_gen(const Twin& value) { return value.value(); }
+    template <class T> int callres_tpl(T, Twin b) { return 30 + b.value(); }
+    template <class T> int callres_tplx(T, Twin b) { return 30 + b.value(); }
+    inline int callres_exact(Twin value) { return value.value(); }
+    inline int callres_cref(const Twin& value) { return value.value(); }
+    inline int callres_en(Twin, int) { return 2; }
+    template <class T> int callres_gs(T) { return 2; }
+    template <class T> int callres_g1(T) { return 2; }
+    template <class T> int callres_gd(const T&) { return 2; }
+}

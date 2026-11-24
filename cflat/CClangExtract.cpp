@@ -66,6 +66,7 @@
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/Support/Path.h"
 #include "clang/Frontend/MultiplexConsumer.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
@@ -2490,15 +2491,24 @@ namespace cflat_cinterop
                 size_t operator()(std::string_view v) const { return std::hash<std::string_view>{}(v); }
             };
             std::unordered_map<std::string, bool, PathHash, std::equal_to<>> scopeMemo;
+            std::unordered_set<std::string> includedScope;  // NormPath of headers AddScopeEdge admitted
             bool InScope(std::string_view path)
             {
                 if (normDirs.empty()) return true;
                 auto it = scopeMemo.find(path);
                 if (it != scopeMemo.end()) return it->second;
                 const std::string owned(path);
-                const bool in = PathInScope(owned, normDirs);
+                const bool in = PathInScope(owned, normDirs)
+                    || (!includedScope.empty() && includedScope.count(NormPath(owned)) != 0);
                 scopeMemo.emplace(owned, in);
                 return in;
+            }
+            // A header a scope edge reaches from an in-scope includer is in scope too.
+            void AddScopeEdge(const std::pair<std::string, std::string>& edge)
+            {
+                if (normDirs.empty() || InScope(edge.second) || !InScope(edge.first)) return;
+                includedScope.insert(NormPath(edge.second));
+                scopeMemo.erase(edge.second);
             }
             bool InScope(const char* path) { return InScope(std::string_view(path != nullptr ? path : "")); }
             const NamedDecl* scopeSentinel = nullptr;
@@ -2576,6 +2586,8 @@ namespace cflat_cinterop
                     while (!nd.empty() && nd.back() == '/') nd.pop_back();
                     normDirs.push_back(std::move(nd));
                 }
+                if (r.scopeIncludeEdges != nullptr)
+                    for (const auto& edge : *r.scopeIncludeEdges) AddScopeEdge(edge);
             }
         };
 
@@ -2651,6 +2663,18 @@ namespace cflat_cinterop
                 : pp(p), ownedReq(std::make_unique<ExtractRequest>(req)),
                   ownedState(std::make_unique<ExtractState>(*ownedReq, out)),
                   st(*ownedState), active(std::move(enabled)) {}
+
+            // A macro defined in a header a scope edge admits is in scope too (AddScopeEdge).
+            void InclusionDirective(SourceLocation hashLoc, const Token&, StringRef spelled,
+                                    bool angled, CharSourceRange, OptionalFileEntryRef file,
+                                    StringRef, StringRef, const Module*, bool,
+                                    SrcMgr::CharacteristicKind) override
+            {
+                std::pair<std::string, std::string> edge;
+                if (st.req.requireInScope && file
+                    && ScopeIncludeEdge(pp, hashLoc, spelled, angled, file->getName(), edge))
+                    st.AddScopeEdge(edge);
+            }
 
             void MacroDefined(const Token& nameTok, const MacroDirective* md) override
             {
@@ -2730,6 +2754,15 @@ namespace cflat_cinterop
                                           ExtractResult& out,
                                           std::shared_ptr<bool> active)
                 : collector(pp, req, out, std::move(active)) {}
+            void InclusionDirective(SourceLocation hashLoc, const Token& tok, StringRef spelled,
+                                    bool angled, CharSourceRange range, OptionalFileEntryRef file,
+                                    StringRef searchPath, StringRef relativePath,
+                                    const Module* suggested, bool moduleImported,
+                                    SrcMgr::CharacteristicKind kind) override
+            {
+                collector.InclusionDirective(hashLoc, tok, spelled, angled, range, file, searchPath,
+                                             relativePath, suggested, moduleImported, kind);
+            }
             void MacroDefined(const Token& nameTok, const MacroDirective* md) override
             {
                 collector.MacroDefined(nameTok, md);
@@ -2774,6 +2807,24 @@ namespace cflat_cinterop
                 if (reason != EnterFile) return;
                 StringRef fn = pp.getSourceManager().getFilename(loc);
                 if (!fn.empty()) st.out.includedFiles.push_back(fn.str());
+            }
+        };
+
+        // Header scope by include identity (ScopeIncludeEdge), recorded as the preprocessor runs.
+        struct ScopeIncludeCollector : public PPCallbacks
+        {
+            Preprocessor& pp;
+            ExtractState& st;
+            ScopeIncludeCollector(Preprocessor& p, ExtractState& s) : pp(p), st(s) {}
+
+            void InclusionDirective(SourceLocation hashLoc, const Token&, StringRef spelled,
+                                    bool angled, CharSourceRange, OptionalFileEntryRef file,
+                                    StringRef, StringRef, const Module*, bool,
+                                    SrcMgr::CharacteristicKind) override
+            {
+                std::pair<std::string, std::string> edge;
+                if (file && ScopeIncludeEdge(pp, hashLoc, spelled, angled, file->getName(), edge))
+                    st.AddScopeEdge(edge);
             }
         };
 
@@ -9254,6 +9305,9 @@ namespace cflat_cinterop
                 if (st.req.wantIncludes)
                     ci.getPreprocessor().addPPCallbacks(
                         std::make_unique<IncludeCollector>(ci.getPreprocessor(), st));
+                if (st.req.requireInScope && !st.normDirs.empty())
+                    ci.getPreprocessor().addPPCallbacks(
+                        std::make_unique<ScopeIncludeCollector>(ci.getPreprocessor(), st));
                 return true;
             }
             std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance&, StringRef) override
@@ -9539,6 +9593,26 @@ namespace cflat_cinterop
         llvm::raw_string_ostream stream(bitcode);
         llvm::WriteBitcodeToFile(*module, stream);
         stream.flush();
+        return true;
+    }
+
+    bool ScopeIncludeEdge(const clang::Preprocessor& pp, clang::SourceLocation hashLoc,
+                          std::string_view spelled, bool angled, std::string_view resolved,
+                          std::pair<std::string, std::string>& edge)
+    {
+        if (angled || hashLoc.isInvalid() || resolved.empty()) return false;
+        const clang::SourceManager& sm = pp.getSourceManager();
+        const clang::PresumedLoc includer = sm.getPresumedLoc(sm.getExpansionLoc(hashLoc));
+        if (includer.isInvalid() || includer.getFilename() == nullptr) return false;
+        const std::string from = includer.getFilename();
+        if (!llvm::sys::path::is_absolute(llvm::StringRef(spelled.data(), spelled.size())))
+        {
+            // Relative: only a header found beside its includer, never one a search path found.
+            std::string dir = NormPath(llvm::sys::path::parent_path(from).str());
+            while (!dir.empty() && dir.back() == '/') dir.pop_back();
+            if (dir.empty() || !NormPath(std::string(resolved)).starts_with(dir + "/")) return false;
+        }
+        edge = {from, std::string(resolved)};
         return true;
     }
 

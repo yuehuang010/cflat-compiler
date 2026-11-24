@@ -1,0 +1,30 @@
+// An overloaded CFlat function name as a C++ constructor argument binds only when exactly one overload
+// matches a function-pointer parameter of a same-arity constructor (clang: "address of overloaded
+// function does not match required type"). CFD selects both overloads; CB has no function target.
+import cpp "cpp_mix18_overloads.hpp";
+
+int fncastOv(int x) { return x + 1; }
+double fncastOv(double x) { return x; }
+
+extern int main()
+{
+    expect_error("address of overloaded function 'fncastOv' does not match required type 'm18ov.CFD'") {
+        int a = ((m18ov.CFD)(fncastOv)).v;
+    }
+    expect_error("address of overloaded function 'fncastOv' does not match required type 'm18ov.CFD'") {
+        int b = m18ov.CFD(fncastOv).v;
+    }
+    expect_error("address of overloaded function 'fncastOv' does not match required type 'm18ov.CB'") {
+        int c = ((m18ov.CB)(fncastOv)).v;
+    }
+    expect_error("address of overloaded function 'fncastOv' does not match required type 'm18ov.CB'") {
+        int d = m18ov.CB(fncastOv).v;
+    }
+    expect_error("address of overloaded function 'fncastOv' does not match required type 'm18ov.CFD'") {
+        m18ov.CFD e = {fncastOv};
+    }
+    expect_error("address of overloaded function 'fncastOv' does not match required type 'm18ov.CFD'") {
+        m18ov.CFD* f = new m18ov.CFD(fncastOv);
+    }
+    return 0;
+}

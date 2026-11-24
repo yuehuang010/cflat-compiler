@@ -1,0 +1,77 @@
+import cpp "cpp_interop_explicit.h";
+
+// CONVPTR refusals: a class pointer converts at copy-init / assignment / return / CFlat callee
+// only through a non-explicit, unambiguous ctor, as clang++ -std=c++20 decides.
+expect_error("is declared explicit") {
+    ConvPtrRExp convPtrRetExp(ConvPtrFoo* p) { return p; }
+}
+
+int convPtrCfBool(ConvPtrRBool r) { return r.value; }
+// Two CFlat overloads each reached through a converting ctor to a different class tie, as in C++.
+int convPtrTwoR(ConvPtrR r) { return 1; }
+int convPtrTwoR(ConvPtrRN r) { return 2; }
+int convPtrTwoI(ConvPtrI r) { return 1; }
+int convPtrTwoI(ConvPtrI2 r) { return 2; }
+int convPtrOvBool(ConvPtrR r) { return 1; }
+int convPtrOvBool(bool b) { return 2; }
+// CONVREST: a `T**` reaches only a ctor parameter [conv.qual] allows (never `const T**`).
+int convRestCfPP2(ConvRestPP2 q) { return q.value; }
+
+extern int main()
+{
+    ConvPtrFoo foo = default;
+    ConvPtrFoo* fp = &foo;
+    expect_error("cannot initialize value of type 'ConvPtrRExp'") {
+        ConvPtrRExp e1 = &foo;
+    }
+    expect_error("is declared explicit") {
+        ConvPtrRExp e2 = ConvPtrRExp(fp);
+        e2 = fp;
+    }
+    expect_error("is ambiguous") {
+        ConvPtrRAmb a1 = nullptr;
+    }
+    // Both ctors are user conversions of the same rank: clang reports the call ambiguous.
+    expect_error("ambiguous call to 'convptr_ob2'") {
+        int r1 = convptr_ob2(fp);
+    }
+    // A CFlat call refuses the pointer -> bool step, so ConvPtrRBool(bool) is not reached.
+    expect_error("no overload of 'convPtrCfBool'") {
+        int r2 = convPtrCfBool(fp);
+    }
+    expect_error("ambiguous call to 'convPtrTwoR'") {
+        int r3 = convPtrTwoR(fp);
+    }
+    int iv = 1;
+    expect_error("ambiguous call to 'convPtrTwoI'") {
+        int r4 = convPtrTwoI(iv);
+    }
+    // C++ would call convPtrOvBool(bool); CFlat refuses pointer -> bool, so it names that pick.
+    expect_error("C++ would call 'convPtrOvBool(bool)'") {
+        int r5 = convPtrOvBool(fp);
+    }
+    // CONVREST refusals (clang refuses each): `T**` -> `const T**`, a derived or base pointee
+    // at depth 2, depth 3, and an explicit ctor reached from a mixed-pointee `?:`.
+    ConvPtrFoo** pp = &fp;
+    expect_error("cannot initialize C++ class 'ConvRestPP2'") {
+        ConvRestPP2 q1 = pp;
+    }
+    expect_error("no overload of 'convRestCfPP2'") {
+        int r6 = convRestCfPP2(pp);
+    }
+    ConvPtrDerived der = default;
+    ConvPtrDerived* dp = &der;
+    ConvPtrDerived** dpp = &dp;
+    expect_error("cannot initialize C++ class 'ConvRestPP'") {
+        ConvRestPP q2 = dpp;
+    }
+    ConvPtrFoo*** ppp = &pp;
+    expect_error("cannot initialize C++ class 'ConvRestPP'") {
+        ConvRestPP q3 = ppp;
+    }
+    bool c = fp == nullptr;
+    expect_error("cannot initialize value of type 'ConvPtrRExp' with a pointer of type 'ConvPtrFoo*'") {
+        ConvPtrRExp e3 = c ? &foo : &der;
+    }
+    return 0;
+}

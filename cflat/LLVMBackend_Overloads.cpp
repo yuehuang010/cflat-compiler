@@ -2102,8 +2102,8 @@ static bool CxxDeepPointerBothNameCvr(const LLVMBackend::TypeAndValue& got,
 }
 
 // A by-value pointer conversion valid under [conv.qual]. False when it drops a const or changes shape.
-static bool IsCxxDeepQualificationConversion(const LLVMBackend::TypeAndValue& got, uint32_t sourceMask,
-                                             const LLVMBackend::TypeAndValue& param, const std::string& spelling)
+bool LLVMBackend::IsCxxDeepQualificationConversion(const TypeAndValue& got, uint32_t sourceMask,
+                                                   const TypeAndValue& param, const std::string& spelling)
 {
     const int depth = param.ValuePointerDepth();
     if (depth < 2 || got.ValuePointerDepth() != depth || param.IsAlias || param.IsCxxRefToPointer
@@ -2123,6 +2123,30 @@ static bool IsCxxDeepQualificationConversion(const LLVMBackend::TypeAndValue& go
             return false;
     }
     return true;
+}
+
+bool LLVMBackend::CxxDeepClassPointerArgInvalid(const FunctionSymbol& candidate, size_t index,
+                                                const NamedVariable& arg, const TypeAndValue& param) const
+{
+    const TypeAndValue& got = arg.TypeAndValue;
+    if (!candidate.IsCxx || (candidate.IsMethod && index == 0) || !param.Pointer || param.IsAlias
+        || param.IsCxxRefToPointer || param.IsRvalueRef || param.IsFunctionPointer
+        || param.IsArrayView || !got.Pointer || got.IsFunctionPointer || got.IsArrayView)
+        return false;
+    const int depth = param.ValuePointerDepth();
+    if (depth < 2 || got.ValuePointerDepth() != depth) return false;
+    const std::string from = ResolveTypeAlias(got.TypeName);
+    const std::string to = ResolveTypeAlias(param.TypeName);
+    if (from.empty() || to.empty() || !IsCxxRecord(from) || !IsCxxRecord(to)) return false;
+    if (from != to) return true;
+    const uint32_t sourceMask = got.PointeeConstMask() | (CxxArgumentPointeeConst(arg) ? 1u : 0u);
+    const std::string spelling = CxxReferenceParameterSpelling(candidate, index);
+    const uint32_t targetMask = spelling.empty() || spelling.find_first_of("()[]&") != std::string::npos
+        ? param.PointeeConstMask() : CxxSpellingPointeeConstMask(spelling, depth);
+    // Only ADDED const is judged here: a CFlat `const T**` fills every level, and a dropped
+    // level is the pointee-const relation's refusal.
+    if ((targetMask & ~sourceMask) == 0) return false;
+    return !IsCxxDeepQualificationConversion(got, sourceMask & targetMask, param, spelling);
 }
 
 // A pointer value of depth >= 2 (not `&x`) at a `void*`-shaped parameter or a same-depth pointer to
@@ -3896,7 +3920,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                             && !IsCxxDeepQualificationConversion(arg.TypeAndValue,
                                 arg.TypeAndValue.PointeeConstMask() | (CxxArgumentPointeeConst(arg) ? 1u : 0u),
                                 *candidateParamItr, CxxReferenceParameterSpelling(candidate, paramIndex)))
-                        || invalidPointerRefBinding)
+                        || invalidPointerRefBinding
+                        || CxxDeepClassPointerArgInvalid(candidate, paramIndex, arg, *candidateParamItr))
                         cxxPointeeConstNotViable = true;
                 }
                 // C++ callback parameters: a function-pointer type has no implicit pointee-const or
@@ -4242,6 +4267,13 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         {
                             ++userConversions;
                             userConversionForArgument = true;
+                        }
+                        else
+                        {
+                            // A CFlat callee's converting ctor is a user conversion too: two through
+                            // different classes tie (ambiguous), a standard sequence beats it.
+                            ++userConversions;
+                            userConversionNames += "ctor:" + candidateParamItr->TypeName + "|";
                         }
                     }
                     // Mirror of the line above in the conversion-OPERATOR direction: a class
@@ -4611,6 +4643,13 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         {
                             ++userConversions;
                             userConversionForArgument = true;
+                        }
+                        else
+                        {
+                            // A CFlat callee's converting ctor is a user conversion too: two through
+                            // different classes tie (ambiguous), a standard sequence beats it.
+                            ++userConversions;
+                            userConversionNames += "ctor:" + candidateParamItr->TypeName + "|";
                         }
                     }
                     // Opaque pointers scored the class REFERENCE a match above; with a `bool`
@@ -9989,6 +10028,52 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 && !param.IsRvalueRef && !arg.TypeAndValue.Pointer
                 && IsCxxRecord(param.TypeName) && IsCxxRecord(arg.TypeAndValue.TypeName))
                 continue;
+            /*
+             * A CFlat callee picked through a class-pointer converting ctor while a `bool` sibling
+             * exists: C++ would take pointer -> bool, which CFlat call arguments refuse, so name it
+             * instead of silently calling the other overload.
+             */
+            if (!candidate.IsCxx && arg.AllowCxxClassPointerCtorConversion && !param.Pointer
+                && IsCxxRecord(param.TypeName))
+            {
+                // Only a sibling every OTHER argument fits: pointer -> bool here is all that excludes it.
+                const FunctionSymbol* boolSibling = nullptr;
+                for (const auto& [otherArgs, other] : resolvedCandidate)
+                {
+                    const auto& otherParams = other.Parameters;
+                    if (i >= otherParams.size() || i >= otherArgs.size()) continue;
+                    const TypeAndValue& otherParam = otherParams[i];
+                    if (otherParam.Pointer || otherParam.ElemPointer
+                        || ResolveTypeAlias(otherParam.TypeName) != "bool")
+                        continue;
+                    std::vector<NamedVariable> probeArgs = otherArgs;
+                    NamedVariable asBool;
+                    asBool.Primary = llvm::ConstantInt::getTrue(*context);
+                    asBool.BaseType = asBool.Primary->getType();
+                    asBool.TypeAndValue.TypeName = "bool";
+                    asBool.InferSourceTypeName = "bool";
+                    asBool.IsRvalue = true;
+                    probeArgs[i] = std::move(asBool);
+                    const std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> one = {
+                        { std::move(probeArgs), other } };
+                    if (!ComputeOverloadFunction(one).second.Parameters.empty())
+                    {
+                        boolSibling = &other;
+                        break;
+                    }
+                }
+                if (boolSibling != nullptr)
+                {
+                    LogErrorMessage("cannot pass this pointer to '{}': C++ would call '{}' "
+                                    "(pointer -> bool beats the converting constructor of '{}'), but "
+                                    "CFlat call arguments do not convert a pointer to bool; compare "
+                                    "it with nullptr, or construct '{}' explicitly",
+                                    { diagnosticFunctionName, spellCandidate(*boolSibling),
+                                      DisplayCxxClassName(param.TypeName),
+                                      DisplayCxxClassName(param.TypeName) });
+                    continue;
+                }
+            }
             if (!CanImplicitlyConstructCxxClass(matched[i], candidate.Parameters[i],
                 cxxByValueParam || cxxIndirectValueParam, candidates.size() > 1))
             {
@@ -10297,6 +10382,15 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             ? "<argument>" : source.VariableName;
                     LogError(CxxConstPointerArgumentError(argIndex + 1, sourceName,
                                                           param.VariableName));
+                }
+                else if (CxxDeepClassPointerArgInvalid(candidate, argIndex, arg, param))
+                {
+                    const std::string spelled = CxxReferenceParameterSpelling(candidate, argIndex);
+                    LogError(std::format(
+                        "cannot pass argument {} of type '{}' to C++ parameter '{}' of type '{}': a "
+                        "multi-level pointer converts only to the same class, adding const only as "
+                        "[conv.qual] allows", argIndex + 1, SpellType(*this, source),
+                        param.VariableName, spelled.empty() ? SpellType(*this, param) : spelled));
                 }
             }
 

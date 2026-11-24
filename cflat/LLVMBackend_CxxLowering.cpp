@@ -358,6 +358,18 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
         {
             loweredArgVars = *extraArgVars;
             loweredExtraArgs = extraArgs;
+            if (!assignmentOperator && IsCxxConstructingStructor(typeName, st))
+                for (size_t i = 0; i < loweredArgVars.size(); ++i)
+                {
+                    std::string refusal;
+                    CxxCtorOverloadedNameArgument(typeName, loweredArgVars[i], i,
+                                                  loweredArgVars.size(), refusal);
+                    if (!refusal.empty())
+                    {
+                        LogError(refusal);
+                        return false;
+                    }
+                }
             for (size_t i = 0; i < loweredArgVars.size() && i + 1 < st.params.size(); ++i)
             {
                 if (!st.params[i + 1].IsFunctionPointer
@@ -1206,6 +1218,24 @@ static bool IsCxxPromotionTo(const std::string& from, const std::string& to)
         LLVMBackend::TypeAndValue probe;
         probe.TypeName = from;
         return probe.IsInteger() > 0 && probe.IsInteger() < 32;
+}
+
+const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::CxxClassPointerBoolCtor(
+        const std::string& typeName, const std::string& pointerWhy) const
+{
+        if (pointerWhy.starts_with("matches more than one constructor overload")) return nullptr;
+        std::string why;
+        const TypeAndValue boolType{ .TypeName = "bool" };
+        const auto* ctor = SelectCxxConstructor(typeName, { boolType }, why,
+                                                /*allowNumericConversions*/ true, nullptr,
+                                                /*allowExplicit*/ false);
+        if (ctor == nullptr || ctor->params.size() < 2) return nullptr;
+        // Only a bool parameter: a pointer has no standard conversion to any other arithmetic type.
+        const TypeAndValue& p = ctor->params[1];
+        if (p.Pointer || p.ElemPointer || ResolveTypeAlias(p.TypeName) != "bool"
+            || (p.IsAlias && !p.IsRvalueRef && !p.CxxConstRef()))
+            return nullptr;
+        return ctor;
 }
 
 const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorListed(
@@ -2736,11 +2766,25 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
                     && !ctorArg->ElemPointer && ctorArg->IsAlias
                     && ctorArg->IsCxxRefToPointer && ctorArg->CxxConstRef()
                     && !ctorArg->IsRvalueRef;
-                if (!pointerByValue && !constPointerRef)
+                // Depth 2: the same class at every level, const added only as [conv.qual] allows.
+                const bool deepQualified = ctorArg != nullptr && ctorArg->Pointer
+                    && argType.ValuePointerDepth() == 2 && ctorArg->ValuePointerDepth() == 2
+                    && !ctorArg->IsAlias && !ctorArg->IsCxxRefToPointer && !ctorArg->IsRvalueRef
+                    && ResolveTypeAlias(ctorArg->TypeName) == ResolveTypeAlias(argType.TypeName)
+                    && IsCxxDeepQualificationConversion(argType, argType.PointeeConstMask(),
+                                                        *ctorArg, {});
+                // Depth 2 into `(const) void*` is the [conv.ptr] object-pointer conversion.
+                const bool deepToVoid = pointerByValue && argType.ValuePointerDepth() == 2
+                    && ctorArg->ValuePointerDepth() == 1 && ResolveTypeAlias(ctorArg->TypeName) == "void";
+                if ((!pointerByValue && !constPointerRef && !deepQualified)
+                    || (argType.ValuePointerDepth() == 2 && !deepQualified && !deepToVoid))
                     return CxxArgConversion::NotApplicable;
             }
             return answer(CxxArgConversion::Convertible);
         }
+        if (classPointerArg && arg.AllowCxxClassPointerBoolCtorConversion
+            && CxxClassPointerBoolCtor(param.TypeName, why) != nullptr)
+            return answer(CxxArgConversion::Convertible);
         // The literal 0 with no int-taking ctor: a null pointer constant into a nullptr_t ctor.
         // Copy-initialization skips explicit constructors, so this route is tried before the block.
         if (NamedVariable nullArg; ZeroLiteralAsNullptrArgument(arg,
@@ -3407,6 +3451,25 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
                                                 /*allowExplicit*/ false,
                                                 allowScalarNarrowing
                                                     || IsNullPointerConstantArgument(arg, true));
+        // No pointer ctor: a proven class pointer tests non-null, then converts through `T(bool)`.
+        if (ctor == nullptr && arg.AllowCxxClassPointerBoolCtorConversion && argType.Pointer
+            && !argType.ElemPointer && IsCxxRecord(argType.TypeName)
+            && CxxClassPointerBoolCtor(param.TypeName, why) != nullptr)
+        {
+            llvm::Value* pointer = arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg);
+            if (pointer == nullptr || !pointer->getType()->isPointerTy()) return false;
+            NamedVariable boolArg;
+            boolArg.Primary = builder->CreateIsNotNull(pointer, "cxx.conv.ptr.bool");
+            boolArg.BaseType = boolArg.Primary->getType();
+            boolArg.TypeAndValue.TypeName = "bool";
+            boolArg.IsRvalue = true;
+            if (!MaterializeImplicitCxxClassArgument(boolArg, param, intoSlot,
+                                                     allowTemplateClassConversion,
+                                                     allowScalarNarrowing))
+                return false;
+            arg = std::move(boolArg);
+            return true;
+        }
         // A derived PRVALUE sliced to its base binds the base's move constructor (clang: one move).
         if (slicesToBase && ctor != nullptr && arg.IsRvalue && IsCxxRvalueReferenceArgument(arg))
             if (const auto* moveCtor = FindCxxMoveCtor(param.TypeName); moveCtor != nullptr)
@@ -4509,6 +4572,49 @@ bool LLVMBackend::CxxCopyInitNeedsClangWrapper(const NamedVariable& source,
         return false;
 }
 
+const LLVMBackend::FunctionSymbol* LLVMBackend::CxxCtorOverloadedNameArgument(
+        const std::string& typeName, const NamedVariable& arg, size_t index, size_t argCount,
+        std::string& refusal)
+{
+        refusal.clear();
+        if (arg.CallerName.empty() || arg.Storage != nullptr || !IsNamedFunctionValue(arg))
+            return nullptr;
+        auto overloads = functionTable.find(ResolveQualifiedName(arg.CallerName));
+        if (overloads == functionTable.end()) return nullptr;
+        std::vector<const FunctionSymbol*> distinct;
+        for (const auto& sym : overloads->second)
+            if (!sym.IsMethod && sym.Function != nullptr
+                && std::none_of(distinct.begin(), distinct.end(),
+                       [&](const FunctionSymbol* prior) { return prior->Function == sym.Function; }))
+                distinct.push_back(&sym);
+        if (distinct.size() < 2) return nullptr;
+        const CxxClassInfo* info = GetCxxClassInfoWithConstructors(typeName);
+        if (info == nullptr) return nullptr;
+        // Every overload some same-arity constructor's function-pointer parameter binds.
+        std::vector<const FunctionSymbol*> bound;
+        bool anyCandidate = false;
+        for (const auto& ctor : info->constructors)
+        {
+            if (ctor.params.size() != argCount + 1) continue;
+            anyCandidate = true;
+            const TypeAndValue& param = ctor.params[index + 1];
+            if (!param.IsFunctionPointer) continue;
+            for (const FunctionSymbol* sym : distinct)
+            {
+                const TypeAndValue sig = FuncPtrSigOfSymbol(*sym);
+                if ((!FuncPtrSignaturesProvablyDiffer(AliasAlignedCallbackSig(sig, param), param)
+                        || FuncPtrFewerParamsCanAdapt(sig, param))
+                    && std::find(bound.begin(), bound.end(), sym) == bound.end())
+                    bound.push_back(sym);
+            }
+        }
+        if (!anyCandidate) return nullptr;
+        if (bound.size() == 1) return bound.front();
+        refusal = std::format("address of overloaded function '{}' does not match required type '{}'",
+            arg.CallerName, DisplayCxxClassName(typeName));
+        return nullptr;
+}
+
 LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCtor(
         NamedVariable& source, const std::string& targetType, llvm::Value* intoSlot,
         std::string& refusal, bool directInit, bool allowScalarNarrowing)
@@ -4518,6 +4624,15 @@ LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCto
             && (source.TypeAndValue.Pointer || source.TypeAndValue.TypeName != targetType))
             source.Primary = LoadArgStorage(source);
         if (source.Primary == nullptr) return CxxConvertingCtorResult::NotApplicable;
+        // A `?:` whose arms both point at one C++ record carries that pointee only in its join.
+        if (source.TypeAndValue.TypeName.empty() && !source.TypeAndValue.Pointer
+            && source.Primary->getType()->isPointerTy() && source.JoinClassPointeeDepth == 1
+            && IsCxxRecord(source.JoinClassPointee) && IsCxxRecord(targetType))
+        {
+            source.TypeAndValue.TypeName = source.JoinClassPointee;
+            source.TypeAndValue.Pointer = true;
+            source.TypeAndValue.PointerDepth = 1;
+        }
         // A literal reaches here with only its value; type it the way a call argument is typed.
         if (source.BaseType == nullptr) source.BaseType = source.Primary->getType();
         if (IsCxxRecord(targetType)
@@ -4530,6 +4645,24 @@ LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCto
         {
             if (!IsCxxRecord(targetType))
                 return CxxConvertingCtorResult::NotApplicable;
+            // A function designator `(R)(fn)` is its thin pointer `R (*)(A)`, as a function<> value;
+            // an overloaded name takes the one overload the constructors' parameters select.
+            if (source.TypeAndValue.TypeName.empty() && IsCxxFunctionDesignatorArgument(source))
+            {
+                const FunctionSymbol* symbol =
+                    CxxCtorOverloadedNameArgument(targetType, source, 0, 1, refusal);
+                if (!refusal.empty()) return CxxConvertingCtorResult::Refused;
+                if (symbol != nullptr) source.Primary = symbol->Function;
+                else symbol = FindSymbolForFunction(
+                    llvm::cast<llvm::Function>(source.Primary->stripPointerCasts()));
+                if (symbol != nullptr)
+                {
+                    const TypeAndValue signature = FuncPtrSigOfSymbol(*symbol);
+                    source.Primary = BareFunctionToThinValue(source.Primary, &signature);
+                    source.BaseType = source.Primary->getType();
+                    source.TypeAndValue = signature;
+                }
+            }
             NamedVariable probe = source;
             // Only a literal is const char*; a mutable char* rvalue keeps its spelling.
             if (!source.IsStringLiteral) probe.IsRvalue = false;
@@ -4709,6 +4842,18 @@ LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCto
             }
         }
 
+        // A single pointer to a proven C++ record converts as it does at a C++ call argument;
+        // the classifier still requires a by-value / const-ref pointer ctor parameter. A `T**`
+        // reaches only a `T**`-shaped ctor parameter by [conv.qual], never `T(bool)`.
+        if (source.TypeAndValue.Pointer
+            && (source.TypeAndValue.ValuePointerDepth() == 1
+                || source.TypeAndValue.ValuePointerDepth() == 2)
+            && IsCxxRecord(source.TypeAndValue.TypeName) && IsCxxRecord(targetType))
+        {
+            source.AllowCxxClassPointerCtorConversion = true;
+            source.AllowCxxClassPointerBoolCtorConversion =
+                source.TypeAndValue.ValuePointerDepth() == 1;
+        }
         TypeAndValue param;
         param.TypeName = targetType;
         switch (ClassifyCxxImplicitArgument(source, param, /*cxxByValueParam*/ true,
@@ -5586,16 +5731,19 @@ bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::
                     return viaRvalue;
             return FindCxxCopyCtor(typeName, constSource, directInit);
         };
-        const CxxClassInfo::Structor* ctor = useMove ? FindCxxMoveCtor(typeName) : nullptr;
+        // A const imported-class source (`move k`, k const) never binds T&&: clang copies it.
+        // A [cpp] struct has no copy constructor by design and keeps its move.
+        const bool bindMove = useMove && (!constSource || IsCppStructName(typeName));
+        const CxxClassInfo::Structor* ctor = bindMove ? FindCxxMoveCtor(typeName) : nullptr;
         if (ctor == nullptr) ctor = fallbackCopyCtor();
         // A class first constructed through a generated wrapper (a CFlat closure into
         // std::function) never ran constructor selection: bind its one-argument ctors now.
         if (ctor == nullptr && TryBindRefusedCxxMember(typeName, "__ctor", 1))
         {
-            ctor = useMove ? FindCxxMoveCtor(typeName) : nullptr;
+            ctor = bindMove ? FindCxxMoveCtor(typeName) : nullptr;
             if (ctor == nullptr) ctor = fallbackCopyCtor();
         }
-        if (ctor == nullptr && useMove) ctor = TryBindCxxGeneratedMoveCtor(typeName);
+        if (ctor == nullptr && bindMove) ctor = TryBindCxxGeneratedMoveCtor(typeName);
         if (ctor == nullptr)
         {
             // An implicit trivial copy constructor (clang's verdict) has no symbol: a byte copy.

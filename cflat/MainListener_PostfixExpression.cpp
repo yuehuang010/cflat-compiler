@@ -2098,6 +2098,113 @@ static void AppendUtf8Scalar(std::string& out, uint32_t scalar)
     }
 }
 
+/*
+ * CALLRES: deleted C++ declarations standing in for a call's visible CFlat overloads, so the ADL
+ * request ranks them beside the associated namespaces' functions. A CFlat generic stands in as a
+ * function template of its own parameter shape. False when an overload or argument has no exact
+ * C++ spelling (a CFlat enum would spell as its backing integer): the visible lookup stays.
+ */
+bool MainListener::CflatAdlStandIns(LLVMBackend& compiler,
+                                    const std::vector<LLVMBackend::FunctionSymbol>& visible,
+                                    const std::vector<LLVMBackend::NamedVariable>& arguments,
+                                    const std::string& name, const std::string& genericName,
+                                    std::string& out) const
+{
+        const auto cflatEnum = [&](const std::string& typeName) {
+            return !typeName.empty() && compiler.cxxCflatToCxxSpelling_.count(typeName) == 0
+                && (!compiler.GetEnumBackingType(typeName).empty()
+                    || !compiler.ResolveEnumTypeName(typeName).empty());
+        };
+        for (const auto& argument : arguments)
+            if (cflatEnum(argument.TypeAndValue.TypeName)) return false;
+        out.clear();
+        bool any = false;
+        const bool generic = !genericName.empty();
+        if (generic)
+        {
+            const auto& templates = genericFunctionTemplates.at(genericName);
+            for (size_t index = 0; index < templates.size(); ++index)
+            {
+                auto typeParams = genericFunctionTypeParams.find(
+                    GenericTemplateState::GenericFunctionCandidateKey(genericName, index));
+                if (typeParams == genericFunctionTypeParams.end() && index == 0)
+                    typeParams = genericFunctionTypeParams.find(genericName);
+                auto* definition = compiler.MaterializeGenericFunction(genericName, index);
+                if (typeParams == genericFunctionTypeParams.end() || typeParams->second.empty()
+                    || definition == nullptr || definition->parameterTypeList() == nullptr
+                    || definition->parameterTypeList()->Ellipsis() != nullptr)
+                    return false;
+                std::vector<CFlatParser::ParameterDeclarationContext*> declarations;
+                if (definition->parameterTypeList()->parameterList() != nullptr)
+                    declarations = definition->parameterTypeList()->parameterList()->parameterDeclaration();
+                // Only a parameter spelled as a bare type parameter (plus '*') keeps the template's shape.
+                std::string parameters;
+                for (size_t i = 0; i < declarations.size(); ++i)
+                {
+                    std::string spelled;
+                    // A defaulted generic parameter is not spelled: the joint ranking is skipped.
+                    if (declarations[i]->declarationSpecifiers() == nullptr
+                        || declarations[i]->initializer() != nullptr)
+                        return false;
+                    for (auto* specifier : declarations[i]->declarationSpecifiers()->declarationSpecifier())
+                    {
+                        auto* type = specifier->typeSpecifier();
+                        if (type == nullptr || type->genericIdentifier() == nullptr) continue;
+                        auto* identifier = type->genericIdentifier();
+                        if (identifier->Identifier() == nullptr || identifier->genericTypeParameters() != nullptr
+                            || IsArrayViewArg(specifier))
+                            return false;
+                        const std::string parameterName = identifier->Identifier()->getText();
+                        if (std::find(typeParams->second.begin(), typeParams->second.end(), parameterName)
+                            == typeParams->second.end())
+                            return false;
+                        spelled = "T" + std::to_string(std::distance(typeParams->second.begin(),
+                            std::find(typeParams->second.begin(), typeParams->second.end(), parameterName)))
+                            + std::string(PointerDepthOf(specifier->pointer()), '*');
+                        break;
+                    }
+                    if (spelled.empty()) return false;
+                    parameters += (i != 0 ? ", " : "") + spelled;
+                }
+                std::string head;
+                for (size_t t = 0; t < typeParams->second.size(); ++t)
+                    head += (t != 0 ? ", class T" : "class T") + std::to_string(t);
+                out += "template <" + head + "> void " + name + "(" + parameters + ") = delete; ";
+                any = true;
+            }
+        }
+        for (const auto& symbol : visible)
+        {
+            if (symbol.IsCxx || symbol.IsMethod || symbol.UniqueName.starts_with("__cflat_")) continue;
+            if (generic && (compiler.gts.instantiatedGenericFunctions.count(symbol.UniqueName) != 0
+                    || compiler.gts.instantiatedGenericFunctions.count(symbol.SourceName) != 0))
+                continue;
+            std::string parameters;
+            for (size_t i = 0; i < symbol.Parameters.size(); ++i)
+            {
+                const auto& parameter = symbol.Parameters[i];
+                const int depth = !parameter.Pointer ? 0
+                    : parameter.PointerDepth > 0 ? parameter.PointerDepth : parameter.ElemPointer ? -1 : 1;
+                std::string spelled;
+                if (depth < 0 || parameter.TypeName.empty() || parameter.TypeName.ends_with("]")
+                    || parameter.IsFunctionPointer || parameter.IsInterface || parameter.IsArrayView
+                    || cflatEnum(parameter.TypeName)
+                    || !compiler.CxxSpellingForCflatType(parameter.TypeName + std::string(depth, '*'), spelled)
+                    || spelled == "void")
+                    return false;
+                parameters += (i != 0 ? ", " : "") + spelled;
+                if (i < symbol.DefaultArguments.size() && !symbol.DefaultArguments[i].kind.empty())
+                    parameters += " = __cflat_dv<" + spelled + ">()";
+            }
+            if (symbol.Variadic) parameters += symbol.Parameters.empty() ? "..." : ", ...";
+            out += "void " + name + "(" + parameters + ") = delete; ";
+            any = true;
+        }
+        if (!any) return false;
+        out.insert(0, "template <class T> T __cflat_dv(); ");
+        return true;
+}
+
 // The only postfix suffixes that may follow a member and still STORE to it: `obj.r++`.
 /*
  * Ruling 2026-10-01 item 3: `std.move(x)` is the C++ operation and binds only C++ objects. When
@@ -11941,6 +12048,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             argVar.TypeAndValue.TypeName = structName;
                                     }
 
+                                    // An interface method's C++ class parameter converts a proven record
+                                    // pointer through its ctor, as at a direct CFlat call.
+                                    argVar.AllowCxxClassPointerCtorConversion = argNV.TypeAndValue.Pointer
+                                        && argNV.TypeAndValue.ValuePointerDepth() == 1
+                                        && Compiler(ctx)->IsCxxRecord(argNV.TypeAndValue.TypeName);
                                     // Propagate struct TypeName for pointer args so struct*->interface upcast works
                                     if (argVar.TypeAndValue.TypeName.empty() && argNV.TypeAndValue.Pointer
                                         && !argNV.TypeAndValue.TypeName.empty()
@@ -14427,12 +14539,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             ? argNV.TypeAndValue.TypeName
                                             : argNV.InferSourceTypeName;
                                     }
-                                    // A C++ call may use a converting ctor only from a single pointer
-                                    // whose pointee is a proven C++ record.
-                                    argVar.AllowCxxClassPointerCtorConversion = cxxCallArgument
-                                        && argNV.TypeAndValue.Pointer
-                                        && argNV.TypeAndValue.ValuePointerDepth() == 1
+                                    // A C++ class parameter (C++ or CFlat callee) may use a converting
+                                    // ctor only from a single pointer whose pointee is a proven C++ record.
+                                    // A `T**` only by [conv.qual] at a `T**`-shaped ctor (the classifier).
+                                    argVar.AllowCxxClassPointerCtorConversion = argNV.TypeAndValue.Pointer
+                                        && (argNV.TypeAndValue.ValuePointerDepth() == 1
+                                            || argNV.TypeAndValue.ValuePointerDepth() == 2)
                                         && Compiler(ctx)->IsCxxRecord(argNV.TypeAndValue.TypeName);
+                                    argVar.AllowCxxClassPointerBoolCtorConversion = cxxCallArgument
+                                        && argVar.AllowCxxClassPointerCtorConversion
+                                        && argNV.TypeAndValue.ValuePointerDepth() == 1;
                                     // Same for a FIXED `T[N]`: argValue is already the decayed element-0
                                     // address (LoadNamedVariable), so ConstArraySize is the only surviving
                                     // signal that this was an array - needed by the funcptr shape gate
@@ -15137,8 +15253,77 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                             && arguments.size() < symbol.DefaultArguments.size()
                                                             && !symbol.DefaultArguments[arguments.size()].kind.empty());
                                                 });
-                                        if (adlCandidate && !visibleArityViable && !isTemplate && owner.empty()
-                                            && cxxBraceArguments.empty()
+                                        /*
+                                         * CALLRES: ordinary lookup and ADL are ONE candidate set. Clang ranks the
+                                         * visible CFlat overloads (as deleted stand-ins) with ADL's: the C++ pick
+                                         * binds, a tie is ambiguous, a stand-in's win keeps the visible lookup.
+                                         */
+                                        std::string visibleStandIns;
+                                        const bool friendBesideVisible = adlCandidate && !visibleArityViable
+                                            && adlDot == std::string::npos && compiler->IsCxxFriendName(adlSimpleName);
+                                        const bool rankVisibleWithAdl
+                                            = ((adlNamespaceCandidate && visibleArityViable) || friendBesideVisible)
+                                            && !isTemplate && owner.empty() && cxxBraceArguments.empty()
+                                            && cxxExplicitTemplateArgs.empty()
+                                            && CflatAdlStandIns(*compiler, existing->second, arguments, adlSimpleName,
+                                                genericFunctionTemplates.count(
+                                                    compiler->ResolveGenericFunctionBase(functionName)) != 0
+                                                    ? compiler->ResolveGenericFunctionBase(functionName) : std::string(),
+                                                visibleStandIns);
+                                        bool visibleWins = false;
+                                        if (rankVisibleWithAdl)
+                                        {
+                                            const std::string saved = std::exchange(
+                                                compiler->cxxAdlVisibleStandIns_, visibleStandIns);
+                                            const bool bound = compiler->RequestCxxFreeFunction(
+                                                functionName, {}, arguments, adlRegisteredName, adlError,
+                                                {}, {}, {}, /*adlCall*/ true);
+                                            compiler->cxxAdlVisibleStandIns_ = saved;
+                                            if (bound)
+                                            {
+                                                resolvedName = std::move(adlRegisteredName);
+                                                flattenCxxDirectConstructionArguments(arguments);
+                                                return;
+                                            }
+                                            if (adlError.find("ambiguous") != std::string::npos)
+                                            {
+                                                // Clang names no candidates here, so list the whole set it ranked.
+                                                std::string visibleList;
+                                                const std::string genericBase =
+                                                    compiler->ResolveGenericFunctionBase(functionName);
+                                                if (genericFunctionTemplates.count(genericBase) != 0)
+                                                    visibleList = adlSimpleName + "<...>";
+                                                for (const auto& symbol : existing->second)
+                                                {
+                                                    if (symbol.IsCxx || symbol.IsMethod
+                                                        || symbol.UniqueName.starts_with("__cflat_")
+                                                        || compiler->gts.instantiatedGenericFunctions.count(
+                                                               symbol.UniqueName) != 0
+                                                        || compiler->gts.instantiatedGenericFunctions.count(
+                                                               symbol.SourceName) != 0)
+                                                        continue;
+                                                    std::string spelled = adlSimpleName + "(";
+                                                    for (size_t i = 0; i < symbol.Parameters.size(); ++i)
+                                                    {
+                                                        const auto& parameter = symbol.Parameters[i];
+                                                        spelled += (i != 0 ? ", " : "") + parameter.TypeName
+                                                            + std::string(!parameter.Pointer ? 0
+                                                                : std::max(parameter.PointerDepth, 1), '*');
+                                                    }
+                                                    visibleList += (visibleList.empty() ? "" : ", ") + spelled + ")";
+                                                }
+                                                LogErrorContext(primaryCtx, std::format(
+                                                    "ambiguous call to '{}': no candidate ranks better than the others "
+                                                    "among the visible overloads ({}) and the C++ functions found by "
+                                                    "argument-dependent lookup; qualify the call or cast the argument",
+                                                    adlSimpleName, visibleList));
+                                                return;
+                                            }
+                                            // A deleted stand-in won: the visible CFlat lookup binds the call.
+                                            visibleWins = adlError.find("deleted") != std::string::npos;
+                                        }
+                                        if (!visibleWins && adlCandidate && !visibleArityViable && !isTemplate
+                                            && owner.empty() && cxxBraceArguments.empty()
                                             && compiler->RequestCxxFreeFunction(
                                                 functionName, cxxExplicitTemplateArgs, arguments,
                                                 adlRegisteredName, adlError, {}, {}, {}, /*adlCall*/ true))

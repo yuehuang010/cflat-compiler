@@ -846,3 +846,91 @@ inline int take_nx(NX v) { return v.p != nullptr ? 0 : 1; }
 inline int take_nx_ref(const NX& v) { return v.p != nullptr ? 0 : 1; }
 inline int take_nz(NZ v) { return v.p != nullptr ? 0 : 1; }
 }
+// CONVPTR: a C++ record pointer converts through a pointer ctor at copy-init, assignment,
+// return and a CFlat callee; `Foo*` -> bool -> `T(bool)` at a C++ call and copy-init.
+struct ConvPtrFoo { int value = 3; };
+struct ConvPtrDerived : T305R4Pad, ConvPtrFoo { int z = 1; };
+struct ConvPtrR {
+    int value;
+    ConvPtrR(const ConvPtrFoo* p) : value(p ? p->value : 0) {}
+};
+struct ConvPtrRN {
+    int value;
+    ConvPtrRN(const ConvPtrFoo* p) : value(p ? p->value : 0) {}
+    ConvPtrRN(const ConvPtrRN& o) : value(o.value) {}
+    ~ConvPtrRN() {}
+};
+struct ConvPtrRBool {
+    int value;
+    ConvPtrRBool(bool b) : value(b ? 46 : 47) {}
+};
+struct ConvPtrRExp {
+    int value;
+    explicit ConvPtrRExp(const ConvPtrFoo* p) : value(p ? p->value : 0) {}
+};
+struct ConvPtrRAmb {
+    int value;
+    ConvPtrRAmb(const ConvPtrFoo* p) : value(1) {}
+    ConvPtrRAmb(const ConvPtrDerived* p) : value(2) {}
+};
+inline int convptr_frb(ConvPtrRBool r) { return r.value; }
+inline int convptr_amb(ConvPtrRAmb r) { return r.value; }
+inline int convptr_ob(bool b) { return b ? 81 : 82; }
+inline int convptr_ob(ConvPtrRBool r) { return 83; }
+inline int convptr_ob2(ConvPtrR r) { return 84; }
+inline int convptr_ob2(ConvPtrRBool r) { return 85; }
+struct ConvPtrI { int value; ConvPtrI(int i) : value(i) {} };
+struct ConvPtrI2 { int value; ConvPtrI2(int i) : value(i + 1) {} };
+// Same name as core list<T>.take: the C++ free function still resolves.
+inline int take(ConvPtrR r) { return r.value + 50; }
+// CONVREST: a `?:` of a C++ class pointer and a pointer to its base joins as the base, the
+// derived arm adjusted (ConvPtrDerived's ConvPtrFoo sits past T305R4Pad); `T**` by [conv.qual].
+inline int convrest_ctor = 0;
+inline int convrest_dtor = 0;
+struct ConvRestRN {
+    int value;
+    ConvRestRN(const ConvPtrFoo* p) : value(p ? p->value : 0) { ++convrest_ctor; }
+    ConvRestRN(const ConvRestRN& o) : value(o.value) { ++convrest_ctor; }
+    ~ConvRestRN() { ++convrest_dtor; }
+};
+struct ConvRestPP { int value; ConvRestPP(const ConvPtrFoo* const* p) : value(p && *p ? (*p)->value + 6 : 0) {} };
+struct ConvRestPPN {
+    int value;
+    ConvRestPPN(const ConvPtrFoo* const* p) : value(p && *p ? (*p)->value + 6 : 0) { ++convrest_ctor; }
+    ConvRestPPN(const ConvRestPPN& o) : value(o.value) { ++convrest_ctor; }
+    ~ConvRestPPN() { ++convrest_dtor; }
+};
+struct ConvRestPPM { int value; ConvRestPPM(ConvPtrFoo* const* p) : value(4) {} };
+struct ConvRestPP3 {
+    int value;
+    ConvRestPP3(const ConvPtrFoo* const* p) : value(1) {}
+    ConvRestPP3(ConvPtrFoo* const* p) : value(2) {}
+};
+struct ConvRestPPV { int value; ConvRestPPV(const void* p) : value(5) {} };
+struct ConvRestPP2 { int value; ConvRestPP2(const ConvPtrFoo** p) : value(2) {} };
+inline int convrest_f(ConvPtrR r) { return r.value; }
+inline int convrest_fn(ConvRestRN r) { return r.value; }
+inline int convrest_amb(ConvPtrRAmb r) { return r.value; }
+inline int convrest_pp(ConvRestPP q) { return q.value; }
+inline int convrest_ppn(ConvRestPPN q) { return q.value; }
+inline int convrest_counts() { return convrest_ctor * 100 + convrest_dtor; }
+// PTRSAFE: class-pointer conversions clang refuses or offsets. PtrSafeF sits past T305R4Pad in
+// PtrSafeD; PtrSafeM reaches PtrSafeF twice (ambiguous); PtrSafePriv has a private PtrSafeF.
+struct PtrSafeB0 { int b = 2; };
+struct PtrSafeF : PtrSafeB0 { int value = 3; };
+struct PtrSafeD : T305R4Pad, PtrSafeF { int z = 1; };
+struct PtrSafeL : PtrSafeF {};
+struct PtrSafeR : PtrSafeF {};
+struct PtrSafeM : PtrSafeL, PtrSafeR { int m = 4; };
+struct PtrSafePriv : T305R4Pad, private PtrSafeF { int z = 1; };
+struct PtrSafeHold { PtrSafeD* p = nullptr; };
+inline const PtrSafeD* ptrsafe_cd(PtrSafeD* p) { return p; }
+inline const PtrSafeF* ptrsafe_cf(PtrSafeF* p) { return p; }
+inline int ptrsafe_takef(PtrSafeF* p) { return p ? p->value : -1; }
+inline int ptrsafe_takecf(const PtrSafeF* p) { return p ? p->value : -1; }
+inline int ptrsafe_ccpp(const PtrSafeF** p) { return 1; }
+inline int ptrsafe_cb(const PtrSafeB0* const* p) { return (*p)->b; }
+inline int ptrsafe_cp(const PtrSafeF* const* p) { return (*p)->value; }
+inline long long ptrsafe_off(const void* derived, const void* base) {
+    return (long long)((const char*)base - (const char*)derived);
+}

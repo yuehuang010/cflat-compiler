@@ -6130,6 +6130,9 @@ void ApplyOwningSinkInferenceToBody(const LLVMBackend* compiler,
         // move-constructs it), so a write or return in the body never consumes the caller.
         const bool cxxClass = compiler != nullptr
             && (compiler->IsCxxRecord(p.TypeName) || compiler->IsForeignNontrivialCxxClass(p.TypeName));
+        // A const imported class param is never moved from (`move p` copies, as clang): no sink.
+        if (cxxClass && compiler->IsForeignNontrivialCxxClass(p.TypeName)
+            && !compiler->IsCppStructName(p.TypeName) && compiler->IsCxxConstClassObject(p)) continue;
         // A cast-wrapped source counts only when every peeled wrapper names the parameter's own
         // type - a TYPE-CHANGING cast is not a whole-value consume of the parameter.
         bool wrappedConsume = false;

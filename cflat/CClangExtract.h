@@ -16,6 +16,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -29,6 +30,7 @@ namespace clang
     class FunctionDecl;
     class CXXRecordDecl;
     class Preprocessor;
+    class SourceLocation;
 }
 
 namespace llvm
@@ -799,6 +801,9 @@ namespace cflat_cinterop
         // declare (RawSig::declaredByRequestHeader) so the caller can drop them.
         bool tagRequestHeaderFunctions = false;
         std::vector<std::string> inScopeDirs;
+        // (includer, header) for each quoted #include resolved beside its includer or by an
+        // absolute path, in include order: such a header shares its in-scope includer's scope.
+        const std::vector<std::pair<std::string, std::string>>* scopeIncludeEdges = nullptr;
         bool checkHeaderScope = false;      // reject a stub sentinel left inside a header scope
         std::string scopeHeaderPath;        // fallback path for a missing sentinel
         bool definitionsOnly = false;       // .c auto-extern: only functions defined in this TU
@@ -1021,6 +1026,15 @@ namespace cflat_cinterop
         unsigned headerErrors = 0;
         std::string firstHeaderError;            // "message at file:line" for the first such error
     };
+
+    /*
+     * The scope edge an `#include` directive makes (see ExtractRequest::scopeIncludeEdges), or
+     * false: a quoted include found beside its includer or spelled as an absolute path names the
+     * same file whichever spelling reached it, so the header binds as its includer's own.
+     */
+    bool ScopeIncludeEdge(const clang::Preprocessor& pp, clang::SourceLocation hashLoc,
+                          std::string_view spelled, bool angled, std::string_view resolved,
+                          std::pair<std::string, std::string>& edge);
 
     // Attach the header-only macro collector to a live incremental preprocessor. The returned
     // closure disables collection after the initial header chunk has been parsed.

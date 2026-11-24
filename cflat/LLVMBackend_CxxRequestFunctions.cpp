@@ -5787,6 +5787,7 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
             std::string guardKey;
             for (const DeferredPlaceGuard& guard : deferredPlaceGuards)
                 guardKey += std::format("|place{}{}", guard.index, guard.spelling);
+            if (adlCall && !cxxAdlVisibleStandIns_.empty()) guardKey += "|visible" + cxxAdlVisibleStandIns_;
             const uint64_t hash = HashWrapperKey(functionName + target + guardKey
                                                  + std::format("|{}", parameterSpellings.size())
                                                  + (braceGroups.empty() ? "" : "|list-probe")
@@ -5833,7 +5834,17 @@ bool LLVMBackend::RequestCxxFreeFunctionImpl(const std::string& functionName,
                 // An unqualified name is an ordinary call plus ADL: the global overloads stay visible.
                 const std::string hideGlobal = functionName.find('.') == std::string::npos
                     ? std::string() : "void " + target.substr(0, target.find('(')) + "() = delete; ";
-                wrapper.source = "namespace " + scope + " { " + hideGlobal
+                /*
+                 * CALLRES: deleted stand-ins for the call's visible CFlat overloads. The using-directive
+                 * puts them in global-scope lookup beside ADL's set, so one of them winning fails the call.
+                 */
+                std::string visible;
+                if (!cxxAdlVisibleStandIns_.empty() && hideGlobal.empty())
+                {
+                    wrapper.source = "namespace " + scope + "_visible { " + cxxAdlVisibleStandIns_ + " }\n";
+                    visible = "using namespace ::" + scope + "_visible; ";
+                }
+                wrapper.source += "namespace " + scope + " { " + visible + hideGlobal
                     + "inline decltype(auto) call(" + parameters + ") noexcept(noexcept("
                     + target + ")) { return " + target + "; } }\n";
                 call = scope + "::call(" + forward + ")";

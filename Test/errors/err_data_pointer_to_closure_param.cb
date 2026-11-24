@@ -109,21 +109,19 @@ expect_error("no method of 'IClosureTwoSlot.lam' matches the given arguments") {
     }
 }
 
-// The gate must stay one-sided. An int argument to a floating-point interface parameter is NOT
-// a provable mismatch: the overload scorer has no int->floating-point rule, so an earlier
-// revision that gated on "the scorer found no match" rejected this. Compiling is the whole
-// assertion - files here are compiled, never run - so a future allowlist cannot silently
-// re-break it.
+// The closure gate stays one-sided; this int -> floating refusal is the native call-conversion
+// rule (the direct class call refuses it too), not the closure gate.
+expect_error("no overload of 'absorb' matches the given arguments.") {
+    interface IFpParam { int absorb(double d); };
+    class FpParamImpl : IFpParam { int absorb(double d) { return (int)d; } };
 
-interface IFpParam { int absorb(double d); };
-class FpParamImpl : IFpParam { int absorb(double d) { return (int)d; } };
-
-int acceptIntIntoFpParam()
-{
-    FpParamImpl impl;
-    IFpParam io = impl;
-    int n = 3;
-    return io.absorb(n);
+    int acceptIntIntoFpParam()
+    {
+        FpParamImpl impl;
+        IFpParam io = impl;
+        int n = 3;
+        return io.absorb(n);
+    }
 }
 
 // The THIN (`function<>`) parameter arm of the same hole. A thin slot takes a BARE code address,

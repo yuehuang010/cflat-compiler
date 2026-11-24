@@ -1342,12 +1342,13 @@ bool LLVMBackend::SpellCxxBraceDeferredConstruction(const NamedVariable& constru
                 }
                 else if (IsCxxRecord(argType.TypeName))
                 {
-                    // A class argument binds by reference: clang copies an lvalue, moves an rvalue.
+                    // A class argument binds by reference: clang copies an lvalue, moves an rvalue;
+                    // a const rvalue binds `const T&&` and copies.
                     const bool xvalue = argType.IsRvalueRef || argument.IsExplicitMove
                         || IsCxxRvalueReferenceArgument(argument)
                         || (argument.IsRvalue && !argType.IsAlias);
                     const bool isConst = CxxConstReceiverKind(argument) != 0;
-                    spelling += xvalue ? " &&" : isConst ? " const &" : " &";
+                    spelling += xvalue ? (isConst ? " const &&" : " &&") : isConst ? " const &" : " &";
                     child = xvalue ? "std::move(" + parameter + ")" : parameter;
                 }
                 else if (argType.IsAlias || argType.IsRvalueRef)
@@ -1404,7 +1405,7 @@ bool LLVMBackend::IsBareNullptrBraceLiteral(const NamedVariable& element)
 }
 
 bool LLVMBackend::RequestCxxDirectBraceConstructor(
-        const std::string& typeName, const std::vector<NamedVariable>& elements,
+        const std::string& typeName, std::vector<NamedVariable>& elements,
         const std::string& initializerList, bool copyListInit, std::string& wrapperName,
         std::string& error, bool allowIncremental,
         std::vector<size_t>* forwardedElementIndices,
@@ -1414,6 +1415,18 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
         error.clear();
         wrapperName.clear();
         if (forwardedElementIndices != nullptr) forwardedElementIndices->clear();
+        // An overloaded function name element is the one overload the constructors select.
+        for (size_t i = 0; i < elements.size(); ++i)
+            if (const FunctionSymbol* symbol = CxxCtorOverloadedNameArgument(
+                    typeName, elements[i], i, elements.size(), error))
+            {
+                const TypeAndValue signature = FuncPtrSigOfSymbol(*symbol);
+                elements[i].Primary = BareFunctionToThinValue(symbol->Function, &signature);
+                elements[i].BaseType = elements[i].Primary->getType();
+                elements[i].TypeAndValue = signature;
+            }
+            else if (!error.empty())
+                return false;
         std::string ownerSpelling;
         if (!CxxSpellingForCflatType(typeName, ownerSpelling))
         {
@@ -1579,6 +1592,8 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
                 else
                     spelling = targetType;
             }
+            // A function value (`{fn}`, a function<> slot) is its thin pointer, as a call argument.
+            else if (type.IsThinFnPtr() && CxxThinFunctionPointerSpelling(type, spelling)) {}
             else if (type.TypeName.empty()
                 || (!(!type.Pointer && !type.ElemPointer
                         && CxxImportedEnumElementSpelling(type.TypeName, spelling))
@@ -1611,13 +1626,14 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
                     spelling += " const";
                 spelling += pointerXvalue ? " &&" : " &";
             }
-            // A class element binds by reference: clang copies an lvalue, moves an rvalue.
+            // A class element binds by reference: clang copies an lvalue, moves an rvalue; a const
+            // rvalue (`c ? a + b : a.cref()`) binds `const T&&` and copies.
             else if (!type.Pointer && IsCxxRecord(type.TypeName))
             {
                 const bool xvalue = elements[i].IsExplicitMove
                     || IsCxxRvalueReferenceArgument(elements[i]);
                 const bool isConst = CxxConstReceiverKind(elements[i]) != 0;
-                spelling += xvalue ? " &&" : isConst ? " const &" : " &";
+                spelling += xvalue ? (isConst ? " const &&" : " &&") : isConst ? " const &" : " &";
             }
             elementParameters[i] = "p" + std::to_string(nextParameter++);
             elementParameterTypes[i] = parameterTypes.size();

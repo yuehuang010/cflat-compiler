@@ -41,5 +41,18 @@ inline A mkA(int value) noexcept { return A(value); }
 inline BV mkBV(int value = 20) noexcept { return BV(value); }
 inline int ctakeBV(BV value) noexcept { return value.v; }
 inline int ctakeBVR(const BV& value) noexcept { return value.v; }
+// MIXRES: member callees take the mixed join without a free-function sink.
+// MIXRES r2: refused nested call-argument joins keep the arm-clash diagnostic.
+struct EB { int v; explicit EB(A a) noexcept : v(a.v) {} EB(int n) noexcept : v(n) {} EB(const EB& o) noexcept : v(o.v) {} ~EB() noexcept {} };
+inline EB mkEB(int n) noexcept { return EB(n); }
+inline int takeEB(EB e) noexcept { return e.v; }
+struct SS { int n; SS(const char* s) noexcept : n(1) {} SS(const SS& o) noexcept : n(o.n) {} ~SS() noexcept {} };
+inline SS mkSS(const char* s) noexcept { return SS(s); }
+inline int takeSS(SS s) noexcept { return s.n; }
+struct Host
+{
+    int take(BV value) noexcept { return value.v; }
+    int takeR(const BV& value) noexcept { return value.v; }
+};
 
 }

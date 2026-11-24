@@ -15151,11 +15151,25 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 && right->getType()->isPointerTy()
                                 && compiler->GetDataStructure(typeAndValue.TypeName).StructType != nullptr)
                             {
-                                LogErrorContext(assignmentExpression, std::format(
-                                    "cannot initialize value of type '{}' with a pointer of type '{}*'; "
-                                    "declare it as '{}* {} = ...;' or drop the 'new'",
-                                    SpellType(*compiler, typeAndValue), SpellType(*compiler, typeAndValue),
-                                    SpellType(*compiler, typeAndValue), name));
+                                // A source of another pointee (`&foo`) is no `new T`: name its real type.
+                                const bool otherPointee = haveInitializerSourceNV
+                                    && initializerSourceNV.TypeAndValue.Pointer
+                                    && !initializerSourceNV.TypeAndValue.TypeName.empty()
+                                    && compiler->ResolveTypeAlias(initializerSourceNV.TypeAndValue.TypeName)
+                                        != compiler->ResolveTypeAlias(typeAndValue.TypeName);
+                                if (otherPointee)
+                                    LogErrorContext(assignmentExpression, std::format(
+                                        "cannot initialize value of type '{}' with a pointer of type '{}'; "
+                                        "no implicit conversion applies here - construct it as '{}(...)'",
+                                        SpellType(*compiler, typeAndValue),
+                                        SpellType(*compiler, initializerSourceNV.TypeAndValue),
+                                        SpellType(*compiler, typeAndValue)));
+                                else
+                                    LogErrorContext(assignmentExpression, std::format(
+                                        "cannot initialize value of type '{}' with a pointer of type '{}*'; "
+                                        "declare it as '{}* {} = ...;' or drop the 'new'",
+                                        SpellType(*compiler, typeAndValue), SpellType(*compiler, typeAndValue),
+                                        SpellType(*compiler, typeAndValue), name));
                                 right = nullptr;
                             }
 

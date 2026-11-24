@@ -25,15 +25,6 @@ expect_error("'?:' arms differ in ownership") {
 
 
 
-expect_error("'?:' arms differ in ownership: 'a + b' is an owning value and 'a.const_ref()' is a borrow") {
-    void cppConstRefBorrow(bool c)
-    {
-        cppas.Life a = cppas.Life(3);
-        cppas.Life b = cppas.Life(4);
-        cppas.Life target = cppas.Life(0);
-        target = c ? a + b : a.const_ref();
-    }
-}
 
 
 // T306 round 3: a default-only arm refuses at the ownership join unless the other arm IS the

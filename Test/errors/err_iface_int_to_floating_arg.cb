@@ -1,0 +1,64 @@
+// An integer argument to a single floating-point interface slot. A native call never converts an
+// integer to floating point implicitly (issue decision 2026-10-29: native strict call conversions
+// win), so the direct class call `c.f(1)` and the free call `f(1)` are refused. The interface path
+// had a no-winner fallback that kept "safely lowerable" widenings and so accepted int -> double
+// (returned the slot's value). Every block below compiled clean before the fix.
+//
+// The accept-set that must survive (double / float / literal arguments to f(double), integer
+// widenings to integer slots) is asserted with VALUES in Test/test_interface.cb
+// (iface_ifres_accept_*).
+
+enum IfresCol : u8 { R = 1, G = 2 };
+interface IIfres { int f(double a); };
+class Ifres : IIfres { int f(double a) { return 1; } };
+interface IIfresFloat { int f(float a); };
+class IfresFloat : IIfresFloat { int f(float a) { return 2; } };
+interface IIfresGen<T> { int f(double a); int g(T a); };
+class IfresGen : IIfresGen<int> { int f(double a) { return 3; } int g(int a) { return a; } };
+interface IIfresConst { int f(double a) const; };
+class IfresConst : IIfresConst { int f(double a) const { return 4; } };
+interface IIfresArity { int f(double a); int f(double a, int b); };
+class IfresArity : IIfresArity { int f(double a) { return 5; } int f(double a, int b) { return b; } };
+struct IfresHolder { IIfres i; };
+
+extern int main()
+{
+    Ifres c;
+    IIfres o = c;
+    expect_error("no overload of 'f' matches the given arguments.") { int r = o.f(1); }
+    int iv = 2;
+    expect_error("no overload of 'f' matches the given arguments.") { int r = o.f(iv); }
+    i64 lv = 2;
+    expect_error("no overload of 'f' matches the given arguments.") { int r = o.f(lv); }
+    i8 sv = 2;
+    expect_error("no overload of 'f' matches the given arguments.") { int r = o.f(sv); }
+    bool bv = true;
+    expect_error("no overload of 'f' matches the given arguments.") { int r = o.f(bv); }
+    IfresCol ev = IfresCol.G;
+    expect_error("no overload of 'f' matches the given arguments.") { int r = o.f(ev); }
+
+    IfresFloat fc;
+    IIfresFloat fo = fc;
+    expect_error("no overload of 'f' matches the given arguments.") { int r = fo.f(1); }
+
+    IfresGen gc;
+    IIfresGen<int> go = gc;
+    expect_error("no overload of 'f' matches the given arguments.") { int r = go.f(1); }
+
+    IfresHolder h;
+    h.i = c;
+    IfresHolder* hp = &h;
+    expect_error("no overload of 'f' matches the given arguments.") { int r = hp->i.f(1); }
+
+    IIfres? n = c;
+    expect_error("no overload of 'f' matches the given arguments.") { int r = n?.f(1); }
+
+    IfresConst kc;
+    const IIfresConst ko = kc;
+    expect_error("no overload of 'f' matches the given arguments.") { int r = ko.f(1); }
+
+    IfresArity ac;
+    IIfresArity ao = ac;
+    expect_error("no overload of 'f' matches the given arguments.") { int r = ao.f(1); }
+    return 0;
+}

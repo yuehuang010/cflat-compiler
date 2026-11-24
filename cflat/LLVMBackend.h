@@ -2170,8 +2170,12 @@ public:
         // call site drops TypeName for a primitive so overload matching stays LLVM-type based.
         // Generic type-argument inference reads it; not part of the --init cache round-trip.
         std::string InferSourceTypeName;
-        // Set only for C++ class-pointer operator operands; ordinary call arguments leave it false.
+        // A proven C++ record pointer at a C++ class slot (call argument, operator operand,
+        // copy-init) may convert through a pointer-taking ctor. Transient, not cached.
         bool AllowCxxClassPointerCtorConversion = false;
+        // Also `Foo*` -> bool -> `T(bool)`: C++ calls and copy-init only; CFlat calls refuse the
+        // pointer -> bool step. Transient, not cached.
+        bool AllowCxxClassPointerBoolCtorConversion = false;
         // C++ identity of a built-in arithmetic result (`l + 1` is C++ `long`, typed i64 here),
         // for C++ template deduction only; native typing never reads it. Transient.
         std::string CxxArithIdentity;
@@ -8229,6 +8233,8 @@ private:
                                 bool adlCall = false,
                                 const std::vector<std::pair<size_t, size_t>>& braceGroups = {},
                                 const std::string& memberOwnerType = {});
+    // CALLRES: C++ declarations of the visible CFlat overloads an ADL request ranks beside its own.
+    std::string cxxAdlVisibleStandIns_;
     bool RequestCxxFreeFunctionImpl(const std::string& functionName,
                                     const std::vector<std::string>& explicitArgs,
                                     std::vector<NamedVariable>& arguments,
@@ -8312,8 +8318,9 @@ private:
     // An imported unscoped enumerator or integer macro as a bare integer literal, else empty.
     std::string CxxImportedConstantLiteral(const NamedVariable& element) const;
     void RecordCxxConstantBraceElement(NamedVariable& element, llvm::Value* value);
+    // An overloaded function name element is rewritten in place to the overload selected.
     bool RequestCxxDirectBraceConstructor(const std::string& typeName,
-                                          const std::vector<NamedVariable>& elements,
+                                          std::vector<NamedVariable>& elements,
                                           const std::string& initializerList,
                                           bool copyListInit,
                                           std::string& wrapperName,
@@ -11829,6 +11836,24 @@ public:
     llvm::Value* AdjustCxxPointerForStore(const TypeAndValue& dest, const TypeAndValue& src,
                                           llvm::Value* value, const std::string& destDesc);
     /*
+     * The implicit class-pointer conversions clang refuses at a store: base -> derived (`D* = B*`)
+     * and a multi-level pointer to a different class of the same hierarchy (`B** = D**`, no
+     * offset is applied through the outer level). LogError and true when refused.
+     */
+    bool RejectCxxClassPointerStore(const TypeAndValue& dest, const TypeAndValue& src,
+                                    const std::string& destDesc);
+    /*
+     * An explicit `(T*)p` between C++ class pointers is static_cast when the classes are related:
+     * an upcast adds the base offset, a downcast subtracts it (null stays null); an ambiguous or
+     * virtual route is refused like clang. Unrelated classes keep the address (reinterpret).
+     */
+    llvm::Value* LowerCxxClassPointerCast(const TypeAndValue& src, const TypeAndValue& dest,
+                                          llvm::Value* ptr);
+    // A C++ by-value multi-level pointer parameter the argument reaches only by changing the class
+    // or by a const change [conv.qual] refuses (`F**` -> `const F**`, `D**` -> `const B* const*`).
+    bool CxxDeepClassPointerArgInvalid(const FunctionSymbol& candidate, size_t index,
+                                       const NamedVariable& arg, const TypeAndValue& param) const;
+    /*
      * A C++ reference return (`C&` / `const C&`) hands back the referent's ADDRESS, so a CFlat
      * pointer destination binds to it directly - the same value `&<call>` yields. Returns that
      * address (base-adjusted like a pointer store), or nullptr when the source is not one.
@@ -12368,6 +12393,10 @@ public:
                                                        const std::vector<NamedVariable>* argVars = nullptr,
                                                        bool allowExplicit = true,
                                                        bool allowScalarNarrowing = false) const;
+    // `Foo*` -> bool -> `T(bool)`: the non-explicit bool ctor a class pointer reaches when no
+    // pointer ctor matched (`pointerWhy` = that pick's refusal; an ambiguous pick stays refused).
+    const CxxClassInfo::Structor* CxxClassPointerBoolCtor(const std::string& typeName,
+                                                          const std::string& pointerWhy) const;
     const CxxClassInfo::Structor* SelectCxxConstructorListed(const std::string& typeName,
                                                              const std::vector<TypeAndValue>& argTypes,
                                                              std::string& why,
@@ -13129,6 +13158,11 @@ public:
                                                           const TypeAndValue& param) const;
     bool NamedFunctionProvablyMismatchesFuncPtr(const std::string& functionName,
         const TypeAndValue& param) const;
+    // An overloaded function name as argument `index` of a C++ constructor of `typeName`: clang's
+    // rule, exactly one overload must bind a function-pointer parameter of a same-arity
+    // constructor. Returns that overload; nullptr when not applicable or refused (`refusal` set).
+    const FunctionSymbol* CxxCtorOverloadedNameArgument(const std::string& typeName,
+        const NamedVariable& arg, size_t index, size_t argCount, std::string& refusal);
 
     // True for a named function or generic-function value, not a call result with the same name.
     bool IsNamedFunctionValue(const NamedVariable& arg) const;
@@ -14269,6 +14303,10 @@ public:
     // A C++ class VALUE slices to a by-value/by-reference parameter of a PUBLIC base of it.
     bool IsCxxDerivedToBaseValue(const TypeAndValue& from, const TypeAndValue& to,
                                  const NamedVariable* source) const;
+    // A by-value pointer conversion of depth >= 2 valid under [conv.qual] (`T**` -> `const T* const*`;
+    // `T**` -> `const T**` is not). `spelling` is the C++ parameter spelling, or empty.
+    static bool IsCxxDeepQualificationConversion(const TypeAndValue& got, uint32_t sourceMask,
+                                                 const TypeAndValue& param, const std::string& spelling);
     // [over.ics.rank] same-class tie: both candidates bind the argument by a derived-to-base
     // conversion to the same base `paramClass` from the same argument type (no user-defined step).
     static bool CxxSameBaseBindRank(const CxxConversionRank& rx, const CxxConversionRank& ry,
@@ -14285,7 +14323,8 @@ public:
     bool IsCxxDerivedToBasePointer(const TypeAndValue& from, const TypeAndValue& to) const
     {
         if (!from.Pointer || !to.Pointer) return false;
-        if (from.ElemPointer != to.ElemPointer) return false;
+        // [conv.ptr] is one level deep: `D**` never converts to `B**` (no offset reaches *p).
+        if (from.ElemPointer || to.ElemPointer) return false;
         if (from.TypeName == to.TypeName || from.TypeName.empty() || to.TypeName.empty()) return false;
         if (!IsCxxRecord(from.TypeName) || !IsCxxRecord(to.TypeName)) return false;
         return IsCxxBaseOf(to.TypeName, from.TypeName);

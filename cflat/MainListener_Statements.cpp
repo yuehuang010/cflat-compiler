@@ -3919,8 +3919,18 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 && !sourceType.empty() && compiler->IsCxxRecord(sourceType)
                 && compiler->IsCxxRecord(targetType)
                 && compiler->ResolveTypeAlias(sourceType) != compiler->ResolveTypeAlias(targetType);
+            // A C++ record pointer or nullptr reaches a register-returned class's converting ctor.
+            const bool pointerCtorSource = compiler->IsCxxTriviallyCopyableRecord(targetType)
+                && ((returnNV.TypeAndValue.Pointer
+                     && (returnNV.TypeAndValue.ValuePointerDepth() == 1
+                         || returnNV.TypeAndValue.ValuePointerDepth() == 2)
+                     && compiler->IsCxxRecord(sourceType))
+                    || (sourceType.empty() && right->getType()->isPointerTy()
+                        && returnNV.JoinClassPointeeDepth == 1
+                        && compiler->IsCxxRecord(returnNV.JoinClassPointee))
+                    || LLVMBackend::IsCxxNullTypedArgument(returnNV));
             if (cxxClassReturn && returnTy->isStructTy()
-                && (distinctCxxClassSource
+                && (distinctCxxClassSource || pointerCtorSource
                     || (!right->getType()->isStructTy() && !right->getType()->isPointerTy()
                         && compiler->IsCxxTriviallyCopyableRecord(targetType))))
             {

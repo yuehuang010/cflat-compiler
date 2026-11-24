@@ -434,6 +434,11 @@ import cpp {"library/cpp_interop_varctor.h", "library/cpp_interop_freeoptpl.h", 
 
 int mix7FnTwice(int x) { return x * 2; }
 int mix14Twice(int x) { return x * 2; }
+// FNCAST r2: overload sets whose first declaration is the int / the double overload.
+int fncastOv(int x) { return x + 1; }
+double fncastOv(double x) { return x; }
+double fncastRov(double x) { return x; }
+int fncastRov(int x) { return x + 1; }
 int ctorConvIndexCalls = 0;
 int CtorConvNextIndex() { ctorConvIndexCalls++; return ctorConvIndexCalls; }
 import cpp {"library/cpp_mix4_conv_builtin.hpp", "library/cpp_interop_fixedarray.hpp", "library/cpp_interop_arraybool.hpp"};
@@ -2819,6 +2824,7 @@ t135.DefList[2] t136GlobalDefOuter = {};
 // T136 ORDER: foreign C++ globals keep clang declaration order. Native defaults are local.
 import cpp "library/cpp_t136_order.hpp";
 import cpp "library/cpp_pickname.hpp";
+import cpp "library/wrapbind/cpp_wrapbind.hpp";
 // Same simple name as the C++ pickname members: must not join their overload set.
 struct PicknameBox { int o = 0; int pickAlias(bool c) { return 9; } };
 struct ParenAssignCppHolder { cppcp.CV value = cppcp.CV(0); };
@@ -4388,6 +4394,73 @@ int T513M3FalseAConstRefProbe(bool k)
     int value = t513mix.ctakeBVR(k ? t513mix.mkBV(20) : t513mix.mkA(11));
     return value * 10000 + t513mix.t513M3Stats();
 }
+int T513MixresTakeBV(t513mix.BV value) { return value.v; }
+int T513MixresTakeTwo(t513mix.BV value, int extra) { return value.v + extra; }
+// MIXRES: converting by-value parameter lvalue arms (S3), lvalue arms at C++ member callees,
+// and a mixed `?:` nested in a mixed `?:` call argument. Order checked against clang++ (Itanium).
+bool T513MixresTrace(int expected)
+{
+    int trace = t513mix.t513M3Stats();
+    bool exact = trace == expected;
+    if const (__WINDOWS__) { exact = true; }
+    return exact && T513V10MixcondTraceLive(trace) == 0;
+}
+t513mix.BV T513MixresRetParam(bool k, t513mix.A a) { return k ? a : t513mix.mkBV(20); }
+t513mix.BV T513MixresRetParamFalse(bool k, t513mix.A a) { return k ? t513mix.mkBV(20) : a; }
+int T513MixresRetParamProbe(bool k, bool falseArm)
+{
+    t513mix.t513M3Reset();
+    if (falseArm)
+    {
+        t513mix.BV f = T513MixresRetParamFalse(!k, t513mix.mkA(3));
+        return f.v;
+    }
+    t513mix.BV r = T513MixresRetParam(k, t513mix.mkA(3));
+    return r.v;
+}
+int T513MixresDeclParam(bool k, t513mix.A a) { t513mix.BV r = k ? a : t513mix.mkBV(20); return r.v; }
+int T513MixresDeclParamFalse(bool k, t513mix.A a) { t513mix.BV r = k ? t513mix.mkBV(20) : a; return r.v; }
+int T513MixresArgParam(bool k, t513mix.A a) { return t513mix.ctakeBV(k ? a : t513mix.mkBV(20)); }
+int T513MixresArgParamFalse(bool k, t513mix.A a) { return t513mix.ctakeBV(k ? t513mix.mkBV(20) : a); }
+int T513MixresMethodParam(bool k, t513mix.A a)
+{
+    t513mix.Host h = t513mix.Host();
+    return h.take(k ? a : t513mix.mkBV(20));
+}
+int T513MixresParamProbe(int form, bool k)
+{
+    t513mix.t513M3Reset();
+    if (form == 0) return T513MixresDeclParam(k, t513mix.mkA(3));
+    if (form == 1) return T513MixresDeclParamFalse(k, t513mix.mkA(3));
+    if (form == 2) return T513MixresArgParam(k, t513mix.mkA(3));
+    if (form == 3) return T513MixresArgParamFalse(k, t513mix.mkA(3));
+    return T513MixresMethodParam(k, t513mix.mkA(3));
+}
+int T513MixresMethodLocalProbe(bool k, bool falseArm)
+{
+    t513mix.t513M3Reset();
+    t513mix.A a = t513mix.mkA(3);
+    t513mix.Host h = t513mix.Host();
+    if (falseArm) return h.take(!k ? t513mix.mkBV(20) : a);
+    return h.take(k ? a : t513mix.mkBV(20));
+}
+int T513MixresNestedProbe(int form, bool k, bool j)
+{
+    t513mix.t513M3Reset();
+    t513mix.Host h = t513mix.Host();
+    if (form == 0) return t513mix.ctakeBV(k ? (j ? t513mix.mkA(1) : t513mix.mkBV(2)) : t513mix.mkA(3));
+    if (form == 1) return t513mix.ctakeBV(!k ? t513mix.mkA(3) : (j ? t513mix.mkA(1) : t513mix.mkBV(2)));
+    if (form == 2) return t513mix.ctakeBVR(k ? (j ? t513mix.mkA(1) : t513mix.mkBV(2)) : t513mix.mkA(3));
+    if (form == 3) return T513MixresTakeBV(k ? (j ? t513mix.mkA(1) : t513mix.mkBV(2)) : t513mix.mkA(3));
+    if (form == 4) return h.take(k ? (j ? t513mix.mkA(1) : t513mix.mkBV(2)) : t513mix.mkA(3));
+    return T513MixresTakeTwo(k ? (j ? t513mix.mkA(1) : t513mix.mkBV(2)) : t513mix.mkA(3), 1000) - 1000;
+}
+int T513MixresNestedLvalueProbe(bool k, bool j)
+{
+    t513mix.t513M3Reset();
+    t513mix.A a = t513mix.mkA(3);
+    return t513mix.ctakeBV(k ? (j ? a : t513mix.mkBV(2)) : a);
+}
 int T513M2C14Probe(bool k, bool j)
 {
     t513V10Reset();
@@ -5955,6 +6028,43 @@ int arrBoundCppAccept()
     if ((int)sizeof(d) * 10 + d[1] != 87) return 86904;
     return 0;
 }
+
+// CONVPTR: CFlat functions taking / returning C++ classes built from a record pointer.
+ConvPtrR convPtrRet(ConvPtrFoo* p) { return p; }
+ConvPtrRN convPtrRetN(ConvPtrDerived* p) { return p; }
+ConvPtrR convPtrRetNull() { return nullptr; }
+int convPtrCf(ConvPtrR r) { return r.value + 120; }
+int convPtrCfN(ConvPtrRN r) { return r.value + 120; }
+int convPtrCfo(ConvPtrFoo* p) { return 91; }
+int convPtrCfo(ConvPtrR r) { return 92; }
+ConvPtrR convPtrRetT(bool c, ConvPtrFoo* a, ConvPtrFoo* b) { return c ? a : b; }
+ConvPtrRN convPtrRetTN(bool c, ConvPtrFoo* a, ConvPtrFoo* b) { return c ? a : b; }
+// A `bool` sibling that another argument cannot reach is no competitor (clang picks 1).
+int convPtrBs(ConvPtrR r, bool b) { return 1; }
+int convPtrBs(bool b, ConvPtrR r) { return 2; }
+int convPtrBn(ConvPtrR r, int i) { return 1; }
+int convPtrBn(bool b, ConvPtrFoo* p) { return 2; }
+// CONVREST: CFlat functions over a mixed-pointee `?:` and a `T**` source.
+ConvPtrR convRestRet(bool c, ConvPtrFoo* a, ConvPtrDerived* d) { return c ? a : d; }
+ConvRestRN convRestRetN(bool c, ConvPtrFoo* a, ConvPtrDerived* d) { return c ? a : d; }
+int convRestCf(ConvPtrR r) { return r.value + 100; }
+int convRestCfN(ConvRestRN r) { return r.value + 100; }
+ConvRestPP convRestRetPP(ConvPtrFoo** p) { return p; }
+ConvRestPPN convRestRetPPN(ConvPtrFoo** p) { return p; }
+int convRestCfPP(ConvRestPP q) { return q.value + 100; }
+int convRestCfPPN(ConvRestPPN q) { return q.value + 100; }
+// PTRSAFE: a global class-pointer initializer stays a constant through a cast or an array element.
+PtrSafeD ptrSafeGd = default;
+PtrSafeD* ptrSafeGDown = (PtrSafeD*)(PtrSafeF*)&ptrSafeGd;
+PtrSafeF* ptrSafeGUp = (PtrSafeF*)&ptrSafeGd;
+PtrSafeF*[1] ptrSafeGArr = { &ptrSafeGd };
+interface IConvPtr { int m(ConvPtrR r); int n(ConvPtrRN r); };
+class ConvPtrImpl : IConvPtr
+{
+    int z = default;
+    int m(ConvPtrR r) { return r.value + 40; }
+    int n(ConvPtrRN r) { return r.value + 50; }
+};
 
 extern int main()
 {
@@ -8791,6 +8901,31 @@ extern int main()
     if const (__WINDOWS__) { t513M3LvalueExpected = 1042647; }
     if (T513M3LvalueCppProbe(true) != t513M3LvalueExpected) return 95234;
     if (T513M3LvalueCppFalseProbe(false) != t513M3LvalueExpected) return 95235;
+    // MIXRES (clang++ -std=c++20 order; Windows checks value and balance).
+    for (int mixresArm = 0; mixresArm < 2; mixresArm++)
+    {
+        bool mixresFalse = mixresArm == 1;
+        if (T513MixresRetParamProbe(true, mixresFalse) != 103 || !T513MixresTrace(126447)) return 95300;
+        if (T513MixresRetParamProbe(false, mixresFalse) != 20 || !T513MixresTrace(1547)) return 95301;
+        if (T513MixresMethodLocalProbe(true, mixresFalse) != 103 || !T513MixresTrace(126744)) return 95302;
+        if (T513MixresMethodLocalProbe(false, mixresFalse) != 20 || !T513MixresTrace(1574)) return 95303;
+    }
+    if (T513MixresParamProbe(0, true) != 103 || !T513MixresTrace(126474)) return 95304;
+    if (T513MixresParamProbe(1, false) != 103 || !T513MixresTrace(126474)) return 95305;
+    if (T513MixresParamProbe(0, false) != 20 || !T513MixresTrace(1574)) return 95306;
+    if (T513MixresParamProbe(2, true) != 103 || !T513MixresTrace(126744)) return 95307;
+    if (T513MixresParamProbe(3, false) != 103 || !T513MixresTrace(126744)) return 95308;
+    if (T513MixresParamProbe(2, false) != 20 || !T513MixresTrace(1574)) return 95309;
+    if (T513MixresParamProbe(4, true) != 103 || !T513MixresTrace(126744)) return 95310;
+    for (int mixresForm = 0; mixresForm < 6; mixresForm++)
+    {
+        if (T513MixresNestedProbe(mixresForm, true, true) != 101 || !T513MixresTrace(1674)) return 95311;
+        if (T513MixresNestedProbe(mixresForm, true, false) != 2 || !T513MixresTrace(57)) return 95312;
+        if (T513MixresNestedProbe(mixresForm, false, true) != 103 || !T513MixresTrace(1674)) return 95313;
+    }
+    if (T513MixresNestedLvalueProbe(true, true) != 103 || !T513MixresTrace(126744)) return 95314;
+    if (T513MixresNestedLvalueProbe(true, false) != 2 || !T513MixresTrace(1574)) return 95315;
+    if (T513MixresNestedLvalueProbe(false, false) != 103 || !T513MixresTrace(126744)) return 95316;
     if (T513V12Probe(true, 11) != t513V12TrueExpected) return 95175;
     if (T513V12Probe(false, 11) != 200057) return 95176;
     // By-value B(A): MSVC destroys A inside B(A), so A dies before the callee's B (clang-cl 1647).
@@ -14600,6 +14735,29 @@ extern int main()
     if (m18ov.TieU(mix18L).v != 1) return 65063;
     // MIX18 r2: a CFlat function value into a free `const bool&` overload is its truth (clang 1); an int picks int.
     if (m18ov.a3(mix7FnTwice) != 1 || m18ov.a3(mix18I) != 2) return 65064;
+    // FNCAST: the cast form with a function designator operand direct-initializes like `T(fn)`
+    // (clang 1, 1, 1, 1): const bool&, bool beside int, `&fn`, and a function-pointer ctor (10).
+    if (((m18ov.CB)(mix14Twice)).v != 1 || ((m18ov.CBI)(mix14Twice)).v != 1) return 65083;
+    if (((mix14sc.OB)(&mix14Twice)).v != 1 || ((m18ov.CF)(mix14Twice)).v != 10) return 65084;
+    m18ov.CF fncastCf = (m18ov.CF)(mix14Twice);
+    m18ov.CB fncastCb = (m18ov.CB)(mix14Twice);
+    if (fncastCf.v != 10 || fncastCb.v != 1) return 65085;
+    // FNCAST: the same cast inside a variadic argument list (printf prints "1", one character).
+    if (printf("%d", ((mix14sc.OB)(mix14Twice)).v) != 1 || printf("%d", ((m18ov.CB)(mix14Twice)).v) != 1)
+        return 65086;
+    // FNCAST r2: an overloaded name takes the overload the constructor's function-pointer parameter
+    // selects, in the cast, call, brace and `new` forms (clang 6, 2, 6, 2, 6, 6).
+    if (((m18ov.CF)(fncastOv)).v != 6 || ((m18ov.CDD)(fncastOv)).v != 2) return 65087;
+    if (((m18ov.CF)(fncastRov)).v != 6 || m18ov.CDD(fncastRov).v != 2) return 65088;
+    m18ov.CF fncastBraceRov = {fncastRov};
+    m18ov.CF* fncastNewRov = new m18ov.CF(fncastRov);
+    if (fncastBraceRov.v != 6 || fncastNewRov.v != 6) return 65089;
+    delete fncastNewRov;
+    // FNCAST r2: a brace list takes a function value (clang 10); a string literal casts to a bool
+    // constructor as its truth (clang 1).
+    m18ov.CF fncastBrace = {mix14Twice};
+    m18ov.CF fncastBraceDirect{mix14Twice};
+    if (fncastBrace.v != 10 || fncastBraceDirect.v != 10 || ((mix14sc.OB)("tw")).v != 1) return 65090;
     // MIX18 ctor: scalar-reference candidates use CFlat ranking; a converted temporary loses to by-value.
     if (m18ov.TieS(mix18I).v != 2) return 65067;
     if (m18ov.TieS(4).v != 2) return 65068;
@@ -19099,6 +19257,152 @@ extern int main()
     int t305R4Iv = 8;
     int* t305R4Ip = &t305R4Iv;
     if (t305r4_take_int(t305R4Ip) != 8 || t305R4Ip != nullptr)         return 9755;
+    // CONVPTR: a proven C++ record pointer converts through ConvPtrR(const ConvPtrFoo*) at
+    // copy-init, assignment, return and a CFlat callee; values match clang++ -std=c++20.
+    ConvPtrFoo convPtrFoo = default;
+    ConvPtrFoo* convPtrFp = &convPtrFoo;
+    ConvPtrDerived convPtrD = default;
+    ConvPtrDerived* convPtrDp = &convPtrD;
+    ConvPtrFoo* convPtrNull = nullptr;
+    ConvPtrR convPtrR1 = &convPtrFoo;
+    if (convPtrR1.value + 30 != 33)                                    return 9756;
+    ConvPtrR convPtrR2 = convPtrDp;
+    if (convPtrR2.value + 30 != 33)                                    return 9757;
+    ConvPtrR convPtrR3 = convPtrNull;
+    if (convPtrR3.value != 0)                                          return 9758;
+    convPtrR3 = &convPtrFoo;
+    if (convPtrR3.value + 60 != 63)                                    return 9759;
+    ConvPtrRN convPtrRN = convPtrFp;
+    convPtrRN = convPtrDp;
+    if (convPtrRN.value + 30 != 33)                                    return 9760;
+    if (convPtrRet(convPtrFp).value + 60 != 63)                        return 9761;
+    if (convPtrRetN(convPtrDp).value + 60 != 63)                       return 9762;
+    if (convPtrRetNull().value + 60 != 60)                             return 9763;
+    if (convPtrCf(&convPtrFoo) != 123 || convPtrCf(convPtrFp) != 123)  return 9764;
+    if (convPtrCf(convPtrDp) != 123 || convPtrCf(nullptr) != 120)      return 9765;
+    if (convPtrCfN(convPtrDp) != 123)                                  return 9766;
+    // An exact pointer overload of a CFlat callee still beats the converting ctor.
+    if (convPtrCfo(convPtrFp) != 91)                                   return 9767;
+    // `Foo*` -> bool -> ConvPtrRBool(bool): one implicit conversion sequence, as in C++.
+    if (convptr_frb(convPtrFp) != 46 || convptr_frb(convPtrNull) != 47) return 9768;
+    ConvPtrRBool convPtrRb = convPtrFp;
+    if (convPtrRb.value != 46)                                         return 9769;
+    // A standard conversion to bool beats the user conversion.
+    if (convptr_ob(convPtrFp) != 81)                                   return 9770;
+    // Two pointer ctors: the more derived pointee wins, as clang ranks it.
+    if (convptr_amb(convPtrFp) != 1 || convptr_amb(convPtrDp) != 2)    return 9771;
+    // A `?:` of record pointers converts at copy-init, assignment and return like one pointer.
+    ConvPtrFoo convPtrFoo4 = default;
+    convPtrFoo4.value = 4;
+    bool convPtrPick = convPtrNull != nullptr;
+    ConvPtrR convPtrT1 = convPtrPick ? &convPtrFoo : &convPtrFoo4;
+    if (convPtrT1.value != 4)                                          return 9773;
+    ConvPtrRN convPtrT2 = convPtrPick ? convPtrFp : convPtrNull;
+    if (convPtrT2.value != 0)                                          return 9774;
+    convPtrT1 = convPtrPick ? convPtrNull : convPtrFp;
+    if (convPtrT1.value != 3)                                          return 9775;
+    if (convPtrRetT(convPtrPick, convPtrFp, &convPtrFoo4).value != 4)  return 9776;
+    if (convPtrRetTN(convPtrPick, convPtrFp, &convPtrFoo4).value != 4) return 9777;
+    if (convPtrBs(convPtrFp, true) != 1 || convPtrBn(convPtrFp, 1) != 1) return 9778;
+    // An interface method's C++ class parameter converts the pointer like a direct call.
+    ConvPtrImpl convPtrImpl = default;
+    IConvPtr convPtrIface = convPtrImpl;
+    if (convPtrIface.m(convPtrFp) != 43 || convPtrIface.n(&convPtrFoo) != 53) return 9779;
+    // Item 4: a C++ free `take(R)` beside core list<T>.take resolves to the C++ function.
+    if (take(&convPtrFoo) != 53 || take(convPtrFp) != 53)              return 9772;
+    // CONVREST: a `?:` of ConvPtrFoo* and ConvPtrDerived* (ConvPtrFoo at a non-zero offset) joins
+    // as ConvPtrFoo*, the derived arm adjusted first; values and counts match clang++ -std=c++20.
+    ConvPtrDerived convRestD = default;
+    convRestD.value = 5;
+    ConvPtrDerived* convRestDp = &convRestD;
+    bool convRestC = convPtrNull != nullptr;
+    ConvPtrFoo* convRestQ = convRestC ? &convPtrFoo : &convRestD;
+    ConvPtrFoo* convRestQ2 = !convRestC ? convRestDp : convPtrFp;
+    if (convRestQ->value * 10 + convRestQ2->value != 55)               return 9780;
+    // One derived class (or one beside null) at a base-pointer destination converts each arm.
+    ConvPtrFoo* convRestQ3 = !convRestC ? &convRestD : convRestDp;
+    ConvPtrFoo* convRestQ4 = convRestC ? nullptr : &convRestD;
+    auto convRestQ5 = convRestC ? &convPtrFoo : &convRestD;
+    if (convRestQ3->value * 100 + convRestQ4->value * 10 + convRestQ5->value != 555) return 9781;
+    ConvPtrR convRestR = convRestC ? &convPtrFoo : &convRestD;
+    ConvPtrR convRestR2 = !convRestC ? &convPtrFoo : convRestDp;
+    if (convRestR.value * 10 + convRestR2.value != 53)                 return 9782;
+    convRestR2 = !convRestC ? convRestDp : convPtrFp;
+    if (convRestR2.value != 5)                                         return 9783;
+    if (convRestRet(convRestC, convPtrFp, convRestDp).value * 10
+        + convRestRet(!convRestC, convPtrFp, convRestDp).value != 53)  return 9784;
+    if (convRestCf(convRestC ? &convPtrFoo : &convRestD) != 105
+        || convRestCf(convRestC ? nullptr : convRestDp) != 105)        return 9785;
+    if (convrest_f(convRestC ? &convPtrFoo : &convRestD) * 10
+        + convrest_f(!convRestC ? &convPtrFoo : &convRestD) != 53)     return 9786;
+    // The joined ConvPtrFoo* picks ConvPtrRAmb(const ConvPtrFoo*) even on the derived arm.
+    ConvPtrRAmb convRestAmb = convRestC ? nullptr : convRestDp;
+    if (convrest_amb(convRestC ? &convPtrFoo : &convRestD) * 10 + convRestAmb.value != 12) return 9787;
+    const int convRestBase = convrest_counts();
+    int convRestSum = 0;
+    {
+        ConvRestRN convRestN = convRestC ? &convPtrFoo : &convRestD;
+        convRestSum = convRestN.value + convRestRetN(convRestC, convPtrFp, convRestDp).value
+            + convRestCfN(convRestC ? &convPtrFoo : &convRestD)
+            + convrest_fn(convRestC ? &convPtrFoo : &convRestD);
+    }
+    if (convRestSum != 120 || convrest_counts() - convRestBase != 404)  return 9788;
+    // A `ConvPtrFoo**` converts to `const ConvPtrFoo* const*`, `ConvPtrFoo* const*` and
+    // `const void*` ctor parameters ([conv.qual] / [conv.ptr]); the less-qualified one wins.
+    ConvPtrFoo** convRestPp = &convPtrFp;
+    ConvRestPP convRestP = convRestPp;
+    ConvRestPP convRestP2 = &convPtrFp;
+    if (convRestP.value + convRestP2.value != 18)                      return 9789;
+    ConvPtrFoo* convRestFp4 = &convPtrFoo4;
+    convRestP = &convRestFp4;
+    if (convRestP.value != 10)                                         return 9790;
+    if (convRestRetPP(convRestPp).value != 9 || convRestCfPP(convRestPp) != 109
+        || convrest_pp(convRestPp) != 9 || convrest_pp(&convPtrFp) != 9) return 9791;
+    ConvRestPPM convRestPm = convRestPp;
+    ConvRestPP3 convRestP3 = convRestPp;
+    ConvRestPPV convRestPv = convRestPp;
+    if (convRestPm.value * 100 + convRestP3.value * 10 + convRestPv.value != 425) return 9792;
+    const int convRestBase2 = convrest_counts();
+    {
+        ConvRestPPN convRestPn = convRestPp;
+        convRestSum = convRestPn.value + convRestRetPPN(convRestPp).value
+            + convRestCfPPN(convRestPp) + convrest_ppn(convRestPp);
+    }
+    if (convRestSum != 136 || convrest_counts() - convRestBase2 != 404) return 9793;
+    // PTRSAFE: an explicit cast between related C++ classes is static_cast (PtrSafeF sits past
+    // T305R4Pad in PtrSafeD): the upcast adds the base offset, the downcast subtracts it.
+    PtrSafeD ptrSafeD = default;
+    ptrSafeD.value = 5;
+    ptrSafeD.b = 9;
+    PtrSafeF ptrSafeA = default;
+    PtrSafeF* ptrSafeUp = (PtrSafeF*)&ptrSafeD;
+    if (ptrSafeUp->value * 10 + ((PtrSafeB0*)&ptrSafeD)->b != 59
+        || ptrsafe_off(&ptrSafeD, ptrSafeUp) == 0)                     return 9794;
+    ptrSafeUp->value = 7;
+    if (ptrSafeD.value != 7 || ptrSafeD.pad != 11)                     return 9795;
+    PtrSafeF* ptrSafePf = &ptrSafeD;
+    PtrSafeD* ptrSafeDn = (PtrSafeD*)ptrSafePf;
+    PtrSafeF* ptrSafeNullF = nullptr;
+    if (ptrSafeDn != &ptrSafeD || ptrSafeDn->z != 1 || (PtrSafeD*)ptrSafeNullF != nullptr
+        || (PtrSafeD*)(PtrSafeB0*)&ptrSafeD != &ptrSafeD)              return 9796;
+    // A C-style cast reaches a private base, as in C++.
+    PtrSafePriv ptrSafePv = default;
+    if (((PtrSafeF*)&ptrSafePv)->value != 3)                           return 9797;
+    // ACCEPT SET: same-class `T**` -> `const T* const*`, const kept by `auto`, cast-away const.
+    PtrSafeF* ptrSafeFp = &ptrSafeD;
+    PtrSafeF** ptrSafeFpp = &ptrSafeFp;
+    auto ptrSafeCq = ptrsafe_cd(&ptrSafeD);
+    PtrSafeF* ptrSafeW = (PtrSafeF*)ptrsafe_cd(&ptrSafeD);
+    if (ptrsafe_cp(ptrSafeFpp) != 7 || ptrsafe_takecf(ptrSafeCq) != 7 || ptrSafeW->value != 7
+        || ptrsafe_takef(&ptrSafeD) != 7)                              return 9798;
+    PtrSafeB0* ptrSafeJ = !convRestC ? (PtrSafeF*)&ptrSafeD : &ptrSafeA;
+    if (ptrSafeJ->b != 9)                                              return 9799;
+    // A brace-initialized array element is base-adjusted like any other store.
+    PtrSafeF*[2] ptrSafeArr = { &ptrSafeD, &ptrSafeA };
+    if (ptrSafeArr[0]->value != 7 || ptrSafeArr[1]->value != 3)       return 9950;
+    if (ptrSafeGDown != &ptrSafeGd || ptrSafeGDown->z != 1)            return 9951;
+    if (ptrSafeGUp->value != 3 || ptrSafeGArr[0]->value != 3
+        || (void*)ptrSafeGUp == (void*)&ptrSafeGd)                     return 9952;
     // ACCEPT SET (passes pre-fix too): an exact `const int*` overload beats the user-defined
     // conversion, and a spelled constructor argument already converted.
     if (cppexp.conv_ip_exact(&cipK) != 2 || cppexp.conv_ip_exact(cipP) != 2)   return 2272;
@@ -24380,6 +24684,74 @@ extern int main()
         if (ol[0] != 74 || ol[1] != 1 || ol[2] != 0 || ol[3] != 0 || ol[4] != 4 || ol[5] != 0 || ol[6] != 1) return 99741;
         ObjoinLife(2, true, ol);
         if (ol[0] != 44 || ol[1] != 0 || ol[2] != 1 || ol[3] != 0 || ol[4] != 4 || ol[5] != 0 || ol[6] != 1) return 99742;
+        // CONSTJOIN: a prvalue arm beside a const place arm (C++ const result, const local/param,
+        // field of a const object) joins as clang's const prvalue: `=` copy-assigns. Brace: value only.
+        if (ConstjoinAssignAddCref(false) != 3 || cppobjoin.Obj.sig() != 10014 || cppobjoin.Obj.live != 0) return 99743;
+        if (ConstjoinAssignAddCref(true) != 23 || cppobjoin.Obj.sig() != 110015 || cppobjoin.Obj.live != 0) return 99744;
+        if (ConstjoinAssignCrefCall(false) != 5 || cppobjoin.Obj.sig() != 100013 || cppobjoin.Obj.live != 0) return 99745;
+        if (ConstjoinAssignCrefCall(true) != 3 || cppobjoin.Obj.sig() != 10013 || cppobjoin.Obj.live != 0) return 99746;
+        if (ConstjoinAssignDefaultCref(false) != 3 || cppobjoin.Obj.sig() != 10013 || cppobjoin.Obj.live != 0) return 99747;
+        if (ConstjoinAssignDefaultCref(true) != 7 || cppobjoin.Obj.sig() != 100013 || cppobjoin.Obj.live != 0) return 99748;
+        if (ConstjoinAssignConstField(false) != 3 || cppobjoin.Obj.sig() != 10013 || cppobjoin.Obj.live != 0) return 99749;
+        if (ConstjoinAssignConstField(true) != 5 || cppobjoin.Obj.sig() != 100013 || cppobjoin.Obj.live != 0) return 99750;
+        if (ConstjoinAssignConstLocal(false) != 3 || cppobjoin.Obj.sig() != 10013 || cppobjoin.Obj.live != 0) return 99751;
+        if (ConstjoinAssignConstLocal(true) != 5 || cppobjoin.Obj.sig() != 100013 || cppobjoin.Obj.live != 0) return 99752;
+        if (ConstjoinAssignFreeCref(false) != 5 || cppobjoin.Obj.sig() != 100013 || cppobjoin.Obj.live != 0) return 99753;
+        if (ConstjoinAssignFreeCref(true) != 3 || cppobjoin.Obj.sig() != 10013 || cppobjoin.Obj.live != 0) return 99754;
+        if (ConstjoinUseCref(false) != 3 || cppobjoin.Obj.sig() != 10002 || cppobjoin.Obj.live != 0) return 99755;
+        if (ConstjoinUseCref(true) != 5 || cppobjoin.Obj.sig() != 100002 || cppobjoin.Obj.live != 0) return 99756;
+        if (ConstjoinUseRef(false) != 3 || cppobjoin.Obj.sig() != 10002 || cppobjoin.Obj.live != 0) return 99757;
+        if (ConstjoinUseRef(true) != 5 || cppobjoin.Obj.sig() != 100002 || cppobjoin.Obj.live != 0) return 99758;
+        if (ConstjoinUseConstRefArg(false) != 5 || cppobjoin.Obj.sig() != 100002 || cppobjoin.Obj.live != 0) return 99759;
+        if (ConstjoinUseConstRefArg(true) != 3 || cppobjoin.Obj.sig() != 10002 || cppobjoin.Obj.live != 0) return 99760;
+        if (ConstjoinAddCref(false) != 23 || cppobjoin.Obj.sig() != 110004 || cppobjoin.Obj.live != 0) return 99761;
+        if (ConstjoinAddCref(true) != 27 || cppobjoin.Obj.sig() != 200004 || cppobjoin.Obj.live != 0) return 99762;
+        if (ConstjoinLeftCref(false) != 72 || cppobjoin.Obj.sig() != 210005 || cppobjoin.Obj.live != 0) return 99763;
+        if (ConstjoinLeftCref(true) != 32 || cppobjoin.Obj.sig() != 120005 || cppobjoin.Obj.live != 0) return 99764;
+        if (ConstjoinNestedAssign(false) != 3 || cppobjoin.Obj.sig() != 10013 || cppobjoin.Obj.live != 0) return 99765;
+        if (ConstjoinNestedAssign(true) != 7 || cppobjoin.Obj.sig() != 100013 || cppobjoin.Obj.live != 0) return 99766;
+        if (ConstjoinNestedAdd(false) != 23 || cppobjoin.Obj.sig() != 110004 || cppobjoin.Obj.live != 0) return 99767;
+        if (ConstjoinNestedAdd(true) != 25 || cppobjoin.Obj.sig() != 200004 || cppobjoin.Obj.live != 0) return 99768;
+        if (ConstjoinPick(false) != 12 || cppobjoin.Obj.sig() != 20003 || cppobjoin.Obj.live != 0) return 99769;
+        if (ConstjoinPick(true) != 12 || cppobjoin.Obj.sig() != 200003 || cppobjoin.Obj.live != 0) return 99770;
+        if (ConstjoinBraceDefaultCref(false) != 3 || cppobjoin.Obj.live != 0) return 99771;
+        if (ConstjoinBraceDefaultCref(true) != 7 || cppobjoin.Obj.live != 0) return 99772;
+        if (ConstjoinBraceCrefCall(false) != 5 || cppobjoin.Obj.live != 0) return 99773;
+        if (ConstjoinBraceCrefCall(true) != 3 || cppobjoin.Obj.live != 0) return 99774;
+        if (ConstjoinAssignConstParam(false) != 3 || cppobjoin.Obj.sig() != 10014 || cppobjoin.Obj.live != 0) return 99775;
+        if (ConstjoinAssignConstParam(true) != 5 || cppobjoin.Obj.sig() != 100014 || cppobjoin.Obj.live != 0) return 99776;
+        if (ConstjoinBraceDeferredCtor(false) != 5 || cppobjoin.Obj.live != 0) return 99781;
+        if (ConstjoinBraceDeferredCtor(true) != 3 || cppobjoin.Obj.live != 0) return 99782;
+        // `move k` of a const object into a by-value constructor parameter copies (never T&&), as clang.
+        if (ConstjoinMoveConstCtorArg() != 4 || cppobjoin.Obj.sig() != 11003 || cppobjoin.Obj.live != 0) return 99783;
+        if (ConstjoinMoveConstDeferred() != 4 || cppobjoin.Obj.sig() != 11003 || cppobjoin.Obj.live != 0) return 99784;
+        // A const [cpp] struct keeps its move (no copy constructor by design); a const imported-class
+        // param is no sink and `move p` copies it, as clang (the caller's argument is never moved).
+        if (ConstjoinCppStructConstMove() != 7 || cppobjoin.Obj.live != 0) return 99785;
+        if (ConstjoinConstParamMove(false) != 33 || cppobjoin.Obj.sig() != 20003 || cppobjoin.Obj.live != 0) return 99786;
+        if (ConstjoinConstParamMove(true) != 33 || cppobjoin.Obj.sig() != 20003 || cppobjoin.Obj.live != 0) return 99787;
+        if (ConstjoinCppStructConstParam() != 7 || cppobjoin.Obj.live != 0) return 99788;
+        // WRAPBIND: use() reached through another header's #include binds use(Obj) directly, so a
+        // by-value `?:` argument constructs the parameter in place (as clang; counts c*1000+c*100+m*10+d).
+        if (WrapbindJoin(false) != 3 || cppwrapbind.Obj.sig() != 102 || cppwrapbind.Obj.live != 0) return 99880;
+        if (WrapbindJoin(true) != 5 || cppwrapbind.Obj.sig() != 1002 || cppwrapbind.Obj.live != 0) return 99881;
+        if (WrapbindJoinCref(false) != 5 || cppwrapbind.Obj.sig() != 1002 || cppwrapbind.Obj.live != 0) return 99882;
+        if (WrapbindJoinCref(true) != 3 || cppwrapbind.Obj.sig() != 102 || cppwrapbind.Obj.live != 0) return 99883;
+        if (WrapbindPlain(false) != 3 || cppwrapbind.Obj.sig() != 102 || cppwrapbind.Obj.live != 0) return 99884;
+        if (WrapbindPlain(true) != 5 || cppwrapbind.Obj.sig() != 1002 || cppwrapbind.Obj.live != 0) return 99885;
+        // WRAPBIND r2: the bound header's object-like and function-like macros are in scope too.
+        if (WRAPBIND_BASE * 100 + cppwrapbind.base() != 4142) return 99886;
+        if (WRAPBIND_TWICE(WRAPBIND_BASE) != 83) return 99887;
+        // cppas.Life `t = c ? a + b : a.const_ref()` (and reversed): copy into the join, copy-assign.
+        int[7] cj = { 0, 0, 0, 0, 0, 0, 0 };
+        ConstjoinLife(0, false, cj);
+        if (cj[0] != 33 || cj[1] != 0 || cj[2] != 1 || cj[3] != 0 || cj[4] != 4 || cj[5] != 1 || cj[6] != 0) return 99777;
+        ConstjoinLife(0, true, cj);
+        if (cj[0] != 73 || cj[1] != 1 || cj[2] != 0 || cj[3] != 0 || cj[4] != 4 || cj[5] != 1 || cj[6] != 0) return 99778;
+        ConstjoinLife(1, false, cj);
+        if (cj[0] != 74 || cj[1] != 1 || cj[2] != 0 || cj[3] != 0 || cj[4] != 4 || cj[5] != 1 || cj[6] != 0) return 99779;
+        ConstjoinLife(1, true, cj);
+        if (cj[0] != 44 || cj[1] != 0 || cj[2] != 1 || cj[3] != 0 || cj[4] != 4 || cj[5] != 1 || cj[6] != 0) return 99780;
         // T288 r3: a const-host field arm is not a plain local join: copy-assign, sources kept (as clang).
         T288ConstHostField(true, q);
         if (q[0] != 21 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99015;
@@ -28219,6 +28591,52 @@ int CallparAdlTwin()
     { cpptw.Twin x = cpptw.Twin(7); cpptw.Twin y = cpptw.Twin(2); value = take2(x, y); }
     return T420Pack(value, baseLive);
 }
+
+// CALLRES: ordinary lookup plus ADL is ONE set; clang ranks the visible CFlat overloads with the
+// argument's namespace functions (cpp_interop_lastuse.h). Master kept the CFlat-only pick.
+int callres_take(int z) { return z; }
+int callres_bool(bool b) { return 60; }
+int callres_ptr(cpptw.Twin* p) { return 65; }
+int callres_def(int z, int w = 3) { return z + w; }
+int callres_take2(int a, int b) { return 80; }
+int callres_gen<T>(T z) { return 40; }
+int callres_tpl(int a, int b) { return 70; }
+int callres_tplx(int a, cpptw.Twin b) { return 75; }
+int CallresTake() { cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0; { cpptw.Twin x = cpptw.Twin(7); value = callres_take(x); } return T420Pack(value, baseLive); }
+// CFlat overload declared after the call (callres_after below).
+int CallresAfter() { cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0; { cpptw.Twin x = cpptw.Twin(7); value = callres_after(x); } return T420Pack(value, baseLive); }
+int CallresBool() { cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0; { cpptw.Twin x = cpptw.Twin(7); value = callres_bool(x); } return T420Pack(value, baseLive); }
+int CallresPtr() { cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0; { cpptw.Twin x = cpptw.Twin(7); value = callres_ptr(x); } return T420Pack(value, baseLive); }
+int CallresDef() { cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0; { cpptw.Twin x = cpptw.Twin(7); value = callres_def(x); } return T420Pack(value, baseLive); }
+int CallresTake2() { cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0; { cpptw.Twin x = cpptw.Twin(7); cpptw.Twin y = cpptw.Twin(2); value = callres_take2(x, y); } return T420Pack(value, baseLive); }
+// A CFlat generic ranks as a function template: the non-template const& wins.
+int CallresGen() { cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0; { cpptw.Twin x = cpptw.Twin(7); value = callres_gen(x); } return T420Pack(value, baseLive); }
+// A function template found by ADL beside a non-viable CFlat overload.
+int CallresTpl() { cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0; { cpptw.Twin x = cpptw.Twin(7); value = callres_tpl(1, x); } return T420Pack(value, baseLive); }
+// Accept-set: an exact non-template CFlat overload beats an exact ADL template (master and clang 75).
+int CallresTplExact() { cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0; { cpptw.Twin x = cpptw.Twin(7); value = callres_tplx(1, x); } return T420Pack(value, baseLive); }
+// The rvalue form picks the same overload (its copy counts are the ADL wrapper's, see the issue file).
+int CallresRvalue() { return callres_take(cpptw.Twin(7)); }
+int callres_after(int z) { return z; }
+// Accept-set: a member of the enclosing struct still hides ADL (clang 33).
+struct CallresMemberHides
+{
+    int callres_take(cpptw.Twin v) { return 33; }
+    int run() { cpptw.Twin x = cpptw.Twin(7); return callres_take(x); }
+};
+int CallresMember() { CallresMemberHides s = default; return s.run(); }
+// CALLRES r2: a CFlat enum has no exact C++ spelling (its backing int would tie with callres_en(Twin, int)),
+// so the visible lookup keeps the exact enum overload (clang 1).
+enum CallresColor : int { CallresRed, CallresBlue };
+int callres_en(cpptw.Twin x, CallresColor c) { return 1; }
+int CallresEnum() { cpptw.Twin x = cpptw.Twin(7); return callres_en(x, CallresColor.CallresBlue); }
+// CALLRES r2: a CFlat generic ranks with its own shape; `T*` is more specialized than C++ `T` (clang 1).
+int callres_gs<T>(T* p) { return 1; }
+int CallresGenericShape() { cpptw.Twin x = cpptw.Twin(7); return callres_gs(&x); }
+// CALLRES r3: a generic with a defaulted parameter is not spelled, so the CFlat lookup stays (master 1;
+// clang calls it ambiguous). A stand-in without the default would bind the C++ template (2).
+int callres_gd<T>(T a, T* b = nullptr) { return 1; }
+int CallresGenericDefault() { cpptw.Twin x = cpptw.Twin(7); return callres_gd(x); }
 
 int T461LocalFree() { const t461cv.CV x = t461cv.CV(7); return t461cv.take(x); }
 int T461LocalMember() { const t461cv.CV x = t461cv.CV(7); t461cv.Host h = default; return h.member_take(x); }
@@ -32116,6 +32534,21 @@ int LoweredUserDtorAssignLegs(int argc)
     if (CallparAdlTwin() != 92200040) return 93714;
     if (CallparMemberAdl() != 33) return 93715;
     if (CallparDefaultScalar() != 3060) return 93716;
+    // CALLRES: clang oracle (value * 10000000 + ctor/copy/move/copy-assign/move-assign/dtor/live digits).
+    if (CallresTake() != 71100020) return 93717;
+    if (CallresAfter() != 71100020) return 93718;
+    if (CallresBool() != 71100020) return 93719;
+    if (CallresPtr() != 71100020) return 93720;
+    if (CallresDef() != 71100020) return 93721;
+    if (CallresTake2() != 92200040) return 93722;
+    if (CallresGen() != 71000010) return 93723;
+    if (CallresTpl() != 371100020) return 93724;
+    if (CallresTplExact() != 751100020) return 93725;
+    if (CallresRvalue() != 7) return 93726;
+    if (CallresMember() != 33) return 93727;
+    if (CallresEnum() != 1) return 93728;
+    if (CallresGenericShape() != 1) return 93729;
+    if (CallresGenericDefault() != 1) return 93730;
     // T461: +200 identifies the const copy constructor; +100 identifies the non-const one.
     if (T461LocalFree() != 207) return 46101;
     if (T461LocalMember() != 207) return 46102;
@@ -34938,3 +35371,48 @@ void ObjoinLife(int shape, bool c, int* o)
     o[1] = cppas.Life.ctors; o[2] = cppas.Life.copies; o[3] = cppas.Life.moves; o[4] = cppas.Life.dtors;
     o[5] = cppas.Life.copy_assigns; o[6] = cppas.Life.move_assigns;
 }
+// CONSTJOIN: imported-class prvalue arm beside a CONST place arm (clang: const prvalue composite).
+int ConstjoinAssignAddCref(bool c) { int r = 0; { cppobjoin.Obj y = cppobjoin.Obj(1); cppobjoin.Obj a = cppobjoin.Obj(2); cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); y = c ? a + x : x.cref(); r = y.v; } return r; }
+int ConstjoinAssignCrefCall(bool c) { int r = 0; { cppobjoin.Obj y = cppobjoin.Obj(1); cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); y = c ? x.cref() : cppobjoin.mk(5); r = y.v; } return r; }
+int ConstjoinAssignDefaultCref(bool c) { int r = 0; { cppobjoin.Obj y = cppobjoin.Obj(1); cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); y = c ? default : x.cref(); r = y.v; } return r; }
+int ConstjoinAssignConstField(bool c) { int r = 0; { cppobjoin.Obj y = cppobjoin.Obj(1); cppobjoin.Holder hh{ cppobjoin.Obj(3) }; cppobjoin.Obj.reset(); y = c ? cppobjoin.mk(5) : cppobjoin.hcref(hh).o; r = y.v; } return r; }
+int ConstjoinAssignConstLocal(bool c) { int r = 0; { cppobjoin.Obj y = cppobjoin.Obj(1); const cppobjoin.Obj k = cppobjoin.Obj(3); cppobjoin.Obj.reset(); y = c ? cppobjoin.mk(5) : k; r = y.v; } return r; }
+int ConstjoinAssignFreeCref(bool c) { int r = 0; { cppobjoin.Obj y = cppobjoin.Obj(1); cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); y = c ? cppobjoin.cref(x) : cppobjoin.mk(5); r = y.v; } return r; }
+int ConstjoinUseCref(bool c) { int r = 0; { cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); r = cppobjoin.use(c ? cppobjoin.mk(5) : x.cref()); } return r; }
+int ConstjoinUseRef(bool c) { int r = 0; { cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); r = cppobjoin.use(c ? cppobjoin.mk(5) : cppobjoin.ref(x)); } return r; }
+int ConstjoinUseConstRefArg(bool c) { int r = 0; { cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); r = cppobjoin.useCref(c ? x.cref() : cppobjoin.mk(5)); } return r; }
+int ConstjoinAddCref(bool c) { int r = 0; { cppobjoin.Obj a = cppobjoin.Obj(2); cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); r = (a + (c ? default : x.cref())).v; } return r; }
+int ConstjoinLeftCref(bool c) { int r = 0; { cppobjoin.Obj a = cppobjoin.Obj(2); cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); r = ((c ? x.cref() : default) + a).v; } return r; }
+int ConstjoinNestedAssign(bool c) { int r = 0; { cppobjoin.Obj y = cppobjoin.Obj(1); cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); y = c ? (c ? default : x.cref()) : x; r = y.v; } return r; }
+int ConstjoinNestedAdd(bool c) { int r = 0; { cppobjoin.Obj a = cppobjoin.Obj(2); cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); r = (a + (c ? (c ? cppobjoin.mk(5) : x.cref()) : x)).v; } return r; }
+int ConstjoinPick(bool c) { int r = 0; { cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); r = cppobjoin.pick(c ? cppobjoin.mk(5) : x.cref()) * 10 + cppobjoin.pick(c ? cppobjoin.mk(5) : x); } return r; }
+int ConstjoinBraceDefaultCref(bool c) { int r = 0; { cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); { cppobjoin.Holder hb{ c ? default : x.cref() }; r = hb.value(); } } return r; }
+int ConstjoinBraceCrefCall(bool c) { int r = 0; { cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); { cppobjoin.CHolder hb{ c ? x.cref() : cppobjoin.mk(5) }; r = hb.value(); } } return r; }
+int ConstjoinParamHelper(const cppobjoin.Obj p, bool c) { int r = 0; { cppobjoin.Obj y = cppobjoin.Obj(1); cppobjoin.Obj.reset(); y = c ? cppobjoin.mk(5) : p; r = y.v; } return r; }
+int ConstjoinAssignConstParam(bool c) { int r = 0; { cppobjoin.Obj x = cppobjoin.Obj(3); r = ConstjoinParamHelper(x, c); } return r; }
+int ConstjoinBraceDeferredCtor(bool c) { int r = 0; { cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); { cppobjoin.CHHolder hb{ cppobjoin.CHolder(c ? x.cref() : cppobjoin.mk(5)) }; r = hb.value(); } } return r; }
+int ConstjoinMoveConstCtorArg() { int r = 0; { const cppobjoin.Obj k = cppobjoin.Obj(4); cppobjoin.Obj.reset(); { cppobjoin.CHolder h = cppobjoin.CHolder(move k); r = h.value(); } } return r; }
+int ConstjoinMoveConstDeferred() { int r = 0; { const cppobjoin.Obj k = cppobjoin.Obj(4); cppobjoin.Obj.reset(); { cppobjoin.CHHolder h{ cppobjoin.CHolder(move k) }; r = h.value(); } } return r; }
+[cpp] struct ConstjoinCW { cppobjoin.Obj o = default; };
+int ConstjoinCppStructConstMove() { int r = 0; { const ConstjoinCW w = default; ConstjoinCW z = move w; r = z.o.v; } return r; }
+int ConstjoinCppStructConstParamG(const ConstjoinCW p) { ConstjoinCW t = move p; return t.o.v; }
+int ConstjoinCppStructConstParam() { int r = 0; { ConstjoinCW w = default; r = ConstjoinCppStructConstParamG(w); } return r; }
+int ConstjoinConstParamDecl(const cppobjoin.Obj p) { cppobjoin.Obj t = move p; return t.v; }
+int ConstjoinConstParamUse(const cppobjoin.Obj p) { return cppobjoin.use(move p); }
+int ConstjoinConstParamMove(bool viaCall) { int r = 0; { cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); r = (viaCall ? ConstjoinConstParamUse(x) : ConstjoinConstParamDecl(x)) * 10 + x.v; } return r; }
+void ConstjoinLife(int shape, bool c, int* o)
+{
+    {
+        cppas.Life a = cppas.Life(3);
+        cppas.Life b = cppas.Life(4);
+        cppas.Life t = cppas.Life(0);
+        cppas.Life.reset();
+        if (shape == 0) { t = c ? a + b : a.const_ref(); o[0] = t.value() * 10 + a.value(); }
+        else { t = c ? b.const_ref() : a + b; o[0] = t.value() * 10 + b.value(); }
+    }
+    o[1] = cppas.Life.ctors; o[2] = cppas.Life.copies; o[3] = cppas.Life.moves; o[4] = cppas.Life.dtors;
+    o[5] = cppas.Life.copy_assigns; o[6] = cppas.Life.move_assigns;
+}
+int WrapbindJoin(bool c) { int r = 0; { cppwrapbind.Obj x = cppwrapbind.Obj(3); cppwrapbind.Obj.reset(); r = cppwrapbind.use(c ? cppwrapbind.mk(5) : x); } return r; }
+int WrapbindJoinCref(bool c) { int r = 0; { cppwrapbind.Obj x = cppwrapbind.Obj(3); cppwrapbind.Obj.reset(); r = cppwrapbind.use(c ? x.cref() : cppwrapbind.mk(5)); } return r; }
+int WrapbindPlain(bool c) { int r = 0; { cppwrapbind.Obj x = cppwrapbind.Obj(3); cppwrapbind.Obj.reset(); r = c ? cppwrapbind.use(cppwrapbind.mk(5)) : cppwrapbind.use(x); } return r; }

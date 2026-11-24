@@ -510,6 +510,7 @@ namespace
         // `<name>` -> the header the first `#include <name>` found; resolves a root such as the
         // request prologue's `<new>`.
         std::unordered_map<std::string, const clang::FileEntry*> angled;
+        std::vector<std::pair<std::string, std::string>> scopeEdges;   // ExtractRequest::scopeIncludeEdges
         uint64_t version = 0;   // bumped per recorded #include; keys reachability memos
     };
 
@@ -794,6 +795,10 @@ namespace
             if (auto includer = sm.getFileEntryRefForID(sm.getFileID(sm.getExpansionLoc(hashLoc))))
                 graph.edges[&includer->getFileEntry()].push_back(target);
             if (angled) graph.angled.emplace("<" + spelled.str() + ">", target);
+            std::pair<std::string, std::string> edge;
+            if (cflat_cinterop::ScopeIncludeEdge(pp, hashLoc, spelled.str(), angled,
+                                                 file->getName().str(), edge))
+                graph.scopeEdges.push_back(std::move(edge));
         }
     };
 
@@ -2672,6 +2677,7 @@ bool CxxIncrementalGroup::HarvestHeader(const cflat_cinterop::ExtractRequest& re
     if (effective.RecordsDefinitionDemand()) effective.demandPlan = &impl_->plan;
     effective.operatorIndex = &impl_->operatorIndex;
     effective.specialMemberRecords = &impl_->specialMemberRecords;
+    effective.scopeIncludeEdges = &impl_->includeGraph.scopeEdges;
     const bool harvested = cflat_cinterop::ExtractCxxIncremental(
         effective, *impl_->interpreter->getCompilerInstance(), impl_->headerRoot,
         impl_->headerRoot, {}, impl_->headerModule, out, error, true);
@@ -3204,6 +3210,7 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
         effective.emitDefinitions = true;
         effective.assumeInlineDefinitions = false;
     }
+    if (effective.requireInScope) effective.scopeIncludeEdges = &impl_->includeGraph.scopeEdges;
     std::vector<clang::TranslationUnitDecl*> extraRoots;
     if (req.emitDefinitions && !typeKey.empty())
     {

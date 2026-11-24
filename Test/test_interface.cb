@@ -2755,6 +2755,16 @@ class OvlRound1Mixed : IOvlRound1Mixed
 };
 interface IOvlExactDouble { int f(double value); };
 class OvlExactDouble : IOvlExactDouble { int f(double value) { return 3; } };
+// IFERES accept-set: an int argument to f(double) is refused (Test/errors/err_iface_int_to_floating_arg.cb);
+// floating arguments and integer widenings to integer slots still bind on the interface path.
+interface IIfresAccept { int f(double a); int g(i64 a); int h(u32 a); int k(int a); };
+class IfresAccept : IIfresAccept
+{
+    int f(double a) { return (int)(a * 10.0); }
+    int g(i64 a) { return (int)a + 100; }
+    int h(u32 a) { return (int)a + 200; }
+    int k(int a) { return a + 300; }
+};
 interface IOvlRound1Generic<T> { int f(T a); int f(double a) const; };
 class OvlRound1GenericImpl : IOvlRound1Generic<int>
 {
@@ -2906,6 +2916,23 @@ bool testInterfaceOverloadDispatch()
     OvlExactDouble exactDoubleImpl;
     IOvlExactDouble exactDoubleIface = exactDoubleImpl;
     result &= Test("iface_ovl_r3_exact_double_iface", exactDoubleIface.f(1.0), 3);
+    IfresAccept ifresImpl;
+    IIfresAccept ifresIface = ifresImpl;
+    double ifresDouble = 2.5;
+    float ifresFloat = 1.5f;
+    int ifresInt = 4;
+    i8 ifresI8 = 5;
+    u8 ifresU8 = 6;
+    char ifresChar = 'a';
+    result &= Test("iface_ifres_accept_double_var", ifresIface.f(ifresDouble), 25);
+    result &= Test("iface_ifres_accept_float_var", ifresIface.f(ifresFloat), 15);
+    result &= Test("iface_ifres_accept_literal", ifresIface.f(3.5), 35);
+    result &= Test("iface_ifres_accept_cast_int", ifresIface.f((double)ifresInt), 40);
+    result &= Test("iface_ifres_accept_int_to_i64", ifresIface.g(ifresInt), 104);
+    result &= Test("iface_ifres_accept_u8_to_u32", ifresIface.h(ifresU8), 206);
+    result &= Test("iface_ifres_accept_i8_to_int", ifresIface.k(ifresI8), 305);
+    result &= Test("iface_ifres_accept_char_to_int", ifresIface.k(ifresChar), 397);
+    result &= Test("iface_ifres_accept_direct_float_var", ifresImpl.f(ifresFloat), 15);
     const OvlRound1ConstOnly constOnlyValue = constOnlyImpl;
     const IOvlRound1ConstOnly constOnlyIfaceValue = constOnlyIface;
     result &= Test("iface_ovl_r1_const_only_const_direct", constOnlyValue.f(1), 2);

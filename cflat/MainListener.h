@@ -3961,6 +3961,8 @@ private:
     bool inCallArgument_ = false;
     const CFlatParser::PostfixExpressionContext* directViewCallArgument_ = nullptr;
     bool inCxxCallArgument_ = false;
+    // A call argument `?:` with a nested `?:` arm builds its slot in place (MIXRES).
+    bool cxxNestedCallTernaryClaim_ = false;
     LLVMBackend::TypeAndValue cxxCallArgumentExpectedType_;
     llvm::Function* cxxTernaryCallSink_ = nullptr;
     llvm::Value* cxxTernaryCallSinkEnvironment_ = nullptr;
@@ -8184,6 +8186,10 @@ public:
     // REFDEF: a `?:` whose leaves are exactly one `default` and one bare local place (a C++ prvalue).
     bool IsCxxMixedDefaultPlaceTernary(antlr4::ParserRuleContext* ctx);
     bool IsCxxDefaultLocalTernary(antlr4::ParserRuleContext* ctx);
+    // CALLRES: deleted C++ stand-ins for the visible CFlat overloads an ADL request ranks.
+    bool CflatAdlStandIns(LLVMBackend& compiler, const std::vector<LLVMBackend::FunctionSymbol>& visible,
+                          const std::vector<LLVMBackend::NamedVariable>& arguments, const std::string& name,
+                          const std::string& genericName, std::string& out) const;
     // REFDEF: the caller can build `defaultType` (a default ctor resolves, or it needs none) before copying.
     bool CanMaterializeMixedDefault(const std::string& defaultType);
     // T459: `c ? default : place` into a `const T&` class parameter joins a temporary of that class.

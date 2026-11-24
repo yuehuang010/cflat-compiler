@@ -35,6 +35,12 @@ namespace m18ov
     // MIX18 r2: a CFlat function value into a free `const bool&` is its truth; an int takes the int overload.
     inline int a3(const bool&) { return 1; }
     inline int a3(int) { return 2; }
+    // FNCAST: a constructor taking a function pointer calls it (the cast form passes a callable pointer).
+    struct CF { int v; CF(int (*f)(int)) : v(f(5)) {} };
+    // FNCAST r2: an overloaded name binds the one overload a function-pointer parameter selects (CF,
+    // CDD); CFD's two parameters each select one, so clang refuses the name as not matching.
+    struct CDD { int v; CDD(double (*f)(double)) : v((int)f(2.0)) {} };
+    struct CFD { int v; CFD(int (*f)(int)) : v(1) {} CFD(double (*f)(double)) : v(2) {} };
     // MIX18 r3: an identity bind (same scalar type) is never a converted temporary: master picks the const& (1).
     inline int gi(const int&) { return 1; }
     inline int gi(int) { return 2; }

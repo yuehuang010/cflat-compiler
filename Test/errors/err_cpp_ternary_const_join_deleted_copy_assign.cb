@@ -1,0 +1,18 @@
+import cpp "../library/cpp_objoin.hpp";
+
+// CONSTJOIN: a prvalue arm beside a const place arm joins as a const prvalue, which binds only
+// operator=(const T&); deleted there, clang refuses even though operator=(T&&) exists.
+expect_error("clang: overload resolution selected deleted operator '='") {
+    int constJoinDeletedCopyAssign(bool c)
+    {
+        cppobjoin.NoCa y = cppobjoin.NoCa(1);
+        cppobjoin.NoCa n = cppobjoin.NoCa(3);
+        y = c ? cppobjoin.mkNoCa(5) : n.cref();
+        return y.v;
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

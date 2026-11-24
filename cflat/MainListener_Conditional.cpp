@@ -3156,11 +3156,12 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
         LLVMBackend::TypeAndValue pointerJoinDest;
         if (outerExpected.Pointer && compiler->IsCxxRecord(outerExpected.TypeName))
             pointerJoinDest = outerExpected;
-        auto adjustCxxPointerArm = [&](llvm::Value*& value) {
+        auto adjustCxxPointerArm = [&](llvm::Value*& value,
+                                       const LLVMBackend::TypeAndValue* sourceOverride = nullptr) {
             if (value == nullptr || !pointerJoinDest.Pointer || !value->getType()->isPointerTy())
                 return;
             if (compiler->builder->GetInsertBlock() == nullptr) return;
-            auto source = InferTernaryArmType(value);
+            auto source = sourceOverride != nullptr ? *sourceOverride : InferTernaryArmType(value);
             if (!source.Pointer || !compiler->IsCxxRecord(source.TypeName)) return;
             value = compiler->AdjustCxxPointerForStore(
                 pointerJoinDest, source, value, "conditional expression");
@@ -3177,6 +3178,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
         size_t cxxTernaryDeclFreshArms = 0;  // arms built from a temporary, not copied from a place
         size_t cxxTernaryDeclScalarArms = 0;
         bool cxxTernaryDeclFailed = false;
+        bool nestedArmDeclFailed = false;  // a nested arm already failed (and reported)
         bool trueCxxTernaryDeclDeferred = false;
         bool falseCxxTernaryDeclDeferred = false;
         bool trueCxxTernaryDeclBuilt = false;
@@ -3582,6 +3584,17 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 ++cxxTernaryDeclScalarArms;
                 return;
             }
+            // So is a C++ record pointer (or null) arm: the declaration converts the joined pointer.
+            if (armValue != nullptr && armValue->getType()->isPointerTy()
+                && (llvm::isa<llvm::ConstantPointerNull>(armValue)
+                    || (armType.Pointer && armType.ValuePointerDepth() == 1
+                        && compiler->IsCxxRecord(armType.TypeName))
+                    || (cxxNestedCallTernaryClaim_
+                        && !compiler->IsCxxRecord(compiler->ResolveTypeAlias(armType.TypeName)))))
+            {
+                ++cxxTernaryDeclScalarArms;
+                return;
+            }
             const bool fieldOfTemp = !explicitMove && armValue != nullptr && armStorage != nullptr
                 && compiler->IsFieldOfOwnedStructTemp(armStorage, armValue);
             // A derived class arm (`D(1)`, or a D lvalue or xvalue) slices into the declared base.
@@ -3819,12 +3832,16 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             ~TernaryCallArgumentDepthScope() { if (active) --depth; }
             bool IsOutermost() const { return active && depth == 1; }
         } ternaryDepth(ternaryCallArgumentDepth_, inCallArgument_);
+        // A nested `?:` arm builds the argument slot in place, as in a declaration (MIXRES).
+        const bool nestedTernaryArm = ArmTernaryThroughParens(expressionTrueCtx) != nullptr
+            || ArmTernaryThroughParens(expressionFalseCtx) != nullptr;
         const bool cxxByValueCallArgumentJoin = cxxTernaryDecl && inCallArgument_
             && ternaryDepth.IsOutermost()
             && (IsDefaultOnlyExpression(expressionTrueCtx)
                 || IsDefaultOnlyExpression(expressionFalseCtx)
                 || HasDefaultOnlyTernaryArm(expressionTrueCtx)
-                || HasDefaultOnlyTernaryArm(expressionFalseCtx))
+                || HasDefaultOnlyTernaryArm(expressionFalseCtx)
+                || nestedTernaryArm)
             && IsWholeCxxCallArgumentShape(ctx, outerExpected);
         const bool cxxCallArgumentJoin = cxxTernaryDecl && inCallArgument_
             && inCxxCallArgument_ && ternaryDepth.IsOutermost()
@@ -4316,7 +4333,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             const int trueNestedState = takeNestedCxxTernaryArm(trueNested);
             restoreNestedDeclArm(trueNestedState, trueShape, trueValue,
                 trueStorage, trueCxxTernaryDeclBuilt);
-            if (trueNestedState == 2) cxxTernaryDeclFailed = true;
+            if (trueNestedState == 2) cxxTernaryDeclFailed = nestedArmDeclFailed = true;
             adoptNestedDerivedArm(trueNestedState, trueDerived);
             trueTempField = compiler->IsTempFieldValue(trueValue);
             publishCxxCtorTemp(trueValue, trueStorage);
@@ -4538,7 +4555,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             const int falseNestedState = takeNestedCxxTernaryArm(falseNested);
             restoreNestedDeclArm(falseNestedState, falseShape, falseValue,
                 falseStorage, falseCxxTernaryDeclBuilt);
-            if (falseNestedState == 2) cxxTernaryDeclFailed = true;
+            if (falseNestedState == 2) cxxTernaryDeclFailed = nestedArmDeclFailed = true;
             adoptNestedDerivedArm(falseNestedState, falseDerived);
             falseTempField = compiler->IsTempFieldValue(falseValue);
             publishCxxCtorTemp(falseValue, falseStorage);
@@ -4722,6 +4739,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             throw;
         }
 
+        std::string constPrvalueJoinType; // class of a prvalue join beside a const place leaf
         // C++ makes a same-type conditional a prvalue when one arm is a prvalue. Copy the
         // corresponding lvalue arm into its own branch temporary before the join.
         if (!cxxTernaryDecl && use != ResultUse::Discard && trueValue != nullptr
@@ -4740,7 +4758,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     probe.TypeAndValue.TypeName = typeName;
                     return compiler->IsOwnedTempValue(probe);
                 };
-                auto materializeArm = [&](bool trueArm, bool useMove) {
+                auto materializeArm = [&](bool trueArm, bool useMove, bool constSource = false) {
                     llvm::Value*& value = trueArm ? trueValue : falseValue;
                     llvm::Value*& storage = trueArm ? trueStorage : falseStorage;
                     LLVMBackend::TypedValue& shape = trueArm ? trueShape : falseShape;
@@ -4754,7 +4772,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                         compiler->builder->SetInsertPoint(endBlock);
                     const auto mark = compiler->MarkOwnedTemps();
                     if (compiler->EmitCxxCopyOrMoveConstruct(typeName, temp, storage,
-                            useMove, "into a conditional expression"))
+                            useMove, "into a conditional expression",
+                            /*displayTypeName*/ std::string(), constSource))
                     {
                         compiler->RegisterOwnedStructTemp(temp, typeName);
                         value = compiler->builder->CreateLoad(classType, temp);
@@ -4788,6 +4807,17 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     && !falseShape.isExplicitMove && !falseShape.isRvalue;
                 const bool falseMoveLvalueJoin = falseShape.isExplicitMove
                     && !trueShape.isExplicitMove && !trueShape.isRvalue;
+                // The copied place arm is a plain class prvalue now, not the `T&` / alias it read.
+                auto materializePlaceArm = [&](bool trueArm) {
+                    LLVMBackend::TypedValue& shape = trueArm ? trueShape : falseShape;
+                    llvm::Value* const before = trueArm ? trueValue : falseValue;
+                    materializeArm(trueArm, false, lvalueJoinConst());
+                    if ((trueArm ? trueValue : falseValue) == before) return;
+                    if (shape.hasSourceType && shape.sourceType.IsCxxRef())
+                        shape.sourceType = LLVMBackend::TypeAndValue{ .TypeName = typeName };
+                    shape.isAlias = false;
+                    if (lvalueJoinConst()) constPrvalueJoinType = typeName;
+                };
                 if (TernaryIsMemberReceiver(ctx) && trueMoveLvalueJoin)
                 {
                     materializeArm(true, true);
@@ -4804,20 +4834,20 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 else if (falseTemp && falseShape.isCxxSameTypeCastCopy && !trueTemp && !trueShape.isRvalue
                     && isAddressableLvalue(trueValue, trueStorage))
                     materializeArm(true, false);
-                // Imported class prvalue arm beside an unmoved non-const place: the join is a
-                // prvalue and the place arm is copied, as clang does (const leaf stays refused).
-                else if (compiler->IsForeignNontrivialCxxClass(typeName) && !lvalueJoinConst()
+                // Imported class prvalue arm beside an unmoved place: the join is a prvalue and the
+                // place arm is copied, as clang does; a const leaf makes it a const prvalue.
+                else if (compiler->IsForeignNontrivialCxxClass(typeName)
                     && isOwnedCxxJoinTemp(trueValue, trueStorage) && !falseTemp
                     && !falseShape.isRvalue && !falseShape.isExplicitMove
                     && !falseDefault
                     && isAddressableLvalue(falseValue, falseStorage))
-                    materializeArm(false, false);
-                else if (compiler->IsForeignNontrivialCxxClass(typeName) && !lvalueJoinConst()
+                    materializePlaceArm(false);
+                else if (compiler->IsForeignNontrivialCxxClass(typeName)
                     && isOwnedCxxJoinTemp(falseValue, falseStorage) && !trueTemp
                     && !trueShape.isRvalue && !trueShape.isExplicitMove
                     && !trueDefault
                     && isAddressableLvalue(trueValue, trueStorage))
-                    materializeArm(true, false);
+                    materializePlaceArm(true);
             }
 
         // A C++ prvalue conditional used as a call argument (C++ or CFlat callee) or an operator operand
@@ -4896,6 +4926,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     joined.storage = resultSlot;
                     joined.receiverStorage = resultSlot;
                     joined.sourceType = LLVMBackend::TypeAndValue{ .TypeName = trueName };
+                    // A copied const place leaf keeps clang's const composite (binds const T&, not T&&).
+                    if (!constPrvalueJoinType.empty()) joined.sourceType.ConstMask = 1u;
                     joined.sourceTypeName = trueName;
                     joined.hasSourceType = true;
                     consumeNewCxxTernaryElision(joined);
@@ -5105,17 +5137,9 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     && hasUniqueLvalueByValueConversion(trueName))
                 || (falseCategory == CxxArmCategory::Lvalue
                     && hasUniqueLvalueByValueConversion(falseName));
-            // CFlat call arguments keep the legacy conditional lowering for lvalue by-value
-            // conversions; the direct sink lowering changes both admission and cleanup order.
-            if (callArgument && !callThroughSink && lvalueByValueConversion)
-                return CxxValueJoinResult::NotApplicable;
-            // A converting by-value parameter lvalue would copy an extra B before returning.
-            const bool paramArmConverts =
-                (trueCategory == CxxArmCategory::Lvalue && trueStorage != nullptr
-                    && compiler->IsFunctionParameterStorage(trueStorage) && trueName != resultName)
-                || (falseCategory == CxxArmCategory::Lvalue && falseStorage != nullptr
-                    && compiler->IsFunctionParameterStorage(falseStorage) && falseName != resultName);
-            if (paramArmConverts)
+            // CFlat callees keep the legacy lowering for lvalue by-value conversions; C++ callees
+            // without a sink (methods, ctors) take the join below, like clang (MIXRES).
+            if (callArgument && !callThroughSink && lvalueByValueConversion && !inCxxCallArgument_)
                 return CxxValueJoinResult::NotApplicable;
             const std::string targetName = cxxTernaryDecl
                 ? compiler->ResolveTypeAlias(cxxTernaryDeclType)
@@ -5511,6 +5535,22 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             && cxxTernaryDeclArmsMoved == 0 && cxxTernaryDeclScalarArms == 2;
         if (cxxTernaryDecl && !cxxTernaryDeclScalarJoin)
         {
+            // A nested call-argument claim that fails to build reports the arm clash, not the
+            // overload fallthrough of an empty argument (MIXRES).
+            if (cxxNestedCallTernaryClaim_ && !nestedArmDeclFailed)
+            {
+                auto describeArm = [](llvm::Value* v) -> std::string {
+                    llvm::Type* t = v != nullptr ? v->getType() : nullptr;
+                    if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(t))
+                        return st->hasName() ? st->getName().str() : std::string("struct");
+                    if (t != nullptr && t->isPointerTy()) return "pointer";
+                    if (t != nullptr && t->isIntegerTy()) return "i" + std::to_string(t->getIntegerBitWidth());
+                    return "unknown";
+                };
+                LogErrorContext(ctx, std::format(
+                    "ternary branches have incompatible types '{}' and '{}'",
+                    describeArm(trueValue), describeArm(falseValue)));
+            }
             if (trueEnd != nullptr && cflat_llvm::GetTerminatorOrNull(trueEnd) == nullptr)
             {
                 compiler->builder->SetInsertPoint(trueEnd);
@@ -6276,10 +6316,76 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             compiler->SwitchToBlock(resumeBlock);
             return {};
         }
-        atTrue();
-        adjustCxxPointerArm(trueValue);
-        atFalse();
-        adjustCxxPointerArm(falseValue);
+        /*
+         * C++ composite pointer type: arms pointing at a C++ class and at a public base of it join
+         * as the base ([expr.cond]/7); one class (or one class beside null) joins as itself. The
+         * derived arm is converted on its own path before the PHI (a base at a non-zero offset
+         * moves the address; null stays null), then both to a pointer destination's base.
+         */
+        LLVMBackend::TypeAndValue compositeCxxPointee;
+        if (trueValue != nullptr && falseValue != nullptr
+            && trueValue->getType()->isPointerTy() && falseValue->getType()->isPointerTy())
+        {
+            auto armPointer = [&](const LLVMBackend::TypedValue& shape, llvm::Value* value) {
+                auto type = InferTernaryArmType(shape);
+                if (!type.Pointer || type.ElemPointer || type.ValuePointerDepth() != 1
+                    || type.IsInterface || type.IsInterfacePointer || type.IsFunctionPointer
+                    || type.IsArrayView || shape.isArrayView)
+                    return LLVMBackend::TypeAndValue{};
+                // The value's ledger pointee wins, as adjustCxxPointerArm reads it: a CFlat pointer
+                // cast `(B*)d` keeps d's address, so the arm still points at the derived class.
+                const auto ledger = InferTernaryArmType(value);
+                if (ledger.Pointer && compiler->IsCxxRecord(compiler->ResolveTypeAlias(ledger.TypeName)))
+                    type.TypeName = ledger.TypeName;
+                type.TypeName = compiler->ResolveTypeAlias(type.TypeName);
+                return compiler->IsCxxRecord(type.TypeName) ? type : LLVMBackend::TypeAndValue{};
+            };
+            const auto trueType = armPointer(trueShape, trueValue);
+            const auto falseType = armPointer(falseShape, falseValue);
+            const bool trueToBase = trueType.Pointer && falseType.Pointer
+                && compiler->IsCxxDerivedToBasePointer(trueType, falseType);
+            const bool falseToBase = trueType.Pointer && falseType.Pointer && !trueToBase
+                && compiler->IsCxxDerivedToBasePointer(falseType, trueType);
+            const bool sameClass = trueType.Pointer && falseType.Pointer
+                && trueType.TypeName == falseType.TypeName;
+            auto armNull = [](const LLVMBackend::TypedValue& shape, llvm::Value* value) {
+                return llvm::isa<llvm::ConstantPointerNull>(value)
+                    || (shape.hasSourceType && shape.sourceType.IsCxxNullptrT);
+            };
+            const bool trueNull = armNull(trueShape, trueValue);
+            const bool falseNull = armNull(falseShape, falseValue);
+            const bool nullBeside = (trueNull && falseType.Pointer && !falseNull)
+                || (falseNull && trueType.Pointer && !trueNull);
+            if (trueToBase || falseToBase || sameClass || nullBeside)
+            {
+                compositeCxxPointee = LLVMBackend::TypeAndValue{
+                    .TypeName = (trueToBase || trueNull ? falseType : trueType).TypeName,
+                    .Pointer = true, .PointerDepth = 1 };
+                // A destination the composite reaches converts both arms from it; any other
+                // destination sees the composite (a derived-pointer store is still accepted: p3 issue).
+                if (!pointerJoinDest.Pointer
+                    || (pointerJoinDest.TypeName != compositeCxxPointee.TypeName
+                        && !compiler->IsCxxDerivedToBasePointer(compositeCxxPointee, pointerJoinDest)))
+                    pointerJoinDest = compositeCxxPointee;
+                atTrue();
+                if (trueToBase)
+                    trueValue = compiler->AdjustCxxPointerForStore(
+                        compositeCxxPointee, trueType, trueValue, "conditional expression");
+                if (!trueNull) adjustCxxPointerArm(trueValue, &compositeCxxPointee);
+                atFalse();
+                if (falseToBase)
+                    falseValue = compiler->AdjustCxxPointerForStore(
+                        compositeCxxPointee, falseType, falseValue, "conditional expression");
+                if (!falseNull) adjustCxxPointerArm(falseValue, &compositeCxxPointee);
+            }
+        }
+        if (!compositeCxxPointee.Pointer)
+        {
+            atTrue();
+            adjustCxxPointerArm(trueValue);
+            atFalse();
+            adjustCxxPointerArm(falseValue);
+        }
         // The fat interface LLVM type is shared by every interface. Rebox each moved arm against
         // the declared return interface after unification, using the per-value source-interface
         // ledger; this also handles parent/derived arms whose LLVM types are identical.
@@ -6868,6 +6974,12 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
         result.arithNarrowWidth = LLVMBackend::ArithResultNarrowWidth(trueShape, falseShape);
         JoinTernaryPointerShape(result, trueShape, falseShape);
         JoinTernaryClassPointee(result, trueShape, falseShape);
+        if (compositeCxxPointee.Pointer && result.value != nullptr
+            && result.value->getType()->isPointerTy())
+        {
+            result.joinClassPointee = pointerJoinDest.TypeName;
+            result.joinClassPointeeDepth = 1;
+        }
         auto moveArmIsConst = [&](const LLVMBackend::TypedValue& shape,
                                   antlr4::tree::ParseTree* arm) {
             if (shape.hasSourceType && CxxTernaryArmConst(shape.sourceType)) return true;
@@ -6881,6 +6993,13 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 || moveArmIsConst(falseShape, expressionFalseCtx)))
         {
             result.sourceType = LLVMBackend::TypeAndValue{ .TypeName = trueShape.sourceType.TypeName };
+            result.sourceType.ConstMask = 1u;
+            result.sourceTypeName = result.sourceType.TypeName;
+            result.hasSourceType = true;
+        }
+        else if (!constPrvalueJoinType.empty())
+        {
+            result.sourceType = LLVMBackend::TypeAndValue{ .TypeName = constPrvalueJoinType };
             result.sourceType.ConstMask = 1u;
             result.sourceTypeName = result.sourceType.TypeName;
             result.hasSourceType = true;
@@ -8150,17 +8269,29 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
         // Only a real `?:` claims it: a plain operand (a parenthesized arm `a ? X : (b ? Y : Z)`)
         // passes the slot on to the ternary inside it.
         const bool claimsCxxTernaryDecl = ctx->Question() != nullptr;
-        const bool cxxCallDefaultTernary = claimsCxxTernaryDecl && inCallArgument_
+        // A nested `?:` arm also builds the slot, for a by-value or `const T&` parameter (MIXRES).
+        const bool nestedCallTernaryArm = claimsCxxTernaryDecl && inCallArgument_
+            && (ArmTernaryThroughParens(ctx->expression()) != nullptr
+                || ArmTernaryThroughParens(ctx->conditionalExpression()) != nullptr);
+        const bool constRefNestedCallTernary = nestedCallTernaryArm && outerExpected.IsCxxRef()
+            && outerExpected.CxxConstRef() && !outerExpected.IsRvalueRef
+            && outerExpected.CxxReferentLevel() == 0
+            && compiler->IsForeignNontrivialCxxClass(outerExpected.TypeName)
+            && IsWholeCxxCallArgumentShape(ctx, outerExpected);
+        const bool cxxCallDefaultTernary = constRefNestedCallTernary
+            || (claimsCxxTernaryDecl && inCallArgument_
             && !outerExpected.Pointer && !outerExpected.IsAlias
             && !outerExpected.IsRvalueRef
             && compiler->IsForeignNontrivialCxxClass(outerExpected.TypeName)
             && (IsDefaultOnlyExpression(ctx->expression())
                 || IsDefaultOnlyExpression(ctx->conditionalExpression())
                 || HasDefaultOnlyTernaryArm(ctx->expression())
-                || HasDefaultOnlyTernaryArm(ctx->conditionalExpression()))
-            && IsWholeCxxCallArgumentShape(ctx, outerExpected);
+                || HasDefaultOnlyTernaryArm(ctx->conditionalExpression())
+                || nestedCallTernaryArm)
+            && IsWholeCxxCallArgumentShape(ctx, outerExpected));
         auto* cxxCallTernaryType = cxxCallDefaultTernary
-            ? compiler->GetType(outerExpected) : nullptr;
+            ? compiler->GetType(LLVMBackend::TypeAndValue{ .TypeName = outerExpected.TypeName })
+            : nullptr;
         llvm::Value* cxxCallTernarySlot = cxxCallTernaryType != nullptr
             ? compiler->AllocaAtEntry(cxxCallTernaryType, nullptr, "cxx.ternary.arg") : nullptr;
         struct CxxCallTernaryPendingScope
@@ -8193,6 +8324,9 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 backend->pendingCxxTernaryDeclFailed_ = savedFailed;
             }
         } cxxCallTernaryPending(compiler, cxxCallTernarySlot, outerExpected.TypeName);
+        // A non-class pointer leaf (a string literal) of a nested claim joins as a scalar.
+        llvm::SaveAndRestore<bool> nestedCallClaimScope(cxxNestedCallTernaryClaim_,
+            cxxNestedCallTernaryClaim_ || (cxxCallTernarySlot != nullptr && nestedCallTernaryArm));
         llvm::Value* cxxTernaryDeclDest = claimsCxxTernaryDecl
             ? compiler->pendingCxxTernaryDeclDest_ : nullptr;
         const std::string cxxTernaryDeclType = claimsCxxTernaryDecl

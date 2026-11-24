@@ -64,9 +64,10 @@ concurrent runs on the same function). Line numbers in old rows predate the 2026
 
 ## Ship gate (p1 + p2)
 
-p1 = 0. p2 = 3 open, one (LINT) blocks on a ruling:
+p1 = 0. p2 = 4 open, two block on a ruling:
 
 - p2/expect-error-substring-source-check-loose - NEEDS RULING (2026-11-18 box 16: literal anchoring refuses 386 legit substrings; two options in the file).
+- p2/cpp-const-class-result-into-mutable-pointer-local - NEEDS RULING (2026-11-19 PTRSAFE 9c79a4f52): same-class `const T*` C++ result into a mutable local / CFlat param; two existing legs pin the accept (file lists them).
 - p2/cold-cpp-interop-compile-peaks-23-27-gb - 9.51 GB cold since the regroup (80a853e9a; was 20.33 GB); accepted until plan P10 lands (RULED 2026-11-18).
 - p2/test-suite-over-time-budget - run G7: phase timing first; a fixture split needs the maintainer's OK.
 
@@ -74,7 +75,7 @@ Run the Windows gate on the master tip once per box.
 
 ## In flight
 
-None. No parked branch or worktree exists (the old parked branches were deleted 2026-11-18; only `fix/movedtor` is left).
+Box 16 (2026-11-19): PTRSTORE (native unrelated-struct `T*` -> `U*` accepted at decl / assign / return; no issue file, repro in the brief) and ETARG (p3/cpp-expression-template-to-cflat-byvalue-class-param-refused). Only `fix/movedtor` is parked.
 
 ## Ready to start (ruled, nothing open - schedule from here first)
 
@@ -96,7 +97,7 @@ Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the pl
 | p3/interface-call-overload-ranking-and-conversion | native ConstMask hole (needs core const annotations), first-not-ambiguous picks, interface single-slot widen, native pointer-field const carry, const twin mangling (all pre-existing) |
 | p3/ctor-lambda-this-closure-relocation | by-value return of a this-capturing-closure holder awaits the native return-ABI ruling |
 | p3/self-pointer-struct-return-not-in-place | RULED 2026-10-25: C++ guaranteed elision for every ctor-/dtor-bearing native struct (sret + in-place new); plan first |
-| p3/cpp-mixed-class-conditional-value-return-argument-refused | S3 sret copy, lv_bv, nested mixed, CFlat/C++ temp order, win64 cross-compile refusal |
+| p3/cpp-mixed-class-conditional-value-return-argument-refused | (MIXRES e2fa30ee6 landed by-value param / member-callee lvalue arms, nested call-argument `?:`) S3 sret copy, nested mixed at a generic callee, CFlat/C++ temp order, win64 cross-compile refusal |
 | p3/alias-return-byvalue-param-leftovers-after-b21 | items 1, 2, 4, 6 open; item 3 on hold (2026-10-15); item 5 ratified, no code |
 
 ## Backlog (p3/p4 and plans; groups from earlier builds)
@@ -123,7 +124,6 @@ Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the pl
 | - | p3/cpp-wrapper-request-misses-template-argument-headers | `std.unique_ptr<cppon.Cls>` wrappers | open: noinc implicit dtor, unpublished-specialization pointer binding |
 | - | p3/copy-constructor-overload-resolution-parity + p3/cpp-call-overload-and-copy-count-parity-leftovers | C++ copy ctor / copy-assign pick | template-ctor return pick + CFlat-callee elision landed cc2d19b64 (RETELIDE); residue: lambda-capturing callee keeps the extra copy (NEEDS RULING: drop the gate + re-pin bridge_capture_return to copy 1 / dtor 2), CALLPAR landed 069983274 (competing `?:` default, bare default ambiguity, ADL, template-only deferral); leftovers file = remaining pre-existing parity shapes |
 | - | p3/cpp-class-assignment-false-refusals | C++ same-class assignment | NEW 2026-11-19 from CPPOPEQ e3eb8921f (deleted / inaccessible / ambiguous operator= now refused like clang): C++ call-result source and target landed 14c9bd018 (ASGACC: register-returned sources, `mk() = b`); residue: [cpp] struct assignment, MoveOnly `?:` text; reference-member class still accepted NEEDS RULING |
-| - | p3/cpp-operator-ranking-and-fnptr-ctor-leftovers | C++ operator candidate set | imported enum free operators vs built-in (member templates vs free operators landed d6eeafe54) |
 | - | p3/cpp-null-constant-ctor-leftovers-after-t132 | literal-zero C++ ctor selection | only item 3 (char-only ctor narrowing, by design unless ruled) left |
 | B5b | p3/cpp-constrained-twin-default-argument-ranking | MSVC: same-mangled constrained twins share one emitted body | clang-cl residue only |
 | B14 | p3/c-flexible-array-member-leftovers | raw interior-pointer `move` (RULED 2026-10-31: proven-borrowed raw pointer move refused), siblings | residue in the issue file |
@@ -143,8 +143,8 @@ Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the pl
 |-----|----------|------|------|
 | - | p3/cpp-static-local-derived-to-base-and-lvalue-ternary-copies | C++ class ternary + static init leftovers | residue: global move init; explicit `return move d` |
 | - | p3/function-slot-null-zero-spellings | grammar | OPEN residue: `rv.G{0}` expression form does not parse (data-pointer null casts landed 63cdc54c2) |
-| - | p3/cpp-expression-template-to-cflat-byvalue-class-param-refused | converting-ctor path | absorbed by P1 (converting constructors); land there |
-| - | p3/cpp-class-pointer-converting-ctor-leftovers | converting-ctor path | T305 residue; with P1 |
+| ETARG | p3/cpp-expression-template-to-cflat-byvalue-class-param-refused | converting-ctor path | in flight box 16 |
+| - | p3/cpp-class-converting-ctor-global-init-and-interface-copy | converting-ctor path | CFlat global dynamic init (global/static storage design question) + one extra interface copy; CONVPTR 5d96c6caa / CONVREST 1e93d8698 landed the rest |
 | - | p3/cpp-inherited-operator-diamond-and-protected-access | virtual inheritance in imported classes | with P4 virtual-base layout |
 
 ### E - temporary lifetime, leak, dangle (one issue per run, opus-tier area)
@@ -181,7 +181,7 @@ Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the pl
 | N-MOVESINK | p3/unique-field-assign-source-not-marked-moved | indirect-root consumes landed 0050627c8 (MOVESINK; move-sink-leftovers file closed); residue: sink-path false refusals through pointer roots, global/static implicit consume error, conservative misses, operator-call re-init, do-while condition |
 | N-FOREACH | p3/unique-foreach-element-adoption-leftovers | items 1, 4 + pointer-collection / global-pointer ranges landed 43f829835 (FOREACHADOPT); item 5 (C++ begin()/end() containers) NEEDS RULING; item 6 `sink2(c ? p : nullptr, p->id)` crash = shared conditional-transfer ordering |
 | N-RAWOWN | p3/raw-local-owner-bit-leftovers + p3/owning-pointer-release-withheld-when-alias-may-reach + p3/runtime-null-coalesce-new-into-local-leaks | raw owner bit: counter-dependent first-iteration sink, alias-withheld release (leak only), `g ?? new T` leak |
-| N-JOIN | p3/owned-borrowed-ternary-join-rejects-and-misclassifies + p3/moved-raw-heap-array-ternary-destroys-one-element | imported-class prvalue arm beside an unmoved non-const place landed 3080d7a0c (OBJOIN); residue: const place arm (run CONSTJOIN in flight); moved raw heap array ternary |
+| N-JOIN | p3/moved-raw-heap-array-ternary-destroys-one-element | OBJOIN 3080d7a0c + CONSTJOIN bfdc07f8f landed the join; residue waits on the raw-array-count desugar ruling |
 | N-VIEW | p3/borrowed-view-fields-passed-through-retaining-calls + p3/move-borrowed-view-field-refused | view fields through retaining calls; `move` of a borrowed view field refused |
 | N-COPY | p3/raw-delete-string-array-skips-element-dtors | residue after 56aecbae4 (pointer-subscript reads copy, stores drop old): `delete[_]` element dtors NEEDS RULING (LANGUAGE.md + test_cpp_interop:20498 say frees only; options in the file) |
 | N-BORROW | p3/consolidate-named-variable-borrow-provenance + p3/iface-return-call-borrow-precision + p3/deref-of-moved-pointer-guard-inside-callee | borrow provenance of named variables; interface return precision; false positive behind a terminating callee |
@@ -197,6 +197,7 @@ Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the pl
 | Run | Issue(s) | Notes |
 |-----|----------|-------|
 | L-TUPLE | p3/tuple-leftovers-after-tuplit | ruled 2026-11-01; R133/R134 closed by UNIQARG b04ec5235; residue: owned unique-element refusals, brace-init field borrows |
+| L-PTRDEPTH | p3/new-pointer-depth-carrier | RULED 2026-11-04; steps 1, 2a, 2b landed (66c224275); residue: volatile / restrict levels, `new const T*(...)` |
 | L-GENERIC | p3/generic-instantiation-value-leftovers + p3/generic-literal-deduction-leftovers | C++ template instance as value; ctor deduction `Box(3)` landed 8d05c9344; brace `Box b{3}` NEEDS RULING (aggregate deduction vs designated brace init) |
 
 ### P - plans and staged work

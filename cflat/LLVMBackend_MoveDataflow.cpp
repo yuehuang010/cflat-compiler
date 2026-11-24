@@ -2836,7 +2836,13 @@ bool LLVMBackend::ConversionDiscardsConst(const llvm::Value* value, const TypeAn
         // mismatch, reported as one; `u8"x"` is a `c8` literal.
         if (LiteralMismatchesPointee(value, source, target, depth)) return false;
         std::string name;
-        const uint32_t from = StoredConstLevels(value, name);
+        uint32_t from = StoredConstLevels(value, name);
+        // A C++ class pointer result (`const D* f()`) carries its pointee const on its type. The
+        // same class keeps it (no CFlat const spelling); a base-class pointer drops it, as in C++.
+        if (depth == 1 && source.Pointer && source.ValuePointerDepth() == 1 && source.PointeeConstBit()
+            && IsCxxRecord(source.TypeName) && IsCxxRecord(target.TypeName)
+            && ResolveTypeAlias(source.TypeName) != ResolveTypeAlias(target.TypeName))
+            from |= 1u;
         uint32_t to = 0;
         if (exactTargetLevels)
         {

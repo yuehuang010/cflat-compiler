@@ -1,0 +1,41 @@
+// CALLRES: ordinary lookup plus ADL is one candidate set. A visible CFlat overload and a C++ function of
+// the argument's namespace that match equally well are ambiguous, as clang refuses the same set.
+import cpp "cpp_interop_lastuse.h";
+
+int callres_exact(cpptw.Twin v) { return 50; }
+int callres_cref(cpptw.Twin v) { return 95; }
+
+int exactTie()
+{
+    cpptw.Twin x = cpptw.Twin(7);
+    int v = 0;
+    expect_error("ambiguous call to 'callres_exact': no candidate ranks better than the others among the visible overloads (callres_exact(cpptw.Twin))") {
+        v = callres_exact(x);
+    }
+    return v;
+}
+
+// By value against `const Twin&`: both identity conversions (clang: call is ambiguous).
+int crefTie()
+{
+    cpptw.Twin x = cpptw.Twin(7);
+    int v = 0;
+    expect_error("ambiguous call to 'callres_cref': no candidate ranks better than the others among the visible overloads (callres_cref(cpptw.Twin))") {
+        v = callres_cref(x);
+    }
+    return v;
+}
+
+// A CFlat generic and a C++ function template of the same shape: partial ordering ties (clang: ambiguous).
+int callres_g1<T>(T a) { return 1; }
+int genericTie()
+{
+    cpptw.Twin x = cpptw.Twin(7);
+    int v = 0;
+    expect_error("ambiguous call to 'callres_g1': no candidate ranks better than the others among the visible overloads (callres_g1<...>)") {
+        v = callres_g1(x);
+    }
+    return v;
+}
+
+extern int main() { return exactTie() + crefTie() + genericTie(); }

@@ -4694,8 +4694,11 @@ llvm::Value* LLVMBackend::EmitCxxBaseAdjust(llvm::Value* ptr, uint64_t offsetByt
 {
         if (ptr == nullptr || offsetBytes == 0) return ptr;
         auto* i8 = builder->getInt8Ty();
-        llvm::Value* shifted = builder->CreateGEP(i8, ptr, builder->getInt64(offsetBytes),
-                                                 "cxx.base");
+        llvm::Value* shifted = builder->CreateInBoundsGEP(i8, ptr, builder->getInt64(offsetBytes),
+                                                         "cxx.base");
+        // A global's address is never null: no select, so a global initializer stays constant.
+        if (llvm::isa<llvm::Constant>(ptr) && llvm::isa<llvm::GlobalValue>(llvm::getUnderlyingObject(ptr)))
+            return shifted;
         // The C++ derived-to-base conversion is null-preserving; clang emits the same select.
         llvm::Value* isNull = builder->CreateICmpEQ(
             ptr, llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptr->getType())),
@@ -4739,6 +4742,89 @@ LLVMBackend::CxxBaseRoutes LLVMBackend::CollectCxxBaseRoutes(const std::string& 
         };
         walk(walk, derived, false, true, 0, 0);
         return routes;
+}
+
+bool LLVMBackend::RejectCxxClassPointerStore(const TypeAndValue& dest, const TypeAndValue& src,
+                                             const std::string& destDesc)
+{
+        if (!dest.Pointer || !src.Pointer || dest.IsFunctionPointer || src.IsFunctionPointer
+            || dest.IsArrayView || src.IsArrayView || dest.TypeName == src.TypeName
+            || !IsCxxRecord(dest.TypeName) || !IsCxxRecord(src.TypeName))
+            return false;
+        const int depth = src.ValuePointerDepth();
+        if (depth < 1 || dest.ValuePointerDepth() != depth) return false;
+        const bool destDerives = CollectCxxBaseRoutes(dest.TypeName, src.TypeName, false).Found();
+        const bool srcDerives = depth >= 2
+            && CollectCxxBaseRoutes(src.TypeName, dest.TypeName, false).Found();
+        if (!destDerives && !srcDerives) return false;
+        const std::string srcClass = SpellType(*this, TypeAndValue{ .TypeName = src.TypeName });
+        const std::string destClass = SpellType(*this, TypeAndValue{ .TypeName = dest.TypeName });
+        if (depth == 1)
+            LogError(std::format(
+                "cannot convert '{}' to '{}' for {} implicitly: '{}' is derived from '{}', and a "
+                "base-to-derived pointer conversion needs an explicit cast", SpellType(*this, src),
+                SpellType(*this, dest), destDesc, destClass, srcClass));
+        else
+            LogError(std::format(
+                "cannot convert '{}' to '{}' for {}: a multi-level pointer converts only to the "
+                "same class, '{}' and '{}' differ", SpellType(*this, src), SpellType(*this, dest),
+                destDesc, srcClass, destClass));
+        return true;
+}
+
+llvm::Value* LLVMBackend::LowerCxxClassPointerCast(const TypeAndValue& src,
+                                                   const TypeAndValue& dest, llvm::Value* ptr)
+{
+        if (ptr == nullptr || !ptr->getType()->isPointerTy() || !src.Pointer || !dest.Pointer
+            || src.IsFunctionPointer || dest.IsFunctionPointer || src.IsArrayView
+            || dest.IsArrayView || src.ValuePointerDepth() != 1 || dest.ValuePointerDepth() != 1
+            || src.TypeName == dest.TypeName || !IsCxxRecord(src.TypeName)
+            || !IsCxxRecord(dest.TypeName)
+            || (builder->GetInsertBlock() == nullptr && !llvm::isa<llvm::Constant>(ptr)))
+            return ptr;
+        const std::string srcClass = SpellType(*this, TypeAndValue{ .TypeName = src.TypeName });
+        const std::string destClass = SpellType(*this, TypeAndValue{ .TypeName = dest.TypeName });
+        const std::string castDesc = std::format("cannot cast '{}' to '{}'", SpellType(*this, src),
+                                                 SpellType(*this, dest));
+        if (const CxxBaseRoutes up = CollectCxxBaseRoutes(src.TypeName, dest.TypeName, false);
+            up.Found())
+        {
+            // A C-style cast to a base ignores access, as in C++; a virtual route asks clang.
+            if (!up.NeedsClang()) return EmitCxxBaseAdjust(ptr, up.offset);
+            if (up.nonVirtual > 1)
+            {
+                LogError(std::format("{}: '{}' is an ambiguous base of '{}'", castDesc, destClass,
+                                     srcClass));
+                return ptr;
+            }
+            return LowerCxxPointerToBase(src.TypeName, dest.TypeName, false, ptr,
+                                         SpellType(*this, src), SpellType(*this, dest), "the cast");
+        }
+        const CxxBaseRoutes down = CollectCxxBaseRoutes(dest.TypeName, src.TypeName, false);
+        if (!down.Found()) return ptr;
+        if (down.nonVirtual > 1)
+        {
+            LogError(std::format("{}: '{}' is an ambiguous base of '{}'", castDesc, srcClass,
+                                 destClass));
+            return ptr;
+        }
+        if (down.viaVirtual)
+        {
+            LogError(std::format("{}: '{}' is a virtual base of '{}', so a static downcast cannot "
+                                 "reach the derived object", castDesc, srcClass, destClass));
+            return ptr;
+        }
+        if (down.offset == 0) return ptr;
+        // static_cast to the derived class: step back over the base offset, null stays null.
+        llvm::Value* shifted = builder->CreateInBoundsGEP(
+            builder->getInt8Ty(), ptr, builder->getInt64(-static_cast<int64_t>(down.offset)),
+            "cxx.derived");
+        if (llvm::isa<llvm::Constant>(ptr) && llvm::isa<llvm::GlobalValue>(llvm::getUnderlyingObject(ptr)))
+            return shifted;
+        llvm::Value* isNull = builder->CreateICmpEQ(
+            ptr, llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptr->getType())),
+            "cxx.derived.isnull");
+        return builder->CreateSelect(isNull, ptr, shifted, "cxx.derived.adj");
 }
 
 bool LLVMBackend::IsCxxDerivedToClangBasePointer(const TypeAndValue& from,
@@ -5143,6 +5229,7 @@ llvm::Value* LLVMBackend::AdjustCxxPointerForStore(const TypeAndValue& dest,
         if (value == nullptr || !value->getType()->isPointerTy()) return value;
         if (!dest.Pointer || !src.Pointer || dest.TypeName == src.TypeName) return value;
         if (!IsCxxRecord(dest.TypeName) || !IsCxxRecord(src.TypeName)) return value;
+        if (RejectCxxClassPointerStore(dest, src, destDesc)) return value;
         // A virtual-base or ambiguous route is clang's conversion, never a static offset.
         if (!src.ElemPointer && !dest.ElemPointer
             && CollectCxxBaseRoutes(src.TypeName, dest.TypeName, false).NeedsClang())

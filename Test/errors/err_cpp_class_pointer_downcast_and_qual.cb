@@ -1,0 +1,98 @@
+import cpp "cpp_interop_explicit.h";
+
+// PTRSAFE refusals, as clang++ -std=c++20 decides: an implicit base-to-derived pointer store, a
+// multi-level pointer to another class, [conv.qual] at C++ calls, ambiguous casts, dropped const.
+expect_error("a base-to-derived pointer conversion needs an explicit cast") {
+    PtrSafeD* ptrSafeRetD(PtrSafeF* p) { return p; }
+}
+
+struct PtrSafeCH { PtrSafeD* p = default; };
+int ptrSafeCfD(PtrSafeD* p) { return p->z; }
+int ptrSafeCfPP(PtrSafeF** p) { return (*p)->value; }
+int ptrSafeWf(PtrSafeF* p) { p->value = 1; return 2; }
+PtrSafeF ptrSafeGf = default;
+expect_error("for element 0 of 'ptrSafeGArr' implicitly") {
+    PtrSafeD*[1] ptrSafeGArr = { &ptrSafeGf };
+}
+
+extern int main(int argc, char** argv)
+{
+    bool c = argc > 0;
+    PtrSafeF a = default;
+    PtrSafeD d = default;
+    PtrSafeF* fp = &a;
+    PtrSafeB0* bp = &d;
+    PtrSafeM m = default;
+    PtrSafeD* dp = &d;
+    PtrSafeD** dpp = &dp;
+    PtrSafeF** fpp = &fp;
+    expect_error("'PtrSafeD' is derived from 'PtrSafeF', and a base-to-derived pointer conversion") {
+        PtrSafeD* q1 = &a;
+    }
+    expect_error("for variable 'q2' implicitly") {
+        PtrSafeD* q2 = bp;
+    }
+    expect_error("a base-to-derived pointer conversion needs an explicit cast") {
+        PtrSafeD* q3 = nullptr;
+        q3 = fp;
+    }
+    expect_error("a base-to-derived pointer conversion needs an explicit cast") {
+        PtrSafeCH ch = default;
+        ch.p = fp;
+    }
+    expect_error("a base-to-derived pointer conversion needs an explicit cast") {
+        PtrSafeHold h = default;
+        h.p = fp;
+    }
+    expect_error("a base-to-derived pointer conversion needs an explicit cast") {
+        PtrSafeD* q4 = !c ? &a : &d;
+    }
+    expect_error("no overload of 'ptrSafeCfD' matches") {
+        int r1 = ptrSafeCfD(fp);
+    }
+    expect_error("a multi-level pointer converts only to the same class, 'PtrSafeD' and 'PtrSafeF' differ") {
+        PtrSafeF** q5 = dpp;
+    }
+    expect_error("no overload of 'ptrSafeCfPP' matches") {
+        int r2 = ptrSafeCfPP(dpp);
+    }
+    expect_error("of type 'const PtrSafeF **': a multi-level pointer converts only to the same class") {
+        int r3 = ptrsafe_ccpp(fpp);
+    }
+    expect_error("no overload of 'ptrsafe_cb' matches") {
+        int r4 = ptrsafe_cb(fpp);
+    }
+    expect_error("no overload of 'ptrsafe_cp' matches") {
+        int r5 = ptrsafe_cp(dpp);
+    }
+    expect_error("'PtrSafeF' is an ambiguous base of 'PtrSafeM'") {
+        PtrSafeF* q6 = (PtrSafeF*)&m;
+    }
+    expect_error("'PtrSafeF' is an ambiguous base of 'PtrSafeM'") {
+        PtrSafeF* q7 = (PtrSafeL*)&m;
+        PtrSafeM* q8 = (PtrSafeM*)q7;
+    }
+    expect_error("cannot convert '(const PtrSafeD)*' to 'PtrSafeF*': the conversion discards const") {
+        PtrSafeF* q9 = ptrsafe_cd(&d);
+    }
+    expect_error("the conversion discards const") {
+        PtrSafeF* q12 = nullptr;
+        q12 = ptrsafe_cd(&d);
+    }
+    expect_error("cannot convert '(const PtrSafeD)*' to 'PtrSafeB0*'") {
+        PtrSafeB0* q13 = ptrsafe_cd(&d);
+    }
+    expect_error("cannot pass argument 1 ('(const PtrSafeD)*') to parameter 'p' ('PtrSafeF*'): the conversion discards const") {
+        int r7 = ptrSafeWf(ptrsafe_cd(&d));
+    }
+    expect_error("for element 1 of 'ar1' implicitly: 'PtrSafeD' is derived from 'PtrSafeF'") {
+        PtrSafeD*[2] ar1 = { dp, fp };
+    }
+    expect_error("for element 0 of 'ar2': a multi-level pointer converts only to the same class") {
+        PtrSafeF**[1] ar2 = { dpp };
+    }
+    expect_error("for field 'PtrSafeCH.p' implicitly") {
+        PtrSafeCH ch2 = { .p = fp };
+    }
+    return 0;
+}

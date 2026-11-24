@@ -706,8 +706,8 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpressionImpl(CFlatParser::Ca
                 && !namedVar.TypeAndValue.IsArrayView;
             const bool fixedArraySource = LLVMBackend::IsCxxFixedArrayArgument(namedVar);
             const bool cxxClassSource = compiler->IsCxxRecord(namedVar.TypeAndValue.TypeName);
-            // A scalar operand direct-initializes a C++ class: `(R)(7)` is `R(7)`. Only a class
-            // with constructors qualifies.
+            // A scalar (or char*) operand direct-initializes a C++ class: `(R)(7)` is `R(7)`. Only a
+            // class with constructors qualifies.
             const bool scalarSource = namedVar.Primary != nullptr && !namedVar.TypeAndValue.Pointer
                 && !namedVar.TypeAndValue.IsArrayView
                 && (namedVar.Primary->getType()->isIntegerTy()
@@ -722,7 +722,7 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpressionImpl(CFlatParser::Ca
                 && !destTypeName.Pointer && !destTypeName.ElemPointer
                 && !destTypeName.IsArrayView
                 && (compiler->IsForeignNontrivialCxxClass(destTypeName.TypeName)
-                    || ((scalarSource || pointerSource)
+                    || ((scalarSource || pointerSource || charPointerSource)
                         && compiler->IsForeignCxxClassWithConstructors(destTypeName.TypeName))
                     || (cxxClassSource && compiler->IsCxxRecord(destTypeName.TypeName)))
                 && namedVar.TypeAndValue.TypeName != destTypeName.TypeName)
@@ -992,6 +992,15 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpressionImpl(CFlatParser::Ca
                 && !destTypeName.IsFunctionPointer && !destTypeName.IsArrayView;
             namedVar.Primary = compiler->CreateCast(namedVar.Primary, type, srcIsSigned,
                 destTypeName.IsUnsignedInteger() != -1);
+            // Between related C++ classes the cast is static_cast: the address moves to the subobject.
+            if (!dataNullSource)
+                if (llvm::Value* adjusted = compiler->LowerCxxClassPointerCast(
+                        namedVar.TypeAndValue, destTypeName, namedVar.Primary);
+                    adjusted != namedVar.Primary)
+                {
+                    namedVar.Primary = adjusted;
+                    namedVar.Storage = nullptr;
+                }
             namedVar.TypeAndValue = destTypeName;
             namedVar.IsDataNullCast = dataNullCast;
             if (castOfTempUniqueField)

@@ -515,6 +515,12 @@
       "f",
       "it returns an owning 'move' pointer but the slot's return is borrowed (declare the slot's return 'move')"
     ],
+    "cannotpassthispointe...structarg3explicitly37352f03aba8cccd": [
+      "convPtrOvBool",
+      "convPtrOvBool(bool)",
+      "ConvPtrR",
+      "ConvPtrR"
+    ],
     "cannotpasstocfunctio...mbdaoranamedfunction48dd5fe854279d60": [
       "cmp",
       "1",
@@ -2181,6 +2187,7 @@
     "cannotpassowningheap...quetdoesnotownarrays57d0d857da621597": "cannot pass owning heap array '{0}' to parameter '{1}' of '{2}': unique<T> does not own arrays",
     "cannotpassthisexpressiontoarg0arg1": "cannot pass this expression to '{0}'; {1}",
     "cannotpassthisfuncti...etoparameterarg0arg1d3d64fd013bab604": "cannot pass this function-pointer value to parameter '{0}': {1}",
+    "cannotpassthispointe...structarg3explicitly37352f03aba8cccd": "cannot pass this pointer to '{0}': C++ would call '{1}' (pointer -> bool beats the converting constructor of '{2}'), but CFlat call arguments do not convert a pointer to bool; compare it with nullptr, or construct '{3}' explicitly",
     "cannotpasstocfunctio...mbdaoranamedfunction48dd5fe854279d60": "cannot pass to C function-pointer parameter '{0}': this lambda captured {1} {2} [{3}]. A C callback is a bare code pointer and cannot carry captured state - pass a non-capturing lambda or a named function.",
     "cannotpasstocfunctio...mbdaoranamedfunction7fc3eb38b29ed908": "cannot pass to C function-pointer parameter '{0}': this lambda captured {1} {2} [{3}, ... (and {4} more)]. A C callback is a bare code pointer and cannot carry captured state - pass a non-capturing lambda or a named function.",
     "cannotpasstocfunctio...mbdaoranamedfunctionf611c7976a8f6c79": "cannot pass to C function-pointer parameter '{0}': this 'function<>' value may store captured state. A C callback is a bare code pointer - pass a non-capturing lambda or a named function.",

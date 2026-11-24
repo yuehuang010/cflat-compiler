@@ -15,3 +15,8 @@ own wrapper call first, so the member is always move-constructed. The only C++-v
 spells the member's constructor arguments (`::new (p0) CM(Cnt(p1), p2)`, zero moves per the clang oracle), which
 needs deferred argument evaluation at every caller (declaration, `new`, brace, nested, expression, ternary phi).
 Repro: `scratch/repro_keep/parenagg/min.cb` (5 with clang, 6 in CFlat).
+
+Brace shapes (CONSTJOIN review, 2026-11-19; r/sig, sig = ctor e5 + copy e4 + move e3 + asg e1-e2 + dtor; values = clang):
+`Holder{ mkc(5) }` (const T mkc()) 110006 vs clang 100005 (+1 copy); `CHHolder{ CHolder(mkc(5)) }` 102007 vs
+101006 (+1 move); `Holder{ c ? mk(5) : ref(x) }` 11006 vs 10005 (+1 move). Same gap: `CHHolder{ CHolder(move k) }`
+(k const) 12007 vs 11006 since CONSTJOIN r2 (copies k, then +1 move).
