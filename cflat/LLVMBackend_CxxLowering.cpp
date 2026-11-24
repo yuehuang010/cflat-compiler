@@ -2853,8 +2853,10 @@ bool LLVMBackend::IsCxxConvertingTemporaryForRvalueRef(const NamedVariable& arg,
         TypeAndValue referent = param;
         referent.Pointer = referent.IsAlias = referent.IsRvalueRef = false;
         referent.PointerDepth = 0;
+        // `operator X&&()` binds its xvalue result directly; clang's probe below still decides.
         if (!viaCtor && !constClassSource && (argType.Pointer || argType.TypeName.empty()
-                         || CxxConversionOperatorTo(argType.TypeName, referent, false).empty()))
+                         || (CxxConversionOperatorTo(argType.TypeName, referent, false).empty()
+                             && CxxConversionOperatorTo(argType.TypeName, param, false).empty())))
             return false;
         // Clang decides: `X&& r = source;` on the source's real cv and category (ambiguity between
         // a ctor and an operator, a const source into a `T(S&)` ctor, explicit, constraints).
@@ -2983,6 +2985,89 @@ std::string LLVMBackend::CxxRvalueRefBindRefusal(const NamedVariable& arg, const
         return std::format("no implicit conversion from '{}' binds '{} &&' (clang: {})",
                            parameter.ends_with(" &") ? source : parameter, targetSpelling,
                            known->second.second);
+}
+
+// A class source whose only reference conversion to the parameter's class sits in a private /
+// protected base: clang refuses the binding as an access error. Its text, or empty.
+std::string LLVMBackend::CxxInaccessibleReferenceConversionRefusal(const NamedVariable& arg,
+                                                                   const TypeAndValue& param)
+{
+        if ((!param.IsAlias && !(param.IsRvalueRef && param.Pointer)) || param.ElemPointer
+            || param.IsCxxRefToPointer || !IsCxxRecord(param.TypeName))
+            return {};
+        const TypeAndValue argType = InferImplicitCxxArgumentType(arg, *this);
+        if (argType.Pointer || !IsCxxRecord(argType.TypeName) || argType.TypeName == param.TypeName
+            || IsCxxBaseOf(param.TypeName, argType.TypeName))
+            return {};
+        std::set<std::string> visited;
+        auto hidden = [&](auto&& self, const std::string& recordName, bool inaccessible) -> bool {
+            if (!visited.insert(recordName).second) return false;
+            EnsureCxxRecordProjected(recordName, false);
+            auto record = cxxRecordEntries_.find(recordName);
+            if (record == cxxRecordEntries_.end()) return false;
+            if (inaccessible)
+                for (const auto& member : record->second.members)
+                {
+                    TypeAndValue ret;
+                    if (member.isConversion && !member.isExplicit && !member.isDeleted
+                        && member.retType.find('&') != std::string::npos
+                        && MapCTypeToTypeAndValue(member.retType, ret, true)
+                        && (ret.TypeName == param.TypeName || IsCxxBaseOf(param.TypeName, ret.TypeName)))
+                        return true;
+                }
+            const std::vector<cflat_cinterop::RawCxxBase> bases = record->second.bases;
+            for (const auto& base : bases)
+            {
+                const std::string baseName = ResolveCxxBaseRecordName(base);
+                if (!baseName.empty()
+                    && self(self, baseName, inaccessible || base.access != cflat_cinterop::AccessPublic))
+                    return true;
+            }
+            return false;
+        };
+        if (!hidden(hidden, argType.TypeName, false)) return {};
+        std::string parameter;
+        std::string targetSpelling;
+        std::string key = CxxRvalueRefBindKey(arg, param, parameter, targetSpelling);
+        if (key.empty()) return {};
+        const std::string reference = param.IsRvalueRef ? targetSpelling + " &&"
+            : (param.CxxConstRef() ? "const " : "") + targetSpelling + " &";
+        key = "refbind|" + reference + "|" + key;
+        if (auto known = cxxRvalueRefBindVerdicts_.find(key); known != cxxRvalueRefBindVerdicts_.end())
+            return known->second.second;
+        auto groupIt = cxxTypeOwnerGroup_.find(param.TypeName);
+        if (groupIt == cxxTypeOwnerGroup_.end()) return {};
+        std::string generatedTypeSource;
+        std::set<size_t> dependencySet;
+        std::unordered_set<std::string> incompleteTypes;
+        GeneratedCxxDefinitionsFor({ param.TypeName, argType.TypeName }, generatedTypeSource,
+                                   dependencySet, incompleteTypes);
+        std::vector<size_t> dependencies(dependencySet.begin(), dependencySet.end());
+        std::unordered_set<std::string> visitedTypes;
+        CollectCxxTypeOwnerGroups(param.TypeName, dependencies, visitedTypes);
+        CollectCxxTypeOwnerGroups(argType.TypeName, dependencies, visitedTypes);
+        CxxRequestGroup group = MakeCxxRequestGroup(groupIt->second, dependencies);
+        if (group.headers.empty()) return {};
+        const std::string wrapperName = std::format("__cflat_refbind_{:016x}", HashWrapperKey(key));
+        const std::string wrapperSource = "extern \"C\" __attribute__((weak)) void " + wrapperName
+            + "(" + parameter + " p0) { " + reference + " r = p0; (void)r; }\n";
+        std::string error;
+        bool verdict = true;
+        {
+            CxxRequestGroupScope groupScope(*this, &group);
+            CSigEntry bound;
+            verdict = RequestGeneratedCxxWrapper(group, generatedTypeSource + wrapperSource,
+                                                 wrapperName, "REFERENCE_BIND", bound, error,
+                                                 incompleteTypes.empty());
+        }
+        const std::string line = verdict ? std::string() : FirstCxxErrorLine(error);
+        const std::string message = line.empty() ? std::string()
+            : std::format("no implicit conversion from '{}' binds '{}' (clang: {})",
+                          parameter.ends_with(" &") ? parameter.substr(0, parameter.size() - 2)
+                                                    : parameter,
+                          reference, line);
+        cxxRvalueRefBindVerdicts_.emplace(key, std::pair{ verdict, message });
+        return message;
 }
 
 std::string LLVMBackend::DescribeCxxImplicitArgumentBlock(const NamedVariable& arg,
@@ -6085,7 +6170,16 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
         if (derivedResult != nullptr) *derivedResult = false;
         if (sourceTypeName.empty() || dest.TypeName.empty() || dest.TypeName == "void") return {};
         if (sourceTypeName == dest.TypeName) return {};
-        const bool classReferenceTarget = dest.IsAlias && IsCxxRecord(dest.TypeName);
+        // `X&&` is pointer-shaped without IsAlias; it binds a reference result like `const X&`.
+        const bool rvalueClassReferenceTarget = dest.IsRvalueRef && dest.Pointer && !dest.IsAlias
+            && !dest.ElemPointer && !dest.IsCxxRefToPointer && IsCxxRecord(dest.TypeName);
+        const bool classReferenceTarget = (dest.IsAlias && IsCxxRecord(dest.TypeName))
+            || rvalueClassReferenceTarget;
+        // [dcl.init.ref] 5: a reference-related source (X or derived) binds directly, never through
+        // a conversion function, even when it declares one.
+        if (classReferenceTarget && IsCxxRecord(sourceTypeName)
+            && IsCxxBaseOf(dest.TypeName, sourceTypeName))
+            return {};
         const bool classValueTarget = !dest.Pointer && !dest.IsAlias
             && IsCxxRecord(dest.TypeName);
         if (dest.ElemPointer
@@ -6130,11 +6224,18 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
                     SpellType(*this, TypeAndValue{ .TypeName = spelling, .Pointer = true });
                 std::vector<std::string> result{ "operator " + cflatSpelling,
                                                  sourceTypeName + ".operator " + cflatSpelling };
-                if (auto record = cxxRecordEntries_.find(sourceTypeName);
-                    record != cxxRecordEntries_.end())
+                // Reference conversion operators of PUBLIC bases are inherited ([class.conv.fct]);
+                // a non-public base's operator is inaccessible and never listed.
+                std::set<std::string> visitedRecords;
+                auto collect = [&](auto&& again, const std::string& recordName) -> void {
+                    if (!visitedRecords.insert(recordName).second) return;
+                    auto record = cxxRecordEntries_.find(recordName);
+                    if (record == cxxRecordEntries_.end()) return;
                     for (const auto& member : record->second.members)
                     {
-                        if (!member.isConversion) continue;
+                        if (!member.isConversion
+                            || (member.isExplicit && !allowExplicit && recordName != sourceTypeName))
+                            continue;
                         TypeAndValue ret;
                         if (!self->MapCTypeToTypeAndValue(member.retType, ret, true)
                             || member.retType.find('&') == std::string::npos
@@ -6143,7 +6244,21 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
                                 && !IsCxxBaseOf(spelling, ret.TypeName)))
                             continue;
                         result.push_back(member.name);
+                        if (recordName != sourceTypeName)
+                        {
+                            result.push_back(recordName + "." + member.name);
+                            result.push_back(CxxConstTwinName(member.name));
+                        }
                     }
+                    const std::vector<cflat_cinterop::RawCxxBase> bases = record->second.bases;
+                    for (const auto& base : bases)
+                        if (base.access == cflat_cinterop::AccessPublic)
+                        {
+                            const std::string baseName = ResolveCxxBaseRecordName(base);
+                            if (!baseName.empty()) again(again, baseName);
+                        }
+                };
+                collect(collect, sourceTypeName);
                 return result;
             }
             TypeAndValue targetType;
@@ -6253,13 +6368,19 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
                 {
                     // A const referent (`operator const X&`) never binds a mutable X& or X&&.
                     if (ret.CxxConstRef() && !dest.CxxConstRef()) return false;
-                    if (ret.TypeName == dest.TypeName && !ret.ElemPointer
-                        && ret.IsAlias)
+                    // [dcl.init.ref]: `X&&` binds only an xvalue result, a mutable `X&` only an
+                    // lvalue one; `const X&` binds either.
+                    const bool lvalueResult = ret.IsAlias && !ret.IsRvalueRef;
+                    const bool xvalueResult = ret.IsRvalueRef && ret.Pointer && !ret.IsAlias;
+                    const bool resultBinds = rvalueClassReferenceTarget ? xvalueResult
+                        : dest.CxxConstRef() ? lvalueResult || xvalueResult : lvalueResult;
+                    if (!resultBinds || ret.ElemPointer) return false;
+                    if (ret.TypeName == dest.TypeName)
                     {
                         returnTypeName = ret.TypeName;
                         return true;
                     }
-                    if (ret.IsAlias && IsCxxRecord(ret.TypeName)
+                    if (IsCxxRecord(ret.TypeName)
                         && IsCxxRecord(dest.TypeName) && ret.TypeName != dest.TypeName
                         && IsCxxBaseOf(dest.TypeName, ret.TypeName))
                     {
@@ -6589,7 +6710,9 @@ bool LLVMBackend::ApplyCxxConversionOperator(NamedVariable& nv, const TypeAndVal
         // A scalar `T&` return is an address too (MIX4: `operator const double&()`).
         const bool scalarRefReturn = conversionReturnType.IsCxxRef()
             && !conversionReturnType.IsCxxRefToPointer && !IsCxxRecord(dest.TypeName);
-        if (!dest.Pointer && (conversionReturnType.Pointer || scalarRefReturn)
+        // A class reference dest (a member's `const X&` arrives without Pointer) binds below.
+        const bool classReferenceDest = (dest.IsAlias || dest.IsRvalueRef) && IsCxxRecord(dest.TypeName);
+        if (!dest.Pointer && !classReferenceDest && (conversionReturnType.Pointer || scalarRefReturn)
             && conversionReturnType.TypeName == dest.TypeName
             && result->getType()->isPointerTy())
         {
@@ -6627,10 +6750,21 @@ bool LLVMBackend::ApplyCxxConversionOperator(NamedVariable& nv, const TypeAndVal
             return true;
         }
 
-        if (dest.IsAlias && IsCxxRecord(dest.TypeName)
-            && conversionReturnType.IsAlias
+        // A reference result (`X&` or `X&&`) is the referent's address: bind it, never copy.
+        if (classReferenceDest
+            && (conversionReturnType.IsAlias
+                || (conversionReturnType.IsRvalueRef && conversionReturnType.Pointer))
             && result->getType()->isPointerTy())
         {
+            // A member's `D&` result arrives without Pointer, so the base adjust above skipped it.
+            if (!(dest.Pointer && conversionReturnType.Pointer))
+            {
+                TypeAndValue destPointer = dest;
+                TypeAndValue resultPointer = conversionReturnType;
+                destPointer.Pointer = resultPointer.Pointer = true;
+                result = AdjustCxxPointerForStore(destPointer, resultPointer, result,
+                                                  "the conversion result");
+            }
             nv.Primary = dest.IsRvalueRef ? result : nullptr;
             nv.Storage = dest.IsRvalueRef ? nullptr : result;
             nv.BaseType = GetType(const_cast<TypeAndValue&>(dest));

@@ -6265,8 +6265,8 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
                                                  ambiguousCandidates);
             }
             const std::string argumentType = SpellType(*this, nv.TypeAndValue);
-            const bool referenceConversionOperator = param.IsAlias
-                && !param.IsCxxRefToPointer && IsCxxRecord(param.TypeName)
+            const bool referenceConversionOperator = (param.IsAlias || param.IsRvalueRef)
+                && !param.IsCxxRefToPointer && !param.ElemPointer && IsCxxRecord(param.TypeName)
                 && !nv.TypeAndValue.Pointer
                 && !CxxConversionOperatorTo(nv.TypeAndValue.TypeName, param, false,
                     nullptr, nullptr, nullptr, &nv.TypeAndValue).empty();

@@ -16084,6 +16084,212 @@ int testMix19TernaryMoveJoin()
     return passed;
 }
 
+/*
+ * STRJOIN: `?:` move joins of strings and dtor structs. A moved arm's buffer is owned by the
+ * join (never deep-copied), an assignment adopts the owned join, and `_ =` drops a moved
+ * struct leaf. A bare all-move statement keeps the bytes in the sources; a mixed one drops.
+ */
+int sjDtors = 0;
+struct SjDT { int* p = default; ~SjDT() { if (p != nullptr) { sjDtors++; delete p; } } };
+struct SjHolder { SjDT d = default; };
+int sjSeen = -1;
+
+void sjDiscardMixed(bool c)
+{
+    Mix19Pair o = default;
+    o.s = mix19Text();
+    Mix19Pair q = default;
+    q.s = mix19Text();
+    _ = c ? move o.s : q.s;
+    sjSeen = o.s.length() * 1000 + q.s.length();
+}
+
+void sjDeclMixedOtherOrder(bool c)
+{
+    Mix19Pair o = default;
+    o.s = mix19Text();
+    Mix19Pair q = default;
+    q.s = mix19Text();
+    string r = c ? q.s : move o.s;
+    sjSeen = r.length() * 1000000 + o.s.length() * 1000 + q.s.length();
+}
+
+void sjDiscardNested(bool c, bool d)
+{
+    Mix19Pair o = default;
+    o.s = mix19Text();
+    o.t = mix19Text();
+    Mix19Pair q = default;
+    q.s = mix19Text();
+    _ = c ? move o.s : (d ? move o.t : move q.s);
+    sjSeen = o.s.length() * 1000000 + o.t.length() * 1000 + q.s.length();
+}
+
+void sjAssignMoves(bool c)
+{
+    Mix19Pair o = default;
+    o.s = mix19Text();
+    Mix19Pair q = default;
+    q.s = mix19Text();
+    string r = mix19Text();
+    r = c ? move o.s : move q.s;
+    sjSeen = r.length() * 1000000 + o.s.length() * 1000 + q.s.length();
+}
+
+void sjAssignMixedField(bool c)
+{
+    Mix19Pair o = default;
+    o.s = mix19Text();
+    Mix19Pair q = default;
+    q.s = mix19Text();
+    Mix19Pair t = default;
+    t.s = mix19Text();
+    t.s = c ? move o.s : q.s;
+    sjSeen = t.s.length() * 1000000 + o.s.length() * 1000 + q.s.length();
+}
+
+void sjBareMoves(bool c)
+{
+    Mix19Pair o = default;
+    o.s = mix19Text();
+    Mix19Pair q = default;
+    q.s = mix19Text();
+    c ? move o.s : move q.s;
+    sjSeen = o.s.length() * 1000 + q.s.length();
+}
+
+void sjBareMixed(bool c)
+{
+    Mix19Pair o = default;
+    o.s = mix19Text();
+    Mix19Pair q = default;
+    q.s = mix19Text();
+    c ? move o.s : q.s;
+    sjSeen = o.s.length() * 1000 + q.s.length();
+}
+
+void sjDtDiscardMoves(bool c)
+{
+    SjHolder o = default;
+    o.d.p = new int(1);
+    SjHolder q = default;
+    q.d.p = new int(2);
+    _ = c ? move o.d : move q.d;
+    sjSeen = (o.d.p == nullptr ? 0 : 1) * 10 + (q.d.p == nullptr ? 0 : 1);
+}
+
+void sjDtDiscardMixed(bool c)
+{
+    SjHolder o = default;
+    o.d.p = new int(1);
+    SjHolder q = default;
+    q.d.p = new int(2);
+    _ = c ? move o.d : q.d;
+    sjSeen = (o.d.p == nullptr ? 0 : 1) * 10 + (q.d.p == nullptr ? 0 : 1);
+}
+
+void sjDtDiscardNested(bool c, bool d)
+{
+    SjHolder o = default;
+    o.d.p = new int(1);
+    SjHolder q = default;
+    q.d.p = new int(2);
+    SjHolder x = default;
+    x.d.p = new int(3);
+    _ = (c ? move o.d : (d ? move q.d : move x.d));
+    sjSeen = (o.d.p == nullptr ? 0 : 1) * 100 + (q.d.p == nullptr ? 0 : 1) * 10 + (x.d.p == nullptr ? 0 : 1);
+}
+
+void sjDtBareNested(bool c, bool d)
+{
+    SjHolder o = default;
+    o.d.p = new int(1);
+    SjHolder q = default;
+    q.d.p = new int(2);
+    SjHolder x = default;
+    x.d.p = new int(3);
+    c ? move o.d : (d ? move q.d : move x.d);
+    sjSeen = (o.d.p == nullptr ? 0 : 1) * 100 + (q.d.p == nullptr ? 0 : 1) * 10 + (x.d.p == nullptr ? 0 : 1);
+}
+
+int testStrjoinTernaryMoveJoin()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    int len = mix19Text().length();
+    i64 before = (i64)HeapAudit.reportLeaks();
+    sjDiscardMixed(true);
+    passed += Test("strjoin discard mixed move selected leaks nothing", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    passed += Test("strjoin discard mixed move selected values", sjSeen, len);
+
+    before = (i64)HeapAudit.reportLeaks();
+    sjDeclMixedOtherOrder(false);
+    passed += Test("strjoin decl mixed other order leaks nothing", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    passed += Test("strjoin decl mixed other order values", sjSeen, len * 1000000 + len);
+
+    before = (i64)HeapAudit.reportLeaks();
+    sjDiscardNested(true, true);
+    passed += Test("strjoin discard nested outer move leaks nothing", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    passed += Test("strjoin discard nested outer move values", sjSeen, len * 1000 + len);
+    before = (i64)HeapAudit.reportLeaks();
+    sjDiscardNested(false, false);
+    passed += Test("strjoin discard nested inner move leaks nothing", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    passed += Test("strjoin discard nested inner move values", sjSeen, len * 1000000 + len * 1000);
+
+    before = (i64)HeapAudit.reportLeaks();
+    sjAssignMoves(true);
+    sjAssignMoves(false);
+    passed += Test("strjoin assign move join leaks nothing", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    passed += Test("strjoin assign move join values", sjSeen, len * 1000000 + len * 1000);
+
+    before = (i64)HeapAudit.reportLeaks();
+    sjAssignMixedField(true);
+    sjAssignMixedField(false);
+    passed += Test("strjoin assign mixed field join leaks nothing", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    passed += Test("strjoin assign mixed field join values", sjSeen, len * 1000000 + len * 1000 + len);
+
+    before = (i64)HeapAudit.reportLeaks();
+    sjBareMoves(true);
+    passed += Test("strjoin bare move join leaks nothing", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    passed += Test("strjoin bare move join keeps sources", sjSeen, len * 1000 + len);
+    before = (i64)HeapAudit.reportLeaks();
+    sjBareMixed(true);
+    passed += Test("strjoin bare mixed join leaks nothing", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    passed += Test("strjoin bare mixed join drops moved", sjSeen, len);
+
+    sjDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    sjDtDiscardMoves(true);
+    sjDtDiscardMoves(false);
+    passed += Test("strjoin dtor discard move join leaks nothing", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    passed += Test("strjoin dtor discard move join dtors", sjDtors, 4);
+    passed += Test("strjoin dtor discard move join values", sjSeen, 10);
+
+    sjDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    sjDtDiscardMixed(true);
+    passed += Test("strjoin dtor discard mixed move selected leaks nothing", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    passed += Test("strjoin dtor discard mixed move selected dtors", sjDtors, 2);
+    sjDtors = 0;
+    sjDtDiscardMixed(false);
+    passed += Test("strjoin dtor discard mixed place selected dtors", sjDtors, 2);
+    passed += Test("strjoin dtor discard mixed place selected values", sjSeen, 11);
+
+    sjDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    sjDtDiscardNested(false, false);
+    passed += Test("strjoin dtor discard nested leaks nothing", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    passed += Test("strjoin dtor discard nested dtors", sjDtors, 3);
+    passed += Test("strjoin dtor discard nested values", sjSeen, 110);
+
+    sjDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    sjDtBareNested(false, true);
+    passed += Test("strjoin dtor bare nested leaks nothing", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    passed += Test("strjoin dtor bare nested keeps sources", sjSeen, 111);
+    return passed;
+}
+
 // `move` of a BORROWED parameter transfers nothing: nulling the callee's copy leaves the CALLER
 // the sole owner. Neither helper may adopt the join - the pointee is still the caller's, and
 // freeing it here destroys a live object the caller frees again at its own scope exit.
@@ -20044,6 +20250,17 @@ void fe2FieldSinkParam(unique Resource* q)
     t.p = p;
 }
 void fe2RawSink(move Resource* q) { q->id = q->id + 1; }
+// Records the id it consumed: a '?:' / '??' foreach element arm into a move sink.
+int fe2TernSunk = 0;
+void fe2TernSink(move Resource* q) { if (q != nullptr) fe2TernSunk = fe2TernSunk + q->id; }
+// The same sinks over a collection reached through a pointer parameter: the slot is the pointee's buffer.
+void fe2PtrListDirectSink(list<unique Resource*>* elements) { for (unique Resource* p in elements) fe2TernSink(p); }
+void fe2PtrListTernSink(list<unique Resource*>* elements) { for (Resource* p in elements) fe2TernSink(fe2PriorYes ? p : nullptr); }
+void fe2PtrArrayCoalesceSink(array<unique Resource*>* arr) { for (unique Resource* p in arr) fe2TernSink(p ?? nullptr); }
+void fe2PtrListAdopt(list<unique Resource*>* elements, Fe2FieldHolder* t) { for (unique Resource* p in elements) t->p = p; }
+// A range over a GLOBAL collection pointer iterates the pointee (it ran zero iterations).
+list<unique Resource*>* fe2GlobalResList = nullptr;
+list<int>* fe2GlobalIntList = nullptr;
 Resource* fe2SameNameGlobal = nullptr;
 Resource* fe2SameNameGet() { return fe2SameNameGlobal; }
 void fe2RebindCapSink(Resource* q) { Lambda<void()> g = () => { q = new Resource(); fe2RawSink(q); }; g(); }
@@ -20879,6 +21096,9 @@ extern int main()
     passed += testMix19TernaryMoveJoin();
     total += 15;
 
+    passed += testStrjoinTernaryMoveJoin();
+    total += 28;
+
     passed += testUniqueFieldStoreRemedies();
     total += 29;
 
@@ -21354,7 +21574,7 @@ extern int main()
     total += 21;
 
     passed += testC15DataMutHeap();
-    total += 83;
+    total += 115;
     total += 12;
     total += 6;
 
@@ -26801,6 +27021,162 @@ int testC15DataMutHeap()
     fe2SameNameGlobal = new Resource();
     fe2SameNameCapSink(nullptr);
     passed += Test("fe2_capture_same_name_local_sink_dtor_once", dtorCount, 1);
+
+    // A 'unique' loop declaration over a raw list: the list does not own the element, so the captured
+    // sink is accepted like the direct form (the collection's element type decides, not the declaration).
+    dtorCount = 0;
+    {
+        list<Resource*> rawElems = default;
+        rawElems.add(new Resource());
+        for (unique Resource* p in rawElems)
+        {
+            Lambda<void()> g = () => { fe2RawSink(p); };
+            g();
+        }
+    }
+    passed += Test("fe2_capture_unique_decl_raw_list_sink_dtor_once", dtorCount, 1);
+
+    // '?:' / '??' naming the foreach element into a move sink: the taken arm nulls the slot before the
+    // call, like the direct sink(p); the container then frees nothing twice.
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        list<unique Resource*> elements = default;
+        elements.add(fe2GrowResource(31));
+        elements.add(fe2GrowResource(32));
+        elements.add(fe2GrowResource(33));
+        int i = 0;
+        for (unique Resource* p in elements)
+        {
+            fe2TernSink(i == 1 ? p : nullptr);
+            i++;
+        }
+        passed += Test("fe2_tern_sink_list_taken_slot_null", elements.get(1) == nullptr, true);
+        passed += Test("fe2_tern_sink_list_untaken_slots_kept",
+            elements.get(0) != nullptr && elements.get(2) != nullptr, true);
+        passed += Test("fe2_tern_sink_list_dtor_loop", dtorCount, 1);
+    }
+    passed += Test("fe2_tern_sink_list_sunk", fe2TernSunk, 32);
+    passed += Test("fe2_tern_sink_list_dtor_once", dtorCount, 3);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        list<unique Resource*> elements = default;
+        elements.add(fe2GrowResource(34));
+        for (Resource* p in elements)
+            fe2TernSink(fe2PriorYes ? nullptr : p);
+        passed += Test("fe2_tern_sink_raw_decl_untaken_slot_kept", elements.get(0) != nullptr, true);
+        for (Resource* p in elements)
+            fe2TernSink(p ?? nullptr);
+        passed += Test("fe2_coalesce_sink_raw_decl_slot_null", elements.get(0) == nullptr, true);
+    }
+    passed += Test("fe2_coalesce_sink_raw_decl_sunk", fe2TernSunk, 34);
+    passed += Test("fe2_coalesce_sink_raw_decl_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        array<unique Resource*> arr = default;
+        arr.init(2);
+        arr.set(0, fe2GrowResource(35));
+        arr.set(1, fe2GrowResource(36));
+        for (unique Resource* p in arr)
+            fe2TernSink(fe2PriorYes ? p : nullptr);
+        passed += Test("fe2_tern_sink_array_slots_null", arr.get(0) == nullptr && arr.get(1) == nullptr, true);
+    }
+    passed += Test("fe2_tern_sink_array_sunk", fe2TernSunk, 71);
+    passed += Test("fe2_tern_sink_array_dtor_once", dtorCount, 2);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        unique Resource*[2] fixedElems = { nullptr, nullptr };
+        fixedElems[0] = fe2GrowResource(37);
+        fixedElems[1] = fe2GrowResource(38);
+        for (unique Resource* p in fixedElems)
+            fe2TernSink(p ?? nullptr);
+        passed += Test("fe2_coalesce_sink_fixed_slots_null", fixedElems[0] == nullptr && fixedElems[1] == nullptr, true);
+    }
+    passed += Test("fe2_coalesce_sink_fixed_sunk", fe2TernSunk, 75);
+    passed += Test("fe2_coalesce_sink_fixed_dtor_once", dtorCount, 2);
+
+    // A raw list does not own its element; the '?:' sink still nulls the slot as the direct form does.
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        list<Resource*> rawElems = default;
+        rawElems.add(new Resource());
+        for (Resource* p in rawElems)
+            fe2TernSink(fe2PriorYes ? p : nullptr);
+        passed += Test("fe2_tern_sink_raw_list_slot_null", rawElems.get(0) == nullptr, true);
+    }
+    passed += Test("fe2_tern_sink_raw_list_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        list<unique Resource*> elements = default;
+        elements.add(fe2GrowResource(41));
+        fe2PtrListDirectSink(&elements);
+        passed += Test("fe2_ptr_list_direct_sink_slot_null", elements.get(0) == nullptr, true);
+        elements.add(fe2GrowResource(42));
+        fe2PtrListTernSink(&elements);
+        passed += Test("fe2_ptr_list_tern_sink_slot_null", elements.get(1) == nullptr, true);
+    }
+    passed += Test("fe2_ptr_list_sink_sunk", fe2TernSunk, 83);
+    passed += Test("fe2_ptr_list_sink_dtor_once", dtorCount, 2);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        array<unique Resource*> arr = default;
+        arr.init(1);
+        arr.set(0, fe2GrowResource(43));
+        fe2PtrArrayCoalesceSink(&arr);
+        passed += Test("fe2_ptr_array_coalesce_sink_slot_null", arr.get(0) == nullptr, true);
+    }
+    passed += Test("fe2_ptr_array_coalesce_sink_sunk", fe2TernSunk, 43);
+    passed += Test("fe2_ptr_array_coalesce_sink_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        Fe2FieldHolder t = default;
+        {
+            list<unique Resource*> elements = default;
+            elements.add(fe2GrowResource(44));
+            fe2PtrListAdopt(&elements, &t);
+            passed += Test("fe2_ptr_list_adopt_slot_null", elements.get(0) == nullptr, true);
+        }
+        passed += Test("fe2_ptr_list_adopt_value", t.p->id, 44);
+        passed += Test("fe2_ptr_list_adopt_dtor_loop", dtorCount, 0);
+    }
+    passed += Test("fe2_ptr_list_adopt_dtor_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        int idSum = 0;
+        list<unique Resource*> elements = default;
+        elements.add(fe2GrowResource(45));
+        elements.add(fe2GrowResource(46));
+        fe2GlobalResList = &elements;
+        for (unique Resource* p in fe2GlobalResList)
+            idSum = idSum + p->id;
+        fe2GlobalResList = nullptr;
+        passed += Test("fe2_global_ptr_list_sum", idSum, 91);
+    }
+    passed += Test("fe2_global_ptr_list_dtor_once", dtorCount, 2);
+    {
+        int intSum = 0;
+        list<int> ints = default;
+        ints.add(3);
+        ints.add(4);
+        fe2GlobalIntList = &ints;
+        for (int x in fe2GlobalIntList)
+            intSum = intSum * 10 + x;
+        fe2GlobalIntList = nullptr;
+        passed += Test("fe2_global_ptr_int_list_sum", intSum, 34);
+    }
     return passed;
 }
 

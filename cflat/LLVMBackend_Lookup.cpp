@@ -1975,3 +1975,27 @@ void LLVMBackend::LogGenericTypeArgsRequired(const std::string& displayName,
         "(expects {}: {}), e.g. {}",
         { displayName, count, names, displayName + "<" + exampleArgs + ">" });
 }
+
+bool LLVMBackend::IsCxxNamespaceFunctionName(const std::string& simpleName) const
+{
+        if (simpleName.empty() || simpleName.find('.') != std::string::npos) return false;
+        const std::string suffix = "." + simpleName;
+        // Only a namespace member is an ADL target; a class's member (template) never is.
+        auto inNamespace = [&](const std::string& name) {
+            if (!name.ends_with(suffix) || name.starts_with("__cflat_")) return false;
+            const std::string owner = name.substr(0, name.size() - suffix.size());
+            return IsCxxNamespace(owner) && !IsCxxRecord(owner);
+        };
+        // A signature whose C++ types are not registered yet is deferred, so only the raw table has it.
+        for (const auto& [name, entries] : cxxFunctionSignatures_)
+            if (inNamespace(name)
+                && std::any_of(entries.begin(), entries.end(), [](const CSigEntry& e) { return e.isCxx; }))
+                return true;
+        for (const auto& [name, symbols] : functionTable)
+            if (inNamespace(name) && std::any_of(symbols.begin(), symbols.end(),
+                    [](const FunctionSymbol& symbol) { return symbol.IsCxx && !symbol.IsMethod; }))
+                return true;
+        for (const auto& [name, templates] : cxxFunctionTemplates_)
+            if (inNamespace(name) && !templates.empty()) return true;
+        return false;
+}

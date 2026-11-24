@@ -1157,12 +1157,17 @@ bool LLVMBackend::CxxBraceDeferredParameterSpelling(const TypeAndValue& type,
         if (!CxxSpellingForCflatType(type.TypeName, base)) return false;
         if (type.Pointer)
         {
-            // Const above the pointee level (`T* const*`) is not spelled on every wrapper path: decline.
-            if ((type.PointeeConstMask() & ~1u) != 0) return false;
-            if (type.PointeeConstBit() && !base.starts_with("const "))
+            // Every pointee level's const is spelled (`char * const *`), as the callable's
+            // function pointer spells it (CxxThinFunctionPointerSpelling).
+            const uint32_t mask = type.PointeeConstMask();
+            if ((type.PointeeConstBit() || (mask & 1u) != 0) && !base.starts_with("const "))
                 base = "const " + base;
-            for (int i = 0; i < std::max(type.ValuePointerDepth(), 1); ++i)
+            const int depth = std::max(type.ValuePointerDepth(), 1);
+            for (int i = 1; i <= depth; ++i)
+            {
                 base += " *";
+                if (i < depth && (mask & TypeAndValue::ConstBitAt(i)) != 0) base += " const";
+            }
         }
         spelling = std::move(base);
         return true;

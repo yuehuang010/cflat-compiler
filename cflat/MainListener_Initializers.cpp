@@ -3394,6 +3394,21 @@ void MainListener::EmitFieldInitializer(
                 compiler->pendingCxxSretForFixedArray_ = true;
                 armFieldSret = true;
             }
+            // RETELIDE: a CFlat callee fed nested calls or temporaries builds its result in the field
+            // slot like a declaration; the call-site guard keeps argument calls off the slot.
+            std::optional<CxxSretResultSlotScope> fieldCallSlot;
+            const void* fieldCallSite = !armFieldSret && destinationIsFresh && !sd.IsUnion
+                && initField != nullptr && !initField->Pointer && !initField->IsAlias
+                && !initField->IsArrayView && initField->ConstArraySize == 0
+                && initField->ConstInnerDimensions.empty()
+                ? CxxSretElementCallSite(fi->assignmentExpression(0), initField->TypeName) : nullptr;
+            if (fieldCallSite != nullptr)
+            {
+                fieldDestination = compiler->CreateCxxFieldGEP(sd, structPtr, initFieldIndex,
+                                                               fieldName + "_sret_init");
+                fieldCallSlot.emplace(compiler, true, fieldCallSite, fieldDestination,
+                                      initField->TypeName);
+            }
             // A fresh C++ class or [immovable] field initialized by a `?:` arms the field slot like a declaration:
             // each selected arm is built in place (C++17 guaranteed elision), never joined and moved.
             const bool armFieldTernary = !armFieldSret && destinationIsFresh && !sd.IsUnion
@@ -3433,8 +3448,10 @@ void MainListener::EmitFieldInitializer(
             if (initField != nullptr)
                 GuardRawPointerIntoOwningTempField(
                     rightNV, *initField, true, initField->IsAlias, fieldName, fi);
-            const bool initializedInPlace = armFieldSret
-                && compiler->pendingCxxSretDest_ == nullptr;
+            const bool initializedInPlace = (armFieldSret
+                && compiler->pendingCxxSretDest_ == nullptr)
+                || (fieldCallSlot.has_value() && fieldCallSlot->Consumed());
+            fieldCallSlot.reset();
             if (armFieldSret)
             {
                 compiler->pendingCxxSretDest_ = nullptr;
@@ -4328,6 +4345,7 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
             // A single C++ call can construct directly in the fresh array slot, matching the
             // scalar declaration path. More complex expressions use the temporary-then-move path.
             bool cxxSretArmed = false;
+            std::optional<CxxSretResultSlotScope> elementCallSlot;
             if (cxxElement)
             {
                 // Per element: a temporary left by an EARLIER element must not mark this one movable.
@@ -4348,6 +4366,9 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                     compiler->pendingCxxSretForFixedArray_ = true;
                     cxxSretArmed = true;
                 }
+                // RETELIDE: a CFlat callee fed nested calls or temporaries builds in the element slot.
+                else if (const void* site = CxxSretElementCallSite(assignment, tv.TypeName))
+                    elementCallSlot.emplace(compiler, true, site, elemPtr, tv.TypeName);
             }
             // A native ctor that may capture `this` builds the element in its slot (one ctor call).
             else if (!cxxElement && moveExpr == nullptr && !fixedElemTV.Pointer
@@ -4377,8 +4398,10 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
             if (std::string why = compiler->FuncPtrValueOwnershipReason(nv, fixedElemTV); !why.empty())
                 LogErrorContext(assignment, std::format(
                     "incompatible function pointer initializer: {}", why));
-            const bool cxxSretConsumed = cxxSretArmed
-                && compiler->pendingCxxSretDest_ == nullptr;
+            const bool cxxSretConsumed = (cxxSretArmed
+                && compiler->pendingCxxSretDest_ == nullptr)
+                || (elementCallSlot.has_value() && elementCallSlot->Consumed());
+            elementCallSlot.reset();
             if (cxxSretArmed)
             {
                 compiler->pendingCxxSretDest_ = nullptr;

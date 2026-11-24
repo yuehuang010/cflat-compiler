@@ -4933,6 +4933,73 @@ LLVM_ATTRIBUTE_NOINLINE void MainListener::UpdateAssignmentStackCharBufferBorrow
         }
 }
 
+bool MainListener::DropDiscardedMoveJoin(CFlatParser::ConditionalExpressionContext* join,
+                                         const LLVMBackend::NamedVariable& nv) {
+        if (join == nullptr || nv.TypeAndValue.Pointer) return false;
+        auto* phi = llvm::dyn_cast_or_null<llvm::PHINode>(nv.Primary);
+        auto* st = phi != nullptr ? llvm::dyn_cast<llvm::StructType>(phi->getType()) : nullptr;
+        if (st == nullptr || !st->hasName()) return false;
+        auto* compiler = Compiler(join);
+        const std::string typeName = st->getName().str();
+        // Strings are owned by the join itself; lowered and imported classes take the C++ paths.
+        if (typeName == "string" || !compiler->IsDataStructure(typeName)
+            || !compiler->IsOwningValueType(typeName) || compiler->IsLoweredCFlatOnlyStruct(typeName)
+            || compiler->IsForeignNontrivialCxxClass(typeName))
+            return false;
+        auto isMoveLeaf = [](antlr4::tree::ParseTree* node) {
+            while (node != nullptr)
+            {
+                if (dynamic_cast<CFlatParser::MoveExpressionContext*>(node) != nullptr) return true;
+                auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+                if (primary != nullptr && primary->expression() != nullptr
+                    && primary->children.size() == 3)
+                {
+                    node = primary->expression();
+                    continue;
+                }
+                if (node->children.size() != 1) return false;
+                node = node->children[0];
+            }
+            return false;
+        };
+        // The i1 "the selected leaf was a move", beside each join PHI (incoming 0 = true arm).
+        std::function<llvm::Value*(antlr4::tree::ParseTree*, llvm::Value*)> leafMoved =
+            [&](antlr4::tree::ParseTree* arm, llvm::Value* value) -> llvm::Value* {
+            auto* nested = ArmTernaryThroughParens(arm);
+            if (nested == nullptr)
+                return isMoveLeaf(arm) ? compiler->builder->getTrue() : compiler->builder->getFalse();
+            auto* armPhi = llvm::dyn_cast<llvm::PHINode>(value);
+            if (armPhi == nullptr || armPhi->getNumIncomingValues() != 2
+                || nested->expression() == nullptr || nested->conditionalExpression() == nullptr)
+                return nullptr;
+            auto* t = leafMoved(nested->expression(), armPhi->getIncomingValue(0));
+            auto* f = leafMoved(nested->conditionalExpression(), armPhi->getIncomingValue(1));
+            if (t == nullptr || f == nullptr) return nullptr;
+            if (t == f) return t;
+            const auto savedIP = compiler->builder->saveIP();
+            compiler->builder->SetInsertPoint(armPhi);
+            auto* moved = compiler->builder->CreatePHI(compiler->builder->getInt1Ty(), 2, "discard_leaf_moved");
+            moved->addIncoming(t, armPhi->getIncomingBlock(0));
+            moved->addIncoming(f, armPhi->getIncomingBlock(1));
+            compiler->builder->restoreIP(savedIP);
+            return moved;
+        };
+        auto* moved = leafMoved(join, phi);
+        auto* known = llvm::dyn_cast_or_null<llvm::ConstantInt>(moved);
+        if (moved == nullptr || (known != nullptr && known->isZero())) return false;
+        auto* temp = compiler->AllocaAtEntry(st, nullptr, "discardtemp");
+        compiler->builder->CreateStore(phi, temp);
+        if (known != nullptr)
+        {
+            compiler->RegisterOwnedStructTemp(temp, typeName);
+            return true;
+        }
+        auto* flag = compiler->AllocaAtEntry(compiler->builder->getInt1Ty(), nullptr, "discard_moved");
+        compiler->builder->CreateStore(moved, flag);
+        compiler->RegisterOwnedStructTemp(temp, typeName, flag);
+        return true;
+    }
+
 llvm::Value* MainListener::ParseAssignmentExpression(
         CFlatParser::AssignmentExpressionContext* ctx,
         LLVMBackend::NamedVariable* assignmentResult) {
@@ -5206,6 +5273,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     return rhsNV.Primary;
                 }
 
+                if (DropDiscardedMoveJoin(ArmTernaryThroughParens(assignCtx), rhsNV))
+                    return rhsNV.Primary;
                 RegisterDiscardedOwningStructTemp(rhsNV);
                 return rhsNV.Primary;
             }
@@ -5288,6 +5357,73 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 namedVar.TypeAndValue.Pointer = false;
                 namedVar.TypeAndValue.IsRvalueRef = false;
                 namedVar.IsRvalue = true;
+            }
+            // ASGACC: `mk() = b` with a same-class source is operator= on the materialized
+            // temporary (clang): the temp becomes the destination of the ordinary class path.
+            if (operatorText == "=" && castTargetCtx == nullptr && !castAssignmentRight.has_value()
+                && assignCtx != nullptr && namedVar.IsRvalue && !namedVar.IsExplicitMove
+                && !namedVar.TypeAndValue.Pointer
+                && compiler->IsCxxRecord(namedVar.TypeAndValue.TypeName)
+                && compiler->generatedCxxRecords_.count(namedVar.TypeAndValue.TypeName) == 0
+                && (namedVar.Storage != nullptr || namedVar.Primary != nullptr))
+            {
+                const std::string prvalueClass = namedVar.TypeAndValue.TypeName;
+                {
+                    CxxCallArgumentScope cxxAssignRhsScope(inCxxCallArgument_, true);
+                    castAssignmentRight = ParseAssignmentExpressionNamed(assignCtx);
+                }
+                auto& source = *castAssignmentRight;
+                // A ref-qualified operator= (`&` refuses a prvalue object, `&&` is not on the lvalue
+                // path's list) keeps the prvalue path.
+                compiler->EnsureCxxAssignmentProjected(prvalueClass);
+                const auto* classInfo = compiler->GetCxxClassInfo(prvalueClass);
+                auto refQualified = [](const LLVMBackend::CxxClassInfo::Structor& op) {
+                    return op.refQualifier != cflat_cinterop::CxxRefQualifierNone;
+                };
+                const bool keepPrvaluePath = classInfo != nullptr
+                    && (refQualified(classInfo->copyAssign) || refQualified(classInfo->moveAssign)
+                        || std::any_of(classInfo->copyAssignOverloads.begin(),
+                               classInfo->copyAssignOverloads.end(), refQualified)
+                        || std::any_of(classInfo->moveAssignOverloads.begin(),
+                               classInfo->moveAssignOverloads.end(), refQualified));
+                // Only a user-declared copy / move operator= is observable on a temporary; an implicit
+                // one keeps the "not an addressable lvalue" refusal (err_cpp_proxy_assign_refused).
+                auto record = compiler->cxxRecordEntries_.find(prvalueClass);
+                const bool userAssign = record != compiler->cxxRecordEntries_.end()
+                    && std::any_of(record->second.members.begin(), record->second.members.end(),
+                           [](const auto& member) {
+                               return member.name == "operator=" && !member.isImplicit
+                                   && (member.isCopyAssign || member.isMoveAssign);
+                           });
+                if (userAssign && !keepPrvaluePath && !source.TypeAndValue.Pointer
+                    && !source.TypeAndValue.IsRvalueRef
+                    && compiler->ResolveTypeAlias(source.TypeAndValue.TypeName)
+                        == compiler->ResolveTypeAlias(prvalueClass))
+                {
+                    if (namedVar.Storage == nullptr)
+                    {
+                        namedVar.Storage = compiler->AllocaAtEntry(
+                            namedVar.Primary->getType(), nullptr, "cxx.assign.prvalue.dest");
+                        compiler->builder->CreateStore(namedVar.Primary, namedVar.Storage);
+                        namedVar.BaseType = namedVar.Primary->getType();
+                        if (!compiler->HasTrivialCxxDtor(prvalueClass))
+                            compiler->RegisterOwnedStructTemp(namedVar.Storage, prvalueClass);
+                    }
+                    if (source.Storage == nullptr && source.Primary != nullptr
+                        && source.Primary->getType() == namedVar.BaseType)
+                    {
+                        source.Storage = compiler->AllocaAtEntry(
+                            source.Primary->getType(), nullptr, "cxx.assign.prvalue.src");
+                        compiler->builder->CreateStore(source.Primary, source.Storage);
+                        source.BaseType = source.Primary->getType();
+                        source.IsRvalue = true;
+                        if (!compiler->HasTrivialCxxDtor(prvalueClass))
+                            compiler->RegisterOwnedStructTemp(source.Storage, prvalueClass);
+                    }
+                    namedVar.IsRvalue = false;
+                    if (RefuseUnassignableCxxSource(compiler, ctx, operatorText, namedVar, source))
+                        return nullptr;
+                }
             }
             if (namedVar.IsCxxMacroGlobal || namedVar.IsCxxMacroJoin)
                 LogErrorContext(unaryCtx, std::format(
@@ -6131,6 +6267,23 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         && llvm::isa<llvm::PHINode>(rhsNV.Storage)
                         && pendingTempSlot(rhsNV.Storage, 0))
                         rhsTemp = rhsNV.Storage;
+                    // ASGACC: a C++ call result the ABI returned in registers has no slot; it is
+                    // still a prvalue, so spill it into a temp and take clang's rvalue operator= pick.
+                    if (rhsTemp == nullptr && !useMove && !rhsDefault && returnedTemp == nullptr
+                        && returnedValue != nullptr && rhsNV.Primary == returnedValue
+                        && rhsNV.Storage == nullptr && !rhsNV.TypeAndValue.Pointer
+                        && compiler->ResolveTypeAlias(rhsNV.TypeAndValue.TypeName) == tn
+                        && returnedValue->getType() == compiler->GetType(tempType))
+                    {
+                        auto* spill = compiler->AllocaAtEntry(
+                            compiler->GetType(tempType), nullptr, "cxx.assign.regret");
+                        compiler->builder->CreateStore(returnedValue, spill);
+                        compiler->RegisterOwnedStructTemp(spill, tn);
+                        rhsNV.Storage = spill;
+                        rhsNV.BaseType = compiler->GetType(tempType);
+                        rhsNV.IsRvalue = true;
+                        rhsTemp = spill;
+                    }
                     if (forcedTempProduced && !rhsDefault)
                         compiler->RegisterOwnedStructTemp(forcedTemp, tn);
                     compiler->lastCxxRetTemp_ = nullptr;
@@ -7681,6 +7834,14 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     !namedVar.TypeAndValue.Pointer && compiler->IsCxxRecord(namedVar.TypeAndValue.TypeName));
                 return ParseAssignmentExpressionNamed(assignCtx);
             }();
+            // A `?:` string join that owns its buffer (moved arms, copied place arms) is a fresh
+            // temp: its storage join names the arm sources, not an lvalue to copy from.
+            if (operatorText == "=" && rightNV.Primary != nullptr
+                && rightNV.Primary->getType() == llvm::StructType::getTypeByName(*compiler->context, "string")
+                && llvm::isa<llvm::PHINode>(rightNV.Primary)
+                && llvm::isa_and_nonnull<llvm::PHINode>(rightNV.Storage)
+                && compiler->IsPendingOwnedStringTemp(rightNV.Primary))
+                rightNV.Storage = nullptr;
             chainRhsIsJoin = assignmentCanCarryChainOwnership && operatorText == "="
                 && isAssignmentRhsOfAssignment()
                 && (rightNV.ChainedAssignJoinRhs
@@ -9110,10 +9271,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                             // Live slot = data[index] now; only the adopting path reads the container.
                             // Other collections keep master's behaviour (no clear).
                             if (range.headerDataField < 0 || range.headerSizeField < 0
-                                || range.collectionStorage == nullptr || range.indexStorage == nullptr
-                                || range.elementValue == nullptr)
+                                || range.headerStorage == nullptr || range.headerType == nullptr
+                                || range.indexStorage == nullptr || range.elementValue == nullptr)
                                 continue;
-                            auto* headerType = range.collection.BaseType;
+                            auto* headerType = range.headerType;
                             auto* iterValue = range.elementValue;
                             auto* nullPtr = llvm::ConstantPointerNull::get(compiler->builder->getPtrTy());
                             auto* adoptsElement = compiler->builder->CreateAnd(
@@ -9122,7 +9283,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                             auto* standIn = compiler->CreateAlloca(headerType);
                             compiler->builder->CreateStore(llvm::Constant::getNullValue(headerType), standIn);
                             auto* header = compiler->builder->CreateSelect(
-                                adoptsElement, range.collectionStorage, standIn, "adoptheader");
+                                adoptsElement, range.headerStorage, standIn, "adoptheader");
                             auto* dataSlot = compiler->CreateStructGEP(headerType, header,
                                 (unsigned)range.headerDataField);
                             auto* liveData = compiler->builder->CreateLoad(

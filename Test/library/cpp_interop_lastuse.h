@@ -433,3 +433,33 @@ namespace dirord
         try { return fn(); } catch (...) { return -1; }
     }
 }
+
+// CALLPAR: overloads that disagree at a `?:` slot, template-only sets, and ADL targets.
+namespace callpar
+{
+    inline int comp(cpptw::Twin a) { return 10 + a.value(); }
+    inline int comp(t418::Val a) { return 20 + a.value(); }
+    inline int convc(t418::Val a) { return 30 + a.value(); }
+    inline int convc(t418::Conv a) { return 40 + a.field; }
+    // `{}` into a scalar or pointer overload beside class ones is not ambiguous: clang picks int / nullptr.
+    inline int g(int i) { return 30 + i; }
+    inline int g(cpptw::Twin a) { return 40 + a.value(); }
+    inline int g(t418::Val a) { return 50 + a.value(); }
+    inline int h(t418::Val* p) { return p ? 61 : 60; }
+    inline int h(cpptw::Twin) { return 70; }
+    inline int h(t418::Val) { return 80; }
+    template <class T> int ftpl(T a) { return 50 + a.value(); }
+    template <class T> int fcr(const T& a) { return 60 + a.value(); }
+    struct Host
+    {
+        template <class T> int tpl(T a) { return 70 + a.value(); }
+        template <class T> int fw(T&& a) { return 80 + a.value(); }
+    };
+    namespace adl
+    {
+        struct A { int v = 5; };
+        inline int adlf(A a) { return a.v + 1; }
+        inline int adlr(const A& a) { return a.v + 2; }
+        template <class T> int adlt(T, A b) { return b.v + 3; }
+    }
+}

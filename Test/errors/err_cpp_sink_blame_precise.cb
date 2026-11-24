@@ -51,6 +51,12 @@ extern int main()
         int x = r.lv(k);
     }
     expect_error("cannot copy C++ class 'sbl.Key' into parameter 't' of 'add': its copy constructor is deleted - pass 'move x' or a temporary") {
+        sbl.ByValOnly<sbl.Key> b = default;
+        sbl.Key l = sbl.Key(4);
+        b.add(l);
+    }
+    // add(const T&) beside add(T): ambiguous for an lvalue, as clang reports.
+    expect_error("ambiguous call to 'add': no candidate ranks better than the others: add(const sbl.Key &), add(sbl.Key)") {
         sbl.ByVal<sbl.Key> b = default;
         sbl.Key l = sbl.Key(4);
         b.add(l);

@@ -12820,6 +12820,64 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                 functionName, argIdx, namedArgCtx.size(), ctorTarget))
                                             argExpectedDest = ctorTarget;
                                     }
+                                    /*
+                                     * CALLPAR: C++ overloads of this arity disagree at this slot, so the front candidate
+                                     * cannot type `c ? default : x`. In C++ the default arm is `X()` of x's own class:
+                                     * seed the overload whose by-value parameter is exactly that class.
+                                     */
+                                    if (funcSym != nullptr && funcSym->IsCxx && !uniqueCxxCandidateForArity
+                                        && funcSymFamily != nullptr && declaredIdx[argIdx] >= 0
+                                        && argumentExpression != nullptr
+                                        && !HasAssignmentOperator(argumentExpression))
+                                    {
+                                        auto* conditional = argumentExpression->conditionalExpression();
+                                        const bool shaped = conditional != nullptr
+                                            && conditional->Question() != nullptr
+                                            && conditional->expression() != nullptr
+                                            && conditional->conditionalExpression() != nullptr;
+                                        const bool trueDefault = shaped
+                                            && IsDefaultOnlyExpression(conditional->expression());
+                                        if (shaped && trueDefault
+                                                != IsDefaultOnlyExpression(conditional->conditionalExpression()))
+                                        {
+                                            antlr4::tree::ParseTree* otherArm = trueDefault
+                                                ? static_cast<antlr4::tree::ParseTree*>(
+                                                    conditional->conditionalExpression())
+                                                : static_cast<antlr4::tree::ParseTree*>(conditional->expression());
+                                            auto* postfix = SolePostfixExpressionShape(otherArm);
+                                            auto* primary = postfix != nullptr && postfix->children.size() == 1
+                                                ? postfix->primaryExpression() : nullptr;
+                                            auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
+                                            const auto* local = generic != nullptr
+                                                && generic->genericTypeParameters() == nullptr
+                                                && generic->Identifier() != nullptr
+                                                ? Compiler(ctx)->FindLiveNamedVariable(generic->Identifier()->getText())
+                                                : nullptr;
+                                            const std::string localType = local != nullptr
+                                                && !local->TypeAndValue.Pointer && local->TypeAndValue.PointerDepth == 0
+                                                ? Compiler(ctx)->ResolveTypeAlias(local->TypeAndValue.TypeName)
+                                                : std::string();
+                                            const size_t slot = static_cast<size_t>(declaredIdx[argIdx]);
+                                            if (!localType.empty() && slot < funcSym->Parameters.size()
+                                                && Compiler(ctx)->IsForeignNontrivialCxxClass(localType)
+                                                && localType != Compiler(ctx)->ResolveTypeAlias(argExpectedDest.TypeName))
+                                                for (const auto& candidate : *funcSymFamily)
+                                                {
+                                                    if (!candidate.IsCxx || candidate.IsMethod != funcSym->IsMethod
+                                                        || candidate.Variadic
+                                                        || candidate.Parameters.size() != funcSym->Parameters.size())
+                                                        continue;
+                                                    const auto& param = candidate.Parameters[slot];
+                                                    if (!param.Pointer && param.PointerDepth == 0 && !param.IsAlias
+                                                        && !param.IsRvalueRef
+                                                        && Compiler(ctx)->ResolveTypeAlias(param.TypeName) == localType)
+                                                    {
+                                                        argExpectedDest = param;
+                                                        break;
+                                                    }
+                                                }
+                                        }
+                                    }
                                     bool defaultArgument = false;
                                     if (defaultOnlyArgument)
                                     {
@@ -12851,6 +12909,64 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             else
                                                 refusals += std::format("\n    {}: {}",
                                                     spellCandidate(*t.Symbol), t.Refusal);
+                                        }
+                                        /*
+                                         * CALLPAR: `default` into C++ overloads is `{}`: two by-value classes that both
+                                         * default-construct implicitly are two user conversions, ambiguous in clang.
+                                         */
+                                        std::vector<LLVMBackend::DefaultArgumentCandidate> cxxClassTakers;
+                                        if (funcSym != nullptr && funcSym->IsCxx && !uniqueCxxCandidateForArity
+                                            && funcSymFamily != nullptr && declaredIdx[argIdx] >= 0)
+                                        {
+                                            const size_t slot = static_cast<size_t>(declaredIdx[argIdx]);
+                                            std::set<std::string> seenClasses;
+                                            // A scalar, pointer or enum candidate may win `{}` outright: abstain.
+                                            bool everyCandidateClass = true;
+                                            for (const auto& candidate : *funcSymFamily)
+                                            {
+                                                if (!candidate.IsCxx || candidate.IsMethod != funcSym->IsMethod
+                                                    || candidate.Variadic
+                                                    || candidate.Parameters.size() != funcSym->Parameters.size()
+                                                    || slot >= candidate.Parameters.size())
+                                                    continue;
+                                                const auto& param = candidate.Parameters[slot];
+                                                const std::string paramType =
+                                                    Compiler(ctx)->ResolveTypeAlias(param.TypeName);
+                                                const bool reference = param.IsAlias || param.IsRvalueRef
+                                                    || param.CxxConstRef() || param.IsCxxRef();
+                                                if (param.PointerDepth != 0 || (param.Pointer && !reference)
+                                                    || param.IsFunctionPointer
+                                                    || !Compiler(ctx)->ResolveEnumTypeName(paramType).empty()
+                                                    || !(Compiler(ctx)->IsCxxRecord(paramType)
+                                                        || Compiler(ctx)->IsDataStructure(paramType)))
+                                                    everyCandidateClass = false;
+                                            }
+                                            for (const auto& candidate : *funcSymFamily)
+                                            {
+                                                if (!everyCandidateClass) break;
+                                                if (!candidate.IsCxx || candidate.IsMethod != funcSym->IsMethod
+                                                    || candidate.Variadic
+                                                    || candidate.Parameters.size() != funcSym->Parameters.size()
+                                                    || slot >= candidate.Parameters.size())
+                                                    continue;
+                                                const auto& param = candidate.Parameters[slot];
+                                                const std::string paramClass =
+                                                    Compiler(ctx)->ResolveTypeAlias(param.TypeName);
+                                                if (param.Pointer || param.PointerDepth != 0 || param.IsAlias
+                                                    || param.IsRvalueRef
+                                                    || !Compiler(ctx)->IsForeignNontrivialCxxClass(paramClass))
+                                                    continue;
+                                                const auto* ctor = Compiler(ctx)->FindCxxDefaultCtor(paramClass);
+                                                if (ctor == nullptr || ctor->isExplicit || ctor->isDeleted
+                                                    || !seenClasses.insert(paramClass).second)
+                                                    continue;
+                                                LLVMBackend::DefaultArgumentCandidate entry;
+                                                entry.Symbol = &candidate;
+                                                entry.Slot = static_cast<int64_t>(slot);
+                                                cxxClassTakers.push_back(std::move(entry));
+                                            }
+                                            if (cxxClassTakers.size() > 1)
+                                                for (const auto& t : cxxClassTakers) takers.push_back(&t);
                                         }
                                         if (takers.size() > 1)
                                         {
@@ -13676,17 +13792,28 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         return std::string();
                                     };
                                     std::string deferredDefaultType;
+                                    /*
+                                     * CALLPAR: a template-only set (free or member) defers only `c ? default : local`;
+                                     * the template emitter spells that shape and requires clang's pick to take the
+                                     * conditional's own class.
+                                     */
+                                    const bool memberTemplateSet = structVar.BaseType != nullptr
+                                        && Compiler(ctx)->HasCxxFunctionTemplateMember(
+                                            structVar.TypeAndValue.TypeName, primaryIdentifier);
+                                    const bool templateSetDeferral = !cxxConstructorCall && !cxxStaticTemplateWrapper
+                                        && (cxxTemplateWrapper || memberTemplateSet)
+                                        && funcSym == nullptr && IsCxxDefaultLocalTernary(argumentExpression);
                                     if ((cxxFreeWrapper || cxxNonTemplateMemberWrapper || cxxStaticMemberWrapper
-                                            || cxxStaticTemplateWrapper)
-                                        && !cxxConstructorCall && (!cxxTemplateWrapper || cxxStaticTemplateWrapper)
+                                            || cxxStaticTemplateWrapper || templateSetDeferral)
+                                        && !cxxConstructorCall
+                                        && (!cxxTemplateWrapper || cxxStaticTemplateWrapper || templateSetDeferral)
                                         && argumentExpression != nullptr
                                         && (funcSym == nullptr || funcSym->IsCxx)
                                         // A set holding any function template may dispatch through the template
                                         // emitter, which takes no deferred shape unless it is a static const-ref slot.
-                                        && (!Compiler(ctx)->HasCxxFunctionTemplate(functionName) || cxxStaticTemplateWrapper)
-                                        && !(structVar.BaseType != nullptr
-                                            && Compiler(ctx)->HasCxxFunctionTemplateMember(
-                                                structVar.TypeAndValue.TypeName, primaryIdentifier))
+                                        && (!Compiler(ctx)->HasCxxFunctionTemplate(functionName) || cxxStaticTemplateWrapper
+                                            || templateSetDeferral)
+                                        && (!memberTemplateSet || templateSetDeferral)
                                         && std::none_of(namedArgCtx.begin(), namedArgCtx.end(),
                                             [](auto* na) { return na->Identifier() != nullptr; }))
                                     {
@@ -14816,8 +14943,58 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // The name filter keeps the ADL request off calls no hidden friend shares.
                                 const std::string adlSimpleName = adlDot == std::string::npos
                                     ? functionName : functionName.substr(adlDot + 1);
+                                /*
+                                 * CALLPAR: an unqualified call also reaches a namespace-scope C++ function of an
+                                 * argument's associated namespace (the innermost namespace enclosing its class).
+                                 */
+                                const auto associatedNamespaceDeclares = [&]() {
+                                    for (const auto& arg : arguments)
+                                    {
+                                        const std::string associated = associatedCxxClass(arg);
+                                        std::string scope = associated.substr(0, associated.find('$'));
+                                        for (size_t dot = scope.rfind('.'); ; dot = scope.rfind('.'))
+                                        {
+                                            scope = dot == std::string::npos ? std::string() : scope.substr(0, dot);
+                                            if (scope.empty() || !compiler->IsCxxRecord(scope)) break;
+                                        }
+                                        if (scope.empty() || !compiler->IsCxxNamespace(scope)) continue;
+                                        const std::string candidateName = scope + "." + adlSimpleName;
+                                        auto declared = compiler->functionTable.find(candidateName);
+                                        if ((declared != compiler->functionTable.end()
+                                                && std::any_of(declared->second.begin(), declared->second.end(),
+                                                    [](const auto& symbol) { return symbol.IsCxx && !symbol.IsMethod; }))
+                                            || compiler->HasCxxFunctionTemplate(candidateName)
+                                            || compiler->cxxFunctionSignatures_.count(candidateName) != 0)
+                                            return true;
+                                    }
+                                    return false;
+                                };
+                                // [basic.lookup.argdep]/3: a member of the enclosing struct (or its interfaces) hides ADL.
+                                const auto enclosingMemberDeclares = [&]() {
+                                    const std::string& self = implicitCallReceiver.TypeAndValue.TypeName;
+                                    if (self.empty()) return false;
+                                    for (const std::string& key : { adlSimpleName, self + "." + adlSimpleName })
+                                        if (auto members = compiler->functionTable.find(key);
+                                            members != compiler->functionTable.end()
+                                            && std::any_of(members->second.begin(), members->second.end(),
+                                                [&](const auto& symbol) {
+                                                    return key != adlSimpleName || (symbol.IsMethod
+                                                        && !symbol.Parameters.empty()
+                                                        && symbol.Parameters.front().TypeName == self);
+                                                }))
+                                            return true;
+                                    for (const auto& [interfaceName, methods] : compiler->interfaceTable)
+                                        if (compiler->StructImplementsInterface(self, interfaceName)
+                                            && std::any_of(methods.begin(), methods.end(),
+                                                [&](const auto& method) { return method.Name == adlSimpleName; }))
+                                            return true;
+                                    return false;
+                                };
+                                const bool adlNamespaceCandidate = adlAssociated && adlDot == std::string::npos
+                                    && !compiler->IsCxxFriendName(adlSimpleName) && !enclosingMemberDeclares()
+                                    && associatedNamespaceDeclares();
                                 const bool adlCandidate = adlAssociated
-                                    && compiler->IsCxxFriendName(adlSimpleName);
+                                    && (compiler->IsCxxFriendName(adlSimpleName) || adlNamespaceCandidate);
                                 bool needsEnumClassConversionWrapper = false;
                                 if (auto existing = compiler->functionTable.find(resolvedName);
                                     existing != compiler->functionTable.end()
@@ -14950,7 +15127,17 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         // found by ADL before the overload-mismatch diagnostic.
                                         std::string adlRegisteredName;
                                         std::string adlError;
-                                        if (adlCandidate && !isTemplate && owner.empty()
+                                        // A visible overload that may take this many arguments keeps master's lookup.
+                                        const bool visibleArityViable = adlNamespaceCandidate
+                                            && std::any_of(existing->second.begin(), existing->second.end(),
+                                                [&](const auto& symbol) {
+                                                    const size_t count = symbol.Parameters.size();
+                                                    return symbol.Variadic || count == arguments.size()
+                                                        || (count > arguments.size()
+                                                            && arguments.size() < symbol.DefaultArguments.size()
+                                                            && !symbol.DefaultArguments[arguments.size()].kind.empty());
+                                                });
+                                        if (adlCandidate && !visibleArityViable && !isTemplate && owner.empty()
                                             && cxxBraceArguments.empty()
                                             && compiler->RequestCxxFreeFunction(
                                                 functionName, cxxExplicitTemplateArgs, arguments,
@@ -17827,13 +18014,14 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             // Storage identity, not the name: a same-named local of an enclosing lambda is no parameter.
             const bool paramBorrow = compiler->IsFunctionParameterStorage(outer.Storage)
                 && !outer.IsOwning;
-            // Any foreach element is a store-path borrow. Only a 'unique' loop variable is owned by its container,
-            // so only it keeps the sink refusal (a raw element sinks like the direct form does).
+            // Any foreach element is a store-path borrow. Only an element the container owns keeps the sink
+            // refusal (the collection's element type decides; the loop declaration only when it is unknown).
             bool elementDeclaredUnique = false;
             for (auto it = rangeForStack_.rbegin(); it != rangeForStack_.rend(); ++it)
                 if (it->variableName == cap.Name)
                 {
-                    elementDeclaredUnique = it->elementDeclaredUnique;
+                    elementDeclaredUnique = it->elementOwnershipKnown
+                        ? it->elementOwnedByCollection : it->elementDeclaredUnique;
                     break;
                 }
             if (!outer.IsRangeForBorrow && !outer.IsBorrowed && !paramBorrow) continue;
@@ -21177,7 +21365,8 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
         }
         // A hidden friend is found by ADL from its call alone; the postfix call path requests it. CVTIE: so
         // is a global-namespace function template, which has no declaration in the function table.
-        if (compiler->IsCxxFriendName(name) || compiler->HasCxxFunctionTemplate(name))
+        if (compiler->IsCxxFriendName(name) || compiler->HasCxxFunctionTemplate(name)
+            || compiler->IsCxxNamespaceFunctionName(name))
         {
             antlr4::tree::ParseTree* up = node->parent;
             while (up != nullptr && dynamic_cast<CFlatParser::PostfixExpressionContext*>(up) == nullptr)

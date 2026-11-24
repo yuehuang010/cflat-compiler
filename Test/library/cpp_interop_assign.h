@@ -696,4 +696,23 @@ struct TrivDelMove { int v = 1; TrivDelMove() {} TrivDelMove(const TrivDelMove&)
     TrivDelMove& operator=(TrivDelMove&&) = delete; };
 inline Del mkDel() { Del t; t.v = 9; return t; }
 inline TrivDelMove mkTrivDelMove() { TrivDelMove t; t.v = 9; return t; }
+// ASGACC: by-value call results (returned in registers for Pub / PubMove) as assignment
+// sources and prvalue destinations; Cnt counts each special member it runs.
+inline Pub mkPub() { Pub t; t.v = 9; return t; }
+inline PubMove mkPubMove() { PubMove t; t.v = 9; return t; }
+struct Fac { int k = 9; static Pub make() { Pub t; t.v = 9; return t; }
+    Pub mk() const { Pub t; t.v = k; return t; } };
+struct Conv { int v = 1; Conv() {} Conv(const Conv&) = default;
+    Conv& operator=(const Conv& o) { v = o.v + 100; return *this; }
+    Conv& operator=(const Pub& p) { v = p.v + 300; return *this; } };
+inline Conv mkConv() { Conv t; t.v = 9; return t; }
+inline int cntCopyCtor = 0, cntMoveCtor = 0, cntCopyAssign = 0, cntMoveAssign = 0, cntDtor = 0;
+struct Cnt { int v = 1; Cnt() {} Cnt(const Cnt& o) : v(o.v) { cntCopyCtor++; }
+    Cnt(Cnt&& o) : v(o.v) { cntMoveCtor++; }
+    Cnt& operator=(const Cnt& o) { v = o.v + 100; cntCopyAssign++; return *this; }
+    Cnt& operator=(Cnt&& o) { v = o.v + 50; cntMoveAssign++; return *this; }
+    ~Cnt() { cntDtor++; } };
+inline Cnt mkCnt() { Cnt t; t.v = 9; return t; }
+inline int cntCounts() { return cntCopyCtor * 10000 + cntMoveCtor * 1000 + cntCopyAssign * 100
+    + cntMoveAssign * 10 + cntDtor; }
 } // namespace cppopeq

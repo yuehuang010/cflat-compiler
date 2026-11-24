@@ -1,4 +1,5 @@
 import "list.cb";
+import "array.cb";
 import "unique.cb";
 
 // A by-value lambda capture of a foreach element stays a borrow in the body, so it cannot move
@@ -6,6 +7,63 @@ import "unique.cb";
 // double-freed at run time (rc 139).
 struct CapRes { int id = 0; };
 void capSink(move CapRes* q) { q->id = 1; }
+
+// A raw loop declaration over a collection that owns its elements is the same borrow: the collection's
+// element type decides. Before the fix these compiled and double-freed (rc 134).
+void capSinkRawDeclElement(list<unique CapRes*>* elements, array<unique CapRes*>* arr)
+{
+    for (CapRes* p in *elements)
+    {
+        Lambda<void()> f = () => {
+            expect_error("cannot move borrowed pointer 'p' captured by a lambda") {
+                capSink(p);
+            }
+        };
+        f();
+    }
+    for (CapRes* p in *arr)
+    {
+        Lambda<void()> f = () => {
+            expect_error("cannot move borrowed pointer 'p' captured by a lambda") {
+                capSink(p);
+            }
+        };
+        f();
+    }
+    unique CapRes*[1] fixedElems = { nullptr };
+    for (CapRes* p in fixedElems)
+    {
+        Lambda<void()> f = () => {
+            expect_error("cannot move borrowed pointer 'p' captured by a lambda") {
+                capSink(p);
+            }
+        };
+        f();
+    }
+}
+
+// The same through a pointer to the collection (no deref in the range expression).
+void capSinkRawDeclPointer(list<unique CapRes*>* elements, array<unique CapRes*>* arr)
+{
+    for (CapRes* p in elements)
+    {
+        Lambda<void()> f = () => {
+            expect_error("cannot move borrowed pointer 'p' captured by a lambda") {
+                capSink(p);
+            }
+        };
+        f();
+    }
+    for (CapRes* p in arr)
+    {
+        Lambda<void()> f = () => {
+            expect_error("cannot move borrowed pointer 'p' captured by a lambda") {
+                capSink(p);
+            }
+        };
+        f();
+    }
+}
 
 void capSinkElement(list<unique CapRes*>* elements)
 {

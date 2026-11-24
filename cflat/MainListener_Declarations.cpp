@@ -3,6 +3,7 @@
 #include "MainListener.h"
 #include "MainListener_ExpressionsShared.h"
 #include <llvm/Analysis/ValueTracking.h>
+#include <llvm/IR/IntrinsicInst.h>
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Support/SaveAndRestore.h"
 
@@ -7975,6 +7976,19 @@ static const void* CxxSretResultCallSite(LLVMBackend* compiler,
 }
 
 
+// RETELIDE: the call site of a sole call `f(args)` building a C++ class element or field slot like a
+// declaration does (null otherwise). Calls nested in its arguments keep their own slots.
+const void* MainListener::CxxSretElementCallSite(CFlatParser::AssignmentExpressionContext* assign,
+                                                const std::string& typeName)
+{
+        auto* compiler = Compiler();
+        auto* pf = SolePostfixExpression(assign);
+        if (!PostfixExpressionEndsInCall(pf) || PostfixCallHasChainedReceiver(pf)
+            || !compiler->IsForeignNontrivialCxxClass(typeName) || !compiler->ReturnsViaCxxSret(typeName))
+            return nullptr;
+        return CxxSretResultCallSite(compiler, assign, typeName);
+}
+
 bool PostfixCallHasChainedReceiver(CFlatParser::PostfixExpressionContext* postfix)
 {
         if (postfix == nullptr || postfix->children.empty()) return false;
@@ -8282,8 +8296,11 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
         auto simpleBraceCall = [&](antlr4::tree::ParseTree* node)
             -> CFlatParser::PostfixExpressionContext* {
             auto* postfix = SolePostfixExpression(node);
+            // Arguments may hold calls or temporaries (`mk(g())`, `mk(S(2).v)`): they evaluate at
+            // the element, and only the outer call's own site is captured.
             if (postfix == nullptr || !PostfixExpressionEndsInCall(postfix)
-                || CountOpenParenTokens(postfix) != 1
+                || postfix->primaryExpression() == nullptr
+                || postfix->primaryExpression()->genericIdentifier() == nullptr
                 || postfix->LeftParen().size() != 1
                 || postfix->argumentExpressionList().size() != 1)
                 return nullptr;
@@ -8430,6 +8447,167 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
                     earlierPotentialDeferrable[i] = earlierPotential;
                     earlierPotential = earlierPotential || potentialDeferrableByLeaf[i];
                 }
+                /*
+                 * BRACEPRV order rule: a later leaf reading a scalar or pointer local by bare name cannot
+                 * observe a deferred constructor or captured call. Proof: no code that ran before took
+                 * the slot's address (its IR uses are plain loads and stores, and no enclosing loop or
+                 * goto can have run later code first), and earlier leaves name it only as a direct
+                 * argument every candidate takes by value. The token scan over earlier leaves is
+                 * conservative: any token spelling the name that is not such an argument declines.
+                 */
+                auto leafExpression = [](CFlatParser::FieldInitContext* leaf)
+                    -> CFlatParser::AssignmentExpressionContext* {
+                    return leaf->Colon() == nullptr && leaf->assignmentExpression().size() == 1
+                        ? leaf->assignmentExpression(0) : nullptr;
+                };
+                auto bareIdentifier = [](antlr4::tree::ParseTree* node) -> antlr4::tree::TerminalNode* {
+                    auto* postfix = SolePostfixExpressionShape(node);
+                    auto* primary = postfix != nullptr && postfix->children.size() == 1
+                        ? postfix->primaryExpression() : nullptr;
+                    auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
+                    return generic != nullptr && generic->genericTypeParameters() == nullptr
+                        ? generic->Identifier() : nullptr;
+                };
+                auto calleeTakesByValue = [&](CFlatParser::AssignmentExpressionContext* expression,
+                                              size_t argumentIndex, size_t arity) {
+                    auto* postfix = SolePostfixExpressionShape(expression);
+                    auto* generic = postfix->primaryExpression()->genericIdentifier();
+                    std::string calleeName = generic->Identifier()->getText();
+                    for (auto* member : postfix->memberNameToken())
+                        calleeName += "." + member->getText();
+                    if (IsCxxBraceDeferrableConstruction(expression))
+                    {
+                        const std::string record = compiler->ResolveTypeAlias(
+                            compiler->ResolveQualifiedName(calleeName));
+                        return compiler->IsCxxConstructorParameterByValue(record, argumentIndex, arity);
+                    }
+                    if (NamesVisibleVariable(compiler, generic->Identifier()->getText())) return false;
+                    auto* overloads = compiler->FindCFlatCallCandidates(calleeName);
+                    if (overloads == nullptr || overloads->empty()) return false;
+                    return std::all_of(overloads->begin(), overloads->end(), [&](const auto& symbol) {
+                        if (symbol.IsMethod || symbol.Variadic
+                            || symbol.Parameters.size() <= argumentIndex)
+                            return false;
+                        const auto& parameter = symbol.Parameters[argumentIndex];
+                        return !parameter.IsAlias && !parameter.IsRvalueRef && !parameter.IsCxxRef();
+                    });
+                };
+                auto unreachableLocalRead = [&](antlr4::tree::ParseTree* node, size_t index) -> bool {
+                    auto* identifier = bareIdentifier(node);
+                    if (identifier == nullptr) return false;
+                    const std::string name = identifier->getText();
+                    const auto* local = compiler->FindLiveNamedVariable(name);
+                    auto* slot = local != nullptr
+                        ? llvm::dyn_cast_or_null<llvm::AllocaInst>(local->Storage) : nullptr;
+                    auto* block = compiler->builder->GetInsertBlock();
+                    if (slot == nullptr || block == nullptr || slot->getFunction() != block->getParent())
+                        return false;
+                    const auto& type = local->TypeAndValue;
+                    llvm::Type* slotType = slot->getAllocatedType();
+                    if (type.IsAlias || type.IsArrayView || type.IsUnique || type.ConstArraySize > 0
+                        || !type.ConstInnerDimensions.empty() || type.IsFunctionPointer
+                        || (type.Pointer ? !slotType->isPointerTy()
+                            : (!slotType->isIntegerTy() && !slotType->isFloatingPointTy())))
+                        return false;
+                    for (auto* user : slot->users())
+                    {
+                        if (auto* load = llvm::dyn_cast<llvm::LoadInst>(user);
+                            load != nullptr && load->getPointerOperand() == slot)
+                            continue;
+                        if (auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
+                            store != nullptr && store->getPointerOperand() == slot
+                            && store->getValueOperand() != slot)
+                            continue;
+                        if (auto* intrinsic = llvm::dyn_cast<llvm::IntrinsicInst>(user);
+                            intrinsic != nullptr && (intrinsic->isLifetimeStartOrEnd()
+                                || llvm::isa<llvm::DbgInfoIntrinsic>(intrinsic)))
+                            continue;
+                        return false;
+                    }
+                    // An `alias` sharing the slot adds no IR use: any other live name on it declines.
+                    for (const auto& frame : compiler->stackNamedVariable)
+                    {
+                        for (const auto& [otherName, other] : frame.namedVariable)
+                            if (otherName != name && other.Storage == slot) return false;
+                        for (const auto& [otherName, other] : frame.functionArgument)
+                            if (otherName != name && other.Storage == slot) return false;
+                    }
+                    antlr4::tree::ParseTree* root = errorContext;
+                    for (; root != nullptr; root = root->parent)
+                    {
+                        if (dynamic_cast<CFlatParser::IterationStatementContext*>(root) != nullptr)
+                            return false;
+                        if (dynamic_cast<CFlatParser::FunctionDefinitionContext*>(root) != nullptr
+                            || dynamic_cast<CFlatParser::LambdaExpressionContext*>(root) != nullptr)
+                            break;
+                    }
+                    if (root == nullptr) return false;
+                    std::vector<antlr4::tree::ParseTree*> pending{ root };
+                    while (!pending.empty())
+                    {
+                        auto* node = pending.back();
+                        pending.pop_back();
+                        if (auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(node);
+                            terminal != nullptr && terminal->getSymbol()->getType() == CFlatParser::Goto)
+                            return false;
+                        for (auto* child : node->children) pending.push_back(child);
+                    }
+                    for (size_t j = 0; j < index; ++j)
+                    {
+                        auto* expression = leafExpression(leaves[j]);
+                        std::vector<antlr4::tree::ParseTree*> nodes{ leaves[j] };
+                        while (!nodes.empty())
+                        {
+                            auto* node = nodes.back();
+                            nodes.pop_back();
+                            for (auto* child : node->children) nodes.push_back(child);
+                            auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(node);
+                            if (terminal == nullptr
+                                || terminal->getSymbol()->getType() != CFlatParser::Identifier
+                                || (expression != nullptr && bareIdentifier(expression) == terminal))
+                                continue;
+                            // Any spelling resolving to the slot counts, not only the name itself.
+                            const std::string spelling = terminal->getText();
+                            const auto* resolved = spelling == name ? local
+                                : compiler->FindLiveNamedVariable(spelling);
+                            if (spelling != name && (resolved == nullptr || resolved->Storage != slot))
+                                continue;
+                            auto* call = expression != nullptr ? simpleBraceCall(expression) : nullptr;
+                            auto* generic = call != nullptr && call->primaryExpression() != nullptr
+                                ? call->primaryExpression()->genericIdentifier() : nullptr;
+                            if (generic == nullptr || generic->Identifier() == nullptr
+                                || generic->genericTypeParameters() != nullptr)
+                                return false;
+                            const auto arguments =
+                                call->argumentExpressionList().front()->argumentNamedExpression();
+                            size_t argumentIndex = arguments.size();
+                            for (size_t a = 0; a < arguments.size(); ++a)
+                                if (arguments[a]->Identifier() == nullptr
+                                    && bareIdentifier(arguments[a]->assignmentExpression()) == terminal)
+                                    argumentIndex = a;
+                            if (argumentIndex == arguments.size()
+                                || !calleeTakesByValue(expression, argumentIndex, arguments.size()))
+                                return false;
+                        }
+                    }
+                    return true;
+                };
+                // A construction from literals and such local reads is quiet as well (`BT(t)`).
+                auto quietLocalConstruction = [&](auto&& self, antlr4::tree::ParseTree* node,
+                                                  size_t index) -> bool {
+                    if (node == nullptr || !IsCxxBraceDeferrableConstruction(node)) return false;
+                    auto* postfix = SolePostfixExpressionShape(node);
+                    if (postfix == nullptr || postfix->argumentExpressionList().size() != 1) return false;
+                    for (auto* argument : postfix->argumentExpressionList().front()->argumentNamedExpression())
+                    {
+                        auto* value = argument->assignmentExpression();
+                        if (argument->Identifier() != nullptr || value == nullptr
+                            || (!IsQuietCxxBraceElement(value) && !unreachableLocalRead(value, index)
+                                && !self(self, value, index)))
+                            return false;
+                    }
+                    return true;
+                };
                 bool laterQuiet = true;
                 for (size_t i = leaves.size(); i-- > 0;)
                 {
@@ -8445,7 +8623,8 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
                         deferrableBraceLeaves.insert(leaf);
                     laterQuiet = laterQuiet && expression != nullptr
                         && (IsQuietCxxBraceElement(expression) || IsDefaultOnlyExpression(expression)
-                            || quietCall || callTernary);
+                            || quietCall || callTernary || unreachableLocalRead(expression, i)
+                            || quietLocalConstruction(quietLocalConstruction, expression, i));
                 }
             }
             // A class prvalue already built in a CFlat temp keeps later elements eager: a deferred
@@ -9320,10 +9499,14 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
                 && field->LeftBrace() == nullptr && field->initializerList() == nullptr
                 && field->assignmentExpression().size() == 1)
             {
+                // Arguments may hold calls or temporaries (`{ mk(g()) }`), as in the aggregate path.
                 auto isSimpleCall = [&](antlr4::tree::ParseTree* node) {
                     auto* postfix = SolePostfixExpression(node);
                     return PostfixExpressionEndsInCall(postfix)
-                        && CountOpenParenTokens(postfix) == 1
+                        && postfix->primaryExpression() != nullptr
+                        && postfix->primaryExpression()->genericIdentifier() != nullptr
+                        && postfix->LeftParen().size() == 1
+                        && postfix->argumentExpressionList().size() == 1
                         && !IsCxxBraceDeferrableConstruction(node);
                 };
                 auto callReturnsDeclaredClass = [&](antlr4::tree::ParseTree* node) {

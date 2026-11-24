@@ -466,7 +466,7 @@ import "diagnostic/heap_audit.cb";
 import cpp {"sstream", "fstream", "iostream", "iomanip"};
 import cpp {"library/cpp_interop_stream.h", "library/cpp_interop_list.h"};
 // Assignment into a live object from a temporary: instrumented, header-only.
-import cpp {"library/cpp_interop_assign.h", "library/cpp_t231_byvalue.hpp", "library/cpp_t239_ternary_byvalue.hpp", "library/cpp_t331_override.hpp", "library/cpp_interop_proxy_assign.h", "library/t29_valarray_subscript.hpp", "library/cpp_interop_refbinding.h", "library/cpp_interop_opaque_return.hpp", "library/cpp_t34_traits_static.hpp", "library/t17_empty_return.hpp", "memory", "library/cpp_t46_smartdot.hpp", "library/cpp_interop_uniqueptr.h", "library/cpp_t492_fieldmove.hpp"};
+import cpp {"library/cpp_interop_assign.h", "library/cpp_t231_byvalue.hpp", "library/cpp_t239_ternary_byvalue.hpp", "library/cpp_t331_override.hpp", "library/cpp_interop_proxy_assign.h", "library/t29_valarray_subscript.hpp", "library/cpp_interop_refbinding.h", "library/cpp_interop_opaque_return.hpp", "library/cpp_t34_traits_static.hpp", "library/t17_empty_return.hpp", "memory", "library/cpp_t46_smartdot.hpp", "library/cpp_interop_uniqueptr.h", "library/cpp_t492_fieldmove.hpp", "library/cpp_objoin.hpp"};
 
 using NestCastSxAlias = cppne.Sx;
 namespace NestCastAliasNs { using SA = cppne.Sx; }
@@ -2818,6 +2818,9 @@ t135.T136List[2] t136GlobalOuter = {};
 t135.DefList[2] t136GlobalDefOuter = {};
 // T136 ORDER: foreign C++ globals keep clang declaration order. Native defaults are local.
 import cpp "library/cpp_t136_order.hpp";
+import cpp "library/cpp_pickname.hpp";
+// Same simple name as the C++ pickname members: must not join their overload set.
+struct PicknameBox { int o = 0; int pickAlias(bool c) { return 9; } };
 struct ParenAssignCppHolder { cppcp.CV value = cppcp.CV(0); };
 struct T136Ord { int v; T136Ord() { v = t136ord.mark(); } };
 t136ord.Stamp t136OrdBefore = default;
@@ -3526,6 +3529,27 @@ struct AggCallFlatMaker
 {
     braceprv.BS make(int n) { braceprv.BS_Stats.selected = 4; return braceprv.BS(n); }
 };
+// BRACEELIDE helpers (clang++ -std=c++20 oracle: scratch/braceelide_tmp/twin*.cpp).
+int BraceElideParamRead(int k) { braceprv.Outer o = { braceprv.BS(k, 1), k }; return o.r.value + o.x; }
+int BraceElideThrowAgg(int t)
+{
+    braceprv.Thrower th = { braceprv.mk(braceprv.BS(2).value), braceprv.BT(t), 2 };
+    return th.a.value;
+}
+braceprv.BS BraceElideRebuildBS(braceprv.BS a) { return braceprv.BS(a.value); }
+cpcpick.CV BraceElideRebuildCV(cpcpick.CV a) { return cpcpick.CV(a.v); }
+struct BraceElideCVHolder { cpcpick.CV e; };
+struct BraceElideBSPair { braceprv.BS e; braceprv.BS f; };
+int BraceElideThrowArray(int t)
+{
+    braceprv.BS[2] arr = { BraceElideRebuildBS(braceprv.BS(1)), braceprv.throwingMk(2) };
+    return arr[0].value;
+}
+int BraceElideThrowField(int t)
+{
+    BraceElideBSPair w = { e = BraceElideRebuildBS(braceprv.BS(1)), f = braceprv.throwingMk(2) };
+    return w.e.value;
+}
 // T228: several candidates share the sret slot. A local is elided when every return inside its live
 // range names it; a return naming another local (or any other value) keeps it a normal local.
 // Oracle: clang++ -std=c++20 on the same shapes (scratch/t228_tmp/oracle.cpp, oracle2.cpp, oracle3.cpp).
@@ -5804,6 +5828,7 @@ struct CppopeqPubHost { cppopeq.Pub f = cppopeq.Pub(); int z = 0; };
 struct CppopeqTrivDelMoveHost { cppopeq.TrivDelMove f = cppopeq.TrivDelMove(); int z = 0; };
 cppopeq.MoveOnly CppopeqMakeMoveOnly() { cppopeq.MoveOnly t = cppopeq.MoveOnly(); t.v = 9; return t; }
 int CppopeqAssignable<T>() { return is_assignable(T) ? 1 : 0; }
+int CppopeqViaGeneric<T>(T s) { T a = s; a = cppopeq.mkPub(); return a.v; }
 int CppopeqAccept()
 {
     cppopeq.DelMove dm = cppopeq.DelMove(); cppopeq.DelMove dmSrc = cppopeq.DelMove(); dmSrc.v = 7;
@@ -5872,6 +5897,49 @@ int CppopeqAccept()
     if (CppopeqAssignable<cppopeq.Pub>() != 1 || CppopeqAssignable<cppopeq.DelMove>() != 1) return 36821;
     // Move-only: only the copy is refused, so the class still assigns (from an rvalue).
     if (CppopeqAssignable<cppopeq.MoveOnly>() != 1) return 36822;
+    // ASGACC: a C++ by-value call result is a prvalue source (+50 = the move ran, +100 the copy).
+    pub = cppopeq.mkPub();
+    if (pub.v != 109) return 36823;
+    pm = cppopeq.mkPubMove();
+    if (pm.v != 59) return 36824;
+    pub = cppopeq.Fac.make();
+    if (pub.v != 109) return 36825;
+    cppopeq.Fac fac = cppopeq.Fac(); fac.k = 6;
+    pub = fac.mk();
+    if (pub.v != 106) return 36826;
+    host.f = cppopeq.mkPub();
+    if (host.f.v != 109) return 36827;
+    cppopeq.Pub* pubPtr = &pub;
+    *pubPtr = cppopeq.mkPub();
+    if (pub.v != 109) return 36828;
+    cppopeq.Pub[2] pubs = default;
+    pubs[1] = cppopeq.mkPub();
+    if (pubs[1].v != 109) return 36829;
+    if (CppopeqViaGeneric(pubSrc) != 109) return 36830;
+    cppopeq.Pub chained = cppopeq.Pub();
+    chained = pub = cppopeq.mkPub();
+    if (chained.v * 1000 + pub.v != 209109) return 36831;
+    // A prvalue destination: operator= runs on the materialized temporary (clang).
+    if ((cppopeq.mkPub() = pubSrc).v != 107) return 36832;
+    if ((cppopeq.mkPubMove() = cppopeq.mkPubMove()).v != 59) return 36833;
+    cppopeq.PubMove pmMoved = cppopeq.PubMove(); pmMoved.v = 5;
+    if ((cppopeq.mkPubMove() = move pmMoved).v != 55) return 36834;
+    // A converting operator= beside the copy one: the same-class source still takes the copy.
+    cppopeq.Conv conv = cppopeq.Conv(); conv.v = 4;
+    if ((cppopeq.mkConv() = conv).v != 104) return 36835;
+    // Special-member counts match clang: one move-assign / copy-assign, every temp destroyed once.
+    int counted = cppopeq.cntCounts();
+    { cppopeq.Cnt c = cppopeq.Cnt(); c = cppopeq.mkCnt(); if (c.v != 59) return 36836; }
+    if (cppopeq.cntCounts() - counted != 12) return 36837;
+    counted = cppopeq.cntCounts();
+    { cppopeq.Cnt c = cppopeq.Cnt(); if ((cppopeq.mkCnt() = c).v != 101) return 36838; }
+    if (cppopeq.cntCounts() - counted != 102) return 36839;
+    counted = cppopeq.cntCounts();
+    { cppopeq.Cnt c = cppopeq.Cnt(); cppopeq.mkCnt() = c; }
+    if (cppopeq.cntCounts() - counted != 102) return 36840;
+    counted = cppopeq.cntCounts();
+    { if ((cppopeq.mkCnt() = cppopeq.mkCnt()).v != 59) return 36841; }
+    if (cppopeq.cntCounts() - counted != 12) return 36842;
     return 0;
 }
 
@@ -9544,6 +9612,45 @@ extern int main()
     t104.RefSource t104RefSource = default;
     if (t104.takeConstX(t104RefSource) != 1071) return 10404;
     if (t104.copies != t104Copies) return 10405;
+    // REFCONV: `operator X&&()` binds the existing object at `X&&` / `const X&` (no temporary);
+    // reference conversions are inherited through a public base; a base result adjusts by offset.
+    {
+        int refconvMade = t104.made;
+        int refconvCopies = t104.copies;
+        t104.RRefSource refconvRRef = default;
+        if (t104.takeRvX(refconvRRef) != 2071) return 10406;
+        if (t104.takeConstX(refconvRRef) != 1071) return 10407;
+        t104.RRefSource refconvMoved = default;
+        if (t104.takeRvX(move refconvMoved) != 2071) return 10408;
+        if (t104.takeRvX(t104.RRefSource()) != 2071) return 10409;
+        if (t104.pickX(refconvRRef) != 4071) return 10410;
+        t104.DerivedRefSource refconvDerived = default;
+        if (t104.takeConstX(refconvDerived) != 1071 || t104.takeMutX(refconvDerived) != 1) return 10411;
+        t104.DerivedRRefSource refconvDerivedRRef = default;
+        if (t104.takeRvX(refconvDerivedRRef) != 2071 || t104.takeConstX(refconvDerivedRRef) != 1071)
+            return 10412;
+        if (t104.made != refconvMade || t104.copies != refconvCopies) return 10413;
+        // By value copies FROM the reference result: one construction, one copy.
+        if (t104.takeValX(refconvRRef) != 3071 || t104.takeValX(refconvDerived) != 3071) return 10414;
+        if (t104.made - refconvMade != 2 || t104.copies - refconvCopies != 2) return 10415;
+        t104.OffsetRefSource refconvOffset = default;
+        t104.OffsetRRefSource refconvOffsetRRef = default;
+        if (t104.takeOffsetX(refconvOffset) != 1073 || t104.takeOffsetX(refconvOffsetRRef) != 1073)
+            return 10416;
+        t104.RefTaker refconvTaker = default;
+        if (refconvTaker.take(refconvRRef) != 7071 || refconvTaker.takeConst(refconvRRef) != 7171
+            || refconvTaker.takeConst(refconvDerived) != 7171) return 10417;
+    }
+    // REFCONV r2: the same operator X& ranks X& over const X& (3.2.6); a derived X binds its base directly.
+    {
+        t104.RefSource refconvCvRef = default;
+        t104.BothRefSource refconvCvBoth = default;
+        t104.RRefSource refconvCvRRef = default;
+        if (t104.pickCv(refconvCvRef) != 1 || t104.pickCv(refconvCvBoth) != 1) return 10418;
+        if (t104.pickAll(refconvCvRef) != 1 || t104.pickAll(refconvCvRRef) != 3) return 10419;
+        t104.DerivedWithRef refconvDerivedX = default;
+        if (t104.takeConstX(refconvDerivedX) != 90) return 10420;
+    }
     if (cpi_t42.made - cpi_t42.gone != t42Made - t42Gone)                            return 4215;
     // An explicit converting ctor never binds `X&&` implicitly; a same-class lvalue needs `move`.
     expect_error("is declared explicit, so it is not offered as an implicit conversion") {
@@ -24224,6 +24331,55 @@ extern int main()
         if (tr[0] != -1 || tr[1] != 0 || tr[2] != 0 || tr[3] != 1 || tr[4] != 1 || tr[5] != 4 || tr[6] != 0 || tr[7] != 0) return 99703;
         TrFieldDiscard(5, tr);
         if (tr[0] != -1 || tr[1] != 0 || tr[2] != 0 || tr[3] != 1 || tr[4] != 1 || tr[5] != 4 || tr[6] != 0 || tr[7] != 0) return 99704;
+        // OBJOIN: an imported-class prvalue arm beside an unmoved place arm copies the place into
+        // the prvalue join (was refused as a mixed-ownership join). clang++ -std=c++20 value + sig.
+        if (ObjoinAddDefaultPlace(false) != 23 || cppobjoin.Obj.sig() != 110004 || cppobjoin.Obj.live != 0) return 99705;
+        if (ObjoinAddDefaultPlace(true) != 27 || cppobjoin.Obj.sig() != 200004 || cppobjoin.Obj.live != 0) return 99706;
+        if (ObjoinAssignDefaultPlace(false) != 3 || cppobjoin.Obj.sig() != 10103 || cppobjoin.Obj.live != 0) return 99707;
+        if (ObjoinAssignDefaultPlace(true) != 7 || cppobjoin.Obj.sig() != 100103 || cppobjoin.Obj.live != 0) return 99708;
+        if (ObjoinAddPlaceDefault(false) != 27 || cppobjoin.Obj.sig() != 200004 || cppobjoin.Obj.live != 0) return 99709;
+        if (ObjoinAddPlaceDefault(true) != 23 || cppobjoin.Obj.sig() != 110004 || cppobjoin.Obj.live != 0) return 99710;
+        if (ObjoinAddPlaceCall(false) != 25 || cppobjoin.Obj.sig() != 200004 || cppobjoin.Obj.live != 0) return 99711;
+        if (ObjoinAddPlaceCall(true) != 23 || cppobjoin.Obj.sig() != 110004 || cppobjoin.Obj.live != 0) return 99712;
+        if (ObjoinAssignPlaceCall(false) != 5 || cppobjoin.Obj.sig() != 100103 || cppobjoin.Obj.live != 0) return 99713;
+        if (ObjoinAssignPlaceCall(true) != 3 || cppobjoin.Obj.sig() != 10103 || cppobjoin.Obj.live != 0) return 99714;
+        if (ObjoinUsePlaceCall(false) != 5 || cppobjoin.Obj.sig() != 100002 || cppobjoin.Obj.live != 0) return 99715;
+        if (ObjoinUsePlaceCall(true) != 3 || cppobjoin.Obj.sig() != 10002 || cppobjoin.Obj.live != 0) return 99716;
+        if (ObjoinAddFieldPlace(false) != 23 || cppobjoin.Obj.sig() != 110004 || cppobjoin.Obj.live != 0) return 99717;
+        if (ObjoinAddFieldPlace(true) != 27 || cppobjoin.Obj.sig() != 200004 || cppobjoin.Obj.live != 0) return 99718;
+        if (ObjoinAddDerefPlace(false) != 23 || cppobjoin.Obj.sig() != 110004 || cppobjoin.Obj.live != 0) return 99719;
+        if (ObjoinAddDerefPlace(true) != 27 || cppobjoin.Obj.sig() != 200004 || cppobjoin.Obj.live != 0) return 99720;
+        if (ObjoinAddParamPlace(false) != 23 || cppobjoin.Obj.sig() != 310004 || cppobjoin.Obj.live != 0) return 99721;
+        if (ObjoinAddParamPlace(true) != 27 || cppobjoin.Obj.sig() != 400004 || cppobjoin.Obj.live != 0) return 99722;
+        if (ObjoinAddNestedJoin(false) != 23 || cppobjoin.Obj.sig() != 110004 || cppobjoin.Obj.live != 0) return 99723;
+        if (ObjoinAddNestedJoin(true) != 27 || cppobjoin.Obj.sig() != 200004 || cppobjoin.Obj.live != 0) return 99724;
+        if (ObjoinAssignRefPlace(false) != 3 || cppobjoin.Obj.sig() != 10103 || cppobjoin.Obj.live != 0) return 99725;
+        if (ObjoinAssignRefPlace(true) != 7 || cppobjoin.Obj.sig() != 100103 || cppobjoin.Obj.live != 0) return 99726;
+        if (ObjoinAddThisFieldPlace(false) != 27 || cppobjoin.Obj.sig() != 210004 || cppobjoin.Obj.live != 0) return 99727;
+        if (ObjoinAddThisFieldPlace(true) != 27 || cppobjoin.Obj.sig() != 300004 || cppobjoin.Obj.live != 0) return 99728;
+        if (ObjoinAssignDerefDefault(false) != 7 || cppobjoin.Obj.sig() != 100103 || cppobjoin.Obj.live != 0) return 99729;
+        if (ObjoinAssignDerefDefault(true) != 3 || cppobjoin.Obj.sig() != 10103 || cppobjoin.Obj.live != 0) return 99730;
+        if (ObjoinLeftOperandJoin(false) != 32 || cppobjoin.Obj.sig() != 120005 || cppobjoin.Obj.live != 0) return 99731;
+        if (ObjoinLeftOperandJoin(true) != 72 || cppobjoin.Obj.sig() != 210005 || cppobjoin.Obj.live != 0) return 99732;
+        // Brace members: value and no leak (the counts carry the brace-element move, not this join).
+        if (ObjoinBraceDefaultPlace(false) != 3 || cppobjoin.Obj.live != 0) return 99733;
+        if (ObjoinBraceDefaultPlace(true) != 7 || cppobjoin.Obj.live != 0) return 99734;
+        if (ObjoinBracePlaceCall(false) != 5 || cppobjoin.Obj.live != 0) return 99735;
+        if (ObjoinBracePlaceCall(true) != 3 || cppobjoin.Obj.live != 0) return 99736;
+        // cppas.Life `t = c ? a + b : b` (and `a.ref()`, reversed): copy into the join, move-assign.
+        int[7] ol = { 0, 0, 0, 0, 0, 0, 0 };
+        ObjoinLife(0, false, ol);
+        if (ol[0] != 44 || ol[1] != 0 || ol[2] != 1 || ol[3] != 0 || ol[4] != 4 || ol[5] != 0 || ol[6] != 1) return 99737;
+        ObjoinLife(0, true, ol);
+        if (ol[0] != 74 || ol[1] != 1 || ol[2] != 0 || ol[3] != 0 || ol[4] != 4 || ol[5] != 0 || ol[6] != 1) return 99738;
+        ObjoinLife(1, false, ol);
+        if (ol[0] != 33 || ol[1] != 0 || ol[2] != 1 || ol[3] != 0 || ol[4] != 4 || ol[5] != 0 || ol[6] != 1) return 99739;
+        ObjoinLife(1, true, ol);
+        if (ol[0] != 73 || ol[1] != 1 || ol[2] != 0 || ol[3] != 0 || ol[4] != 4 || ol[5] != 0 || ol[6] != 1) return 99740;
+        ObjoinLife(2, false, ol);
+        if (ol[0] != 74 || ol[1] != 1 || ol[2] != 0 || ol[3] != 0 || ol[4] != 4 || ol[5] != 0 || ol[6] != 1) return 99741;
+        ObjoinLife(2, true, ol);
+        if (ol[0] != 44 || ol[1] != 0 || ol[2] != 1 || ol[3] != 0 || ol[4] != 4 || ol[5] != 0 || ol[6] != 1) return 99742;
         // T288 r3: a const-host field arm is not a plain local join: copy-assign, sources kept (as clang).
         T288ConstHostField(true, q);
         if (q[0] != 21 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99015;
@@ -28018,6 +28174,52 @@ int T418TemplateCompeting(bool c)
     return value;  // copies stay master's (one extra per arm, pre-existing); the guard is acceptance
 }
 
+// CALLPAR: overloads that disagree at the slot type `default` from the other arm, as clang's `X()` does.
+int CallparComp(bool c) { t418.reset(); int value = 0; { t418.Val v = t418.Val(7); value = callpar.comp(c ? default : v); } return T418Pack(value); }
+int CallparConv(bool c) { t418.reset(); int value = 0; { t418.Conv v = default; value = callpar.convc(c ? default : v); } return T418Pack(value); }
+// CALLPAR: a template-only set evaluates `c ? default : local` as the C++ conditional (clang's copies).
+int CallparTpl(bool c)
+{
+    cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0;
+    { cpptw.Twin x = cpptw.Twin(7); value = callpar.ftpl(c ? default : x); }
+    return T420Pack(value, baseLive);
+}
+int CallparTplRef(bool c)
+{
+    cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0;
+    { cpptw.Twin x = cpptw.Twin(7); value = callpar.fcr(c ? default : x); }
+    return T420Pack(value, baseLive);
+}
+int CallparTplMember(bool c)
+{
+    cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0;
+    { cpptw.Twin x = cpptw.Twin(7); callpar.Host h = default; value = h.tpl(c ? default : x); }
+    return T420Pack(value, baseLive);
+}
+int CallparTplForward(bool c)
+{
+    cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0;
+    { cpptw.Twin x = cpptw.Twin(7); callpar.Host h = default; value = h.fw(c ? default : x); }
+    return T420Pack(value, baseLive);
+}
+// CALLPAR: a bare call reaches a namespace-scope C++ function or template by ADL.
+int CallparAdl() { callpar.adl.A a = default; return adlf(a) * 100 + adlr(a) * 10 + adlt(1, a); }
+// CALLPAR r2: a member of the enclosing struct hides ADL ([basic.lookup.argdep]/3, clang 33).
+struct CallparMemberHides
+{
+    int adlf(callpar.adl.A a) { return 33; }
+    int run() { callpar.adl.A a = default; return adlf(a); }
+};
+int CallparMemberAdl() { CallparMemberHides s = default; return s.run(); }
+// CALLPAR r2: bare `default` with a scalar or pointer candidate keeps clang's pick (g(int) 30, h(Val*) 60).
+int CallparDefaultScalar() { return callpar.g(default) * 100 + callpar.h(default); }
+int CallparAdlTwin()
+{
+    cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0;
+    { cpptw.Twin x = cpptw.Twin(7); cpptw.Twin y = cpptw.Twin(2); value = take2(x, y); }
+    return T420Pack(value, baseLive);
+}
+
 int T461LocalFree() { const t461cv.CV x = t461cv.CV(7); return t461cv.take(x); }
 int T461LocalMember() { const t461cv.CV x = t461cv.CV(7); t461cv.Host h = default; return h.member_take(x); }
 int T461LocalCtor() { const t461cv.CV x = t461cv.CV(7); t461cv.Sink s = t461cv.Sink(x); return s.result; }
@@ -31222,8 +31424,113 @@ int LoweredUserDtorAssignLegs(int argc)
         braceprv.Outer out = { braceprv.mkConstInnerPtr(&s), 1 };
         if (out.r.value != 7) return 13615;
     }
-    // Known gap (not clang parity, clang 1001): const above the pointee level declines capture, eager path.
-    if (braceprv.BS_Stats.code() != 1012 || braceprv.BS_Stats.selected != 13) return 13615;
+    // BRACEELIDE: const above the pointee level is spelled on the wrapper; built in place (clang 1001).
+    if (braceprv.BS_Stats.code() != 1001 || braceprv.BS_Stats.selected != 13) return 13615;
+    // BRACEELIDE order rule: a later element reading a local whose address no code has taken cannot
+    // observe the deferred constructor, so it is built in place (clang 1001; master moved, 1012).
+    braceprv.BS_Stats.reset();
+    {
+        int k = 4;
+        braceprv.Outer out = { braceprv.BS(k, 1), k };
+        if (out.r.value + out.x != 45) return 13616;
+    }
+    if (braceprv.BS_Stats.code() != 1001) return 13616;
+    braceprv.BS_Stats.reset();
+    if (BraceElideParamRead(4) != 45 || braceprv.BS_Stats.code() != 1001) return 13617;
+    braceprv.BS_Stats.reset();
+    {
+        int k = 4;
+        braceprv.Outer out = { braceprv.BS(k, 1), k, k };
+        if (out.r.value + out.x + out.y != 49) return 13618;
+    }
+    if (braceprv.BS_Stats.code() != 1001) return 13618;
+    braceprv.BS_Stats.reset();
+    {
+        int k = 3;
+        braceprv.Outer out = { braceprv.mk(k), k };
+        if (out.r.value * 10 + out.x != 33) return 13619;
+    }
+    if (braceprv.BS_Stats.code() != 1001 || braceprv.BS_Stats.order != 3) return 13619;
+    braceprv.BS_Stats.reset();
+    {
+        int a = 4;
+        int b = 6;
+        braceprv.Outer out = { braceprv.BS(a, 1), a, b };
+        if (out.r.value + out.x + out.y != 51) return 13620;
+    }
+    if (braceprv.BS_Stats.code() != 1001) return 13620;
+    braceprv.BS_Stats.reset();
+    if (braceprv.guarded(BraceElideThrowAgg, 0) != 2 || braceprv.BS_Stats.code() != 2002
+        || braceprv.BS_Stats.order != 22) return 13621;
+    // Guard (master equal): a `T&` constructor still runs before the later read sees the write.
+    {
+        int k = 3;
+        braceprv.WAgg w = { braceprv.BW(k), k };
+        if (w.w.value != 3 || w.x != 77 || k != 77) return 13622;
+    }
+    // Guard (master equal): an `alias` naming the slot keeps the `T&` element eager (clang 77).
+    {
+        int k = 3;
+        alias int r = k;
+        braceprv.WAgg w = { braceprv.BW(r), k };
+        if (w.w.value != 3 || w.x != 77 || k != 77) return 13633;
+    }
+    // Guard (master equal): an escaped address keeps the element eager; the value is clang's.
+    {
+        int k = 4;
+        int* pk = &k;
+        braceprv.Outer out = { braceprv.BS(k, 1), k };
+        if (out.r.value + out.x + *pk != 49) return 13623;
+    }
+    // BRACECALL: a call whose argument is a call or a temporary builds in place (clang counts).
+    braceprv.BS_Stats.reset();
+    {
+        braceprv.Outer out = { braceprv.mk(braceprv.side()), 1 };
+        if (out.r.value != 4) return 13624;
+    }
+    if (braceprv.BS_Stats.code() != 1001 || braceprv.BS_Stats.order != 94) return 13624;
+    braceprv.BS_Stats.reset();
+    {
+        braceprv.Outer out = { braceprv.mk(braceprv.BS(2).value), 1 };
+        if (out.r.value != 2) return 13625;
+    }
+    if (braceprv.BS_Stats.code() != 2002 || braceprv.BS_Stats.order != 22) return 13625;
+    braceprv.BS_Stats.reset();
+    if (braceprv.guarded(BraceElideThrowAgg, 1) != -1 || braceprv.BS_Stats.code() != 2002
+        || braceprv.BS_Stats.order != 22) return 13626;
+    // RETELIDE shapes: a CFlat callee fed a temporary builds in a CFlat field or array slot
+    // (clang: born 2 / 4, value 1 / 12; master copied, born 3 / 6, value 2 / 23).
+    cpcpick.CV.reset();
+    {
+        BraceElideCVHolder holder = { e = BraceElideRebuildCV(cpcpick.CV(1)) };
+        if (holder.e.v != 1 || cpcpick.CV.mutCopy != 0) return 13627;
+    }
+    if (cpcpick.CV.born != 2 || cpcpick.CV.dead != 2) return 13627;
+    cpcpick.CV.reset();
+    {
+        cpcpick.CV[2] arr = { BraceElideRebuildCV(cpcpick.CV(1)), BraceElideRebuildCV(cpcpick.CV(2)) };
+        if (arr[0].v * 10 + arr[1].v != 12 || cpcpick.CV.mutCopy != 0) return 13628;
+    }
+    if (cpcpick.CV.born != 4 || cpcpick.CV.dead != 4) return 13628;
+    braceprv.BS_Stats.reset();
+    if (braceprv.guarded(BraceElideThrowArray, 0) != -1 || braceprv.BS_Stats.code() != 3003
+        || braceprv.BS_Stats.order != 112) return 13629;
+    braceprv.BS_Stats.reset();
+    if (braceprv.guarded(BraceElideThrowField, 0) != -1 || braceprv.BS_Stats.code() != 3003
+        || braceprv.BS_Stats.order != 112) return 13630;
+    braceprv.BS_Stats.reset();
+    {
+        braceprv.BS[2] arr = { braceprv.mk(braceprv.BS(1).value), braceprv.mk(2) };
+        if (arr[0].value * 10 + arr[1].value != 12) return 13631;
+    }
+    if (braceprv.BS_Stats.code() != 3003) return 13631;
+    // BRACECALL sole element: `S x = { mk(g()) }` builds in the slot (clang 1001, master 1012).
+    braceprv.BS_Stats.reset();
+    {
+        braceprv.BS sole = { braceprv.mk(braceprv.side()) };
+        if (sole.value != 4) return 13632;
+    }
+    if (braceprv.BS_Stats.code() != 1001 || braceprv.BS_Stats.order != 94) return 13632;
     // T224: the nested candidate's return moves nothing; the caller's destructor runs once.
     cppunw.reset();
     {
@@ -31793,6 +32100,22 @@ int LoweredUserDtorAssignLegs(int argc)
     if (T418TemplateSingle(true) != 10) return 41815;
     if (T418TemplateCompeting(false) != 82) return 41816;
     if (T418TemplateCompeting(true) != 10) return 41817;
+    if (CallparComp(false) != 2711020) return 93701;
+    if (CallparComp(true) != 2020020) return 93702;
+    if (CallparConv(false) != 4400000) return 93703;
+    if (CallparConv(true) != 4400000) return 93704;
+    if (CallparTpl(false) != 571100020) return 93705;
+    if (CallparTpl(true) != 502000020) return 93706;
+    if (CallparTplRef(false) != 671100020) return 93707;
+    if (CallparTplRef(true) != 602000020) return 93708;
+    if (CallparTplMember(false) != 771100020) return 93709;
+    if (CallparTplMember(true) != 702000020) return 93710;
+    if (CallparTplForward(false) != 871100020) return 93711;
+    if (CallparTplForward(true) != 802000020) return 93712;
+    if (CallparAdl() != 678) return 93713;
+    if (CallparAdlTwin() != 92200040) return 93714;
+    if (CallparMemberAdl() != 33) return 93715;
+    if (CallparDefaultScalar() != 3060) return 93716;
     // T461: +200 identifies the const copy constructor; +100 identifies the non-const one.
     if (T461LocalFree() != 207) return 46101;
     if (T461LocalMember() != 207) return 46102;
@@ -34557,6 +34880,15 @@ int deepPtrLegs()
     // Each runs once too: the temporary and the other global's store belong to the variable's own initializer.
     if (grpleak_host.Calls<grpleak_ref.X>().g() != 11) return 11912;
     if (grpleak_host.Calls<grpleak_side.X>().g() != 1417) return 11913;
+    // PICKNAME: a CFlat method named like a C++ member leaves clang's member pick intact.
+    pickname.NSink pickNs = default; pickname.MSink pickMs = default;
+    pickname.TSink<int> pickTs = default; pickname.DSink pickDs = default;
+    if (pickNs.pickAlias(pickname.nd_ptr()) != pickname.oraclePick()) return 12801;
+    if (pickMs.pickAlias(pickname.nd_ptr()) != 1) return 12802;
+    if (pickTs.pickAlias(pickname.nd_ptr()) != 1) return 12803;
+    if (pickDs.pickAlias(pickname.nd_ptr()) != 1) return 12804;
+    PicknameBox pickBox = default;
+    if (pickBox.pickAlias(true) != 9) return 12805;
     return 0;
 }
 
@@ -34564,4 +34896,45 @@ cppexp.Retelide TNestelideLater(cppexp.Retelide p)
 {
     cppexp.Retelide g = move p;
     return g;
+}
+
+// OBJOIN helpers (legs 99705-99742): an imported-class prvalue arm beside an unmoved place arm
+// is a prvalue join; the place arm is copied into the selected temporary (clang++ -std=c++20).
+// Each returns the value read; cppobjoin.Obj.sig() is ctor|copy|move|move-assign|copy-assign|dtor
+// counted from after the locals are built, including their scope-exit destructors.
+int ObjoinAddDefaultPlace(bool c) { int r = 0; { cppobjoin.Obj a = cppobjoin.Obj(2); cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); r = (a + (c ? default : x)).v; } return r; }
+int ObjoinAssignDefaultPlace(bool c) { int r = 0; { cppobjoin.Obj y = cppobjoin.Obj(1); cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); y = c ? default : x; r = y.v; } return r; }
+int ObjoinAddPlaceDefault(bool c) { int r = 0; { cppobjoin.Obj a = cppobjoin.Obj(2); cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); r = (a + (c ? x : default)).v; } return r; }
+int ObjoinAddPlaceCall(bool c) { int r = 0; { cppobjoin.Obj a = cppobjoin.Obj(2); cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); r = (a + (c ? x : cppobjoin.mk(5))).v; } return r; }
+int ObjoinAssignPlaceCall(bool c) { int r = 0; { cppobjoin.Obj y = cppobjoin.Obj(1); cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); y = c ? x : cppobjoin.mk(5); r = y.v; } return r; }
+int ObjoinUsePlaceCall(bool c) { int r = 0; { cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); r = cppobjoin.use(c ? x : cppobjoin.mk(5)); } return r; }
+int ObjoinAddFieldPlace(bool c) { int r = 0; { cppobjoin.Obj a = cppobjoin.Obj(2); cppobjoin.Holder hh{ cppobjoin.Obj(3) }; cppobjoin.Obj.reset(); r = (a + (c ? default : hh.o)).v; } return r; }
+int ObjoinAddDerefPlace(bool c) { int r = 0; { cppobjoin.Obj a = cppobjoin.Obj(2); cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj* p = &x; cppobjoin.Obj.reset(); r = (a + (c ? default : *p)).v; } return r; }
+int ObjoinParamHelper(cppobjoin.Obj p, bool c) { cppobjoin.Obj a = cppobjoin.Obj(2); return (a + (c ? default : p)).v; }
+int ObjoinAddParamPlace(bool c) { int r = 0; { cppobjoin.Obj.reset(); r = ObjoinParamHelper(cppobjoin.mk(3), c); } return r; }
+int ObjoinAddNestedJoin(bool c) { int r = 0; { cppobjoin.Obj a = cppobjoin.Obj(2); cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); r = (a + (c ? (c ? default : x) : x)).v; } return r; }
+int ObjoinAssignRefPlace(bool c) { int r = 0; { cppobjoin.Obj y = cppobjoin.Obj(1); cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); y = c ? default : cppobjoin.ref(x); r = y.v; } return r; }
+struct ObjoinBox { cppobjoin.Obj o = default; int objoinPick(bool c) { cppobjoin.Obj a = cppobjoin.Obj(2); return (a + (c ? default : o)).v; } };
+int ObjoinAddThisFieldPlace(bool c) { int r = 0; { ObjoinBox b = default; cppobjoin.Obj.reset(); r = b.objoinPick(c); } return r; }
+int ObjoinAssignDerefDefault(bool c) { int r = 0; { cppobjoin.Obj y = cppobjoin.Obj(1); cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj* p = &x; cppobjoin.Obj.reset(); y = c ? *p : default; r = y.v; } return r; }
+int ObjoinLeftOperandJoin(bool c) { int r = 0; { cppobjoin.Obj a = cppobjoin.Obj(2); cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); r = ((c ? default : x) + a).v; } return r; }
+// Brace members: the value and no leak are pinned; the counts carry the brace-element extra move
+// that `Holder h{ mk(5) }` makes without any `?:` (not this join).
+int ObjoinBraceDefaultPlace(bool c) { int r = 0; { cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); cppobjoin.Holder h{ c ? default : x }; r = h.value(); } return r; }
+int ObjoinBracePlaceCall(bool c) { int r = 0; { cppobjoin.Obj x = cppobjoin.Obj(3); cppobjoin.Obj.reset(); cppobjoin.CHolder h{ c ? x : cppobjoin.mk(5) }; r = h.value(); } return r; }
+// cppas.Life: `t = c ? a + b : b` copies b into the prvalue join, then move-assigns (clang).
+// o = [value * 10 + source value, ctors, copies, moves, dtors, copy-assigns, move-assigns]
+void ObjoinLife(int shape, bool c, int* o)
+{
+    {
+        cppas.Life a = cppas.Life(3);
+        cppas.Life b = cppas.Life(4);
+        cppas.Life t = cppas.Life(0);
+        cppas.Life.reset();
+        if (shape == 0) { t = c ? a + b : b; o[0] = t.value() * 10 + b.value(); }
+        else if (shape == 1) { t = c ? a + b : a.ref(); o[0] = t.value() * 10 + a.value(); }
+        else { t = c ? b : a + b; o[0] = t.value() * 10 + b.value(); }
+    }
+    o[1] = cppas.Life.ctors; o[2] = cppas.Life.copies; o[3] = cppas.Life.moves; o[4] = cppas.Life.dtors;
+    o[5] = cppas.Life.copy_assigns; o[6] = cppas.Life.move_assigns;
 }

@@ -1,0 +1,9 @@
+// CALLPAR: bare `default` into two C++ overloads taking default-constructible classes is `f({})`,
+// which clang refuses as ambiguous.
+import cpp "cpp_interop_lastuse.h";
+
+expect_error("'default' argument 1 to 'callpar.comp' is ambiguous: more than one overload takes it") {
+    int competing() { return callpar.comp(default); }
+}
+
+extern int main() { return 0; }

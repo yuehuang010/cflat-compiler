@@ -1,0 +1,13 @@
+// A reference conversion operator inherited through a private / protected base is inaccessible:
+// clang refuses the binding, and CFlat relays its access error.
+import cpp "cpp_interop_t104_refparam.hpp";
+
+expect_error("is a private member of") {
+    int privateConst() { t104.PrivateRefSource s = default; return t104.takeConstX(s); }
+}
+expect_error("is a protected member of") {
+    int protectedMut() { t104.ProtectedRefSource s = default; return t104.takeMutX(s); }
+}
+expect_error("is a private member of") {
+    int privateRvalue() { t104.PrivateRRefSource s = default; return t104.takeRvX(s); }
+}

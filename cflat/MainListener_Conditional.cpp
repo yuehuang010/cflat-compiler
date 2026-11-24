@@ -796,6 +796,30 @@ bool MainListener::CanMaterializeMixedDefault(const std::string& defaultType)
         || !compiler->CxxElementNeedsDefaultConstruction(defaultType);
 }
 
+// CALLPAR: `c ? default : local` (either order) whose other arm is a live nontrivial C++ class local.
+bool MainListener::IsCxxDefaultLocalTernary(antlr4::ParserRuleContext* ctx)
+{
+        auto* conditional = DeferrableTernaryNode(ctx);
+        if (conditional == nullptr || conditional->expression() == nullptr
+            || conditional->conditionalExpression() == nullptr)
+            return false;
+        const bool trueDefault = IsDefaultOnlyExpression(conditional->expression());
+        if (trueDefault == IsDefaultOnlyExpression(conditional->conditionalExpression())) return false;
+        antlr4::tree::ParseTree* other = trueDefault
+            ? static_cast<antlr4::tree::ParseTree*>(conditional->conditionalExpression())
+            : static_cast<antlr4::tree::ParseTree*>(conditional->expression());
+        auto* postfix = SolePostfixExpressionShape(other);
+        auto* primary = postfix != nullptr && postfix->children.size() == 1 ? postfix->primaryExpression() : nullptr;
+        auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
+        if (generic == nullptr || generic->genericTypeParameters() != nullptr || generic->Identifier() == nullptr)
+            return false;
+        auto* compiler = Compiler(ctx);
+        auto local = compiler->GetScopedLocalOrArgument(generic->Identifier()->getText());
+        return local.Storage != nullptr && !local.TypeAndValue.Pointer && local.TypeAndValue.PointerDepth == 0
+            && !local.TypeAndValue.IsAlias
+            && compiler->IsForeignNontrivialCxxClass(compiler->ResolveTypeAlias(local.TypeAndValue.TypeName));
+}
+
 /*
  * REFDEF: C++ makes `c ? default : place` a prvalue, so the caller copies the selected place at the
  * argument's position. Only this exact shape is materialized that way; any call or move leaf keeps
@@ -2268,7 +2292,7 @@ llvm::Value* MainListener::AdoptTernaryStringArm(LLVMBackend* compiler, llvm::Va
 void MainListener::FinishTernaryArm(LLVMBackend* compiler, llvm::Value*& value,
                           const LLVMBackend::OwnedTempMark& mark, bool& deepCopied,
                           llvm::BasicBlock* hoistTo, bool movedString) {
-        // Both arms moved: the moved-out buffer has no other owner, so the join takes it as is.
+        // A moved arm: the moved-out buffer has no other owner, so the join takes it as is.
         // A copy here orphaned the source buffer (HeapAudit leak); the join registers the phi.
         auto* stringTy = llvm::StructType::getTypeByName(*compiler->context, "string");
         if (movedString && stringTy != nullptr && value != nullptr && value->getType() == stringTy)
@@ -2567,6 +2591,28 @@ bool MainListener::CollectOwningLocalPointerArm(const LLVMBackend::TypedValue& s
     out.push_back({ storage, value->getType(), armBlock, sourceName, std::string(), false, true });
     out.back().MoveParamSinkArgument = inCallArgument_;
     out.back().IsExplicitMove = shape.isExplicitMove;
+    return true;
+}
+
+// A call-argument arm naming the active foreach element itself: an implicit move sink takes it out of
+// its slot like the direct `sink(p)` does, so the taken arm nulls the slot before the call.
+bool MainListener::CollectRangeElementArm(const LLVMBackend::TypedValue& shape,
+        llvm::Value* value, llvm::Value* storage, llvm::BasicBlock* armBlock,
+        std::vector<LLVMBackend::ConditionalMoveSource>& out)
+{
+    if (!inCallArgument_) return false;
+    if (storage == nullptr) storage = shape.receiverStorage;
+    if (value == nullptr || storage == nullptr || armBlock == nullptr
+        || !value->getType()->isPointerTy() || !shape.sourceFieldName.empty()
+        || shape.sourceIsElementAccess || shape.isExplicitMove)
+        return false;
+    const auto* source = Compiler()->FindVariableByStorage(storage);
+    if (source == nullptr || !source->IsRangeForBorrow || !source->TypeAndValue.Pointer)
+        return false;
+    const auto* range = FindActiveRangeForVariable(*source);
+    if (range == nullptr || range->elementStorage != storage) return false;
+    out.push_back({ storage, value->getType(), armBlock, range->variableName, std::string(), false });
+    out.back().MoveParamSinkArgument = true;
     return true;
 }
 
@@ -3184,8 +3230,6 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             && armIsMove(expressionTrueCtx->assignmentExpression());
         const bool falseExplicitMove = expressionFalseCtx != nullptr
             && armIsMove(expressionFalseCtx);
-        const bool bothArmsMoved = expressionTrueCtx != nullptr && expressionFalseCtx != nullptr
-            && trueExplicitMove && falseExplicitMove;
         /*
          * A moved arm whose bytes nothing consumes keeps them in its source: the operand of
          * `(c ? move a : move b).x` (read in place through the storage join) and a discarded
@@ -3415,6 +3459,39 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             compiler->RegisterOwnedStructTemp(temp, typeName);
             return true;
         };
+        /*
+         * A discarded nested all-move join's value is a PHI over its moved leaves, and its storage
+         * is a spill: put each leaf load back where it was read, in its own arm block, and re-arm it.
+         */
+        std::function<void(llvm::Value*)> restoreMovedLeaves = [&](llvm::Value* value) {
+            if (auto* join = llvm::dyn_cast<llvm::PHINode>(value))
+            {
+                compiler->UnregisterOwnedStringTemp(join);
+                const auto savedIP = compiler->builder->saveIP();
+                for (unsigned i = 0; i < join->getNumIncomingValues(); ++i)
+                    if (auto* term = cflat_llvm::GetTerminatorOrNull(join->getIncomingBlock(i)))
+                    {
+                        compiler->builder->SetInsertPoint(term);
+                        restoreMovedLeaves(join->getIncomingValue(i));
+                    }
+                compiler->builder->restoreIP(savedIP);
+                return;
+            }
+            if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value))
+            {
+                compiler->builder->CreateStore(value, load->getPointerOperand());
+                compiler->MarkStorageNotExplicitlyMovedNull(load->getPointerOperand());
+                return;
+            }
+            // A leaf with no source slot (a moved prvalue) is dropped.
+            if (auto* st = llvm::dyn_cast<llvm::StructType>(value->getType()); st != nullptr && st->hasName())
+            {
+                auto* temp = compiler->AllocaAtEntry(st, nullptr, "discardtemp");
+                compiler->builder->CreateStore(value, temp);
+                if (auto* dtor = compiler->GetOrCreateFullDestructor(st->getName().str()))
+                    compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { temp });
+            }
+        };
         auto keepUnconsumedMovedArm = [&](bool explicitMove, llvm::Value* value, llvm::Value* storage,
                                           const LLVMBackend::TypedValue& shape,
                                           const LLVMBackend::OwnedTempMark& armMark,
@@ -3423,6 +3500,26 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             if (discardLoweredArm(explicitMove, value, storage, shape.sourceTypeName, shape.isRvalue,
                     armMark, armCtx))
                 return;
+            // A discarded moved string: all-move joins keep the bytes in the source (as structs do
+            // below); a mixed join is a prvalue, so the moved buffer is freed here, in its arm.
+            auto* stringTy = llvm::StructType::getTypeByName(*compiler->context, "string");
+            if (discard && explicitMove && value != nullptr && stringTy != nullptr
+                && value->getType() == stringTy)
+            {
+                // A nested join's phi is already a pending owned temp: the arm flush frees it.
+                const bool pending = compiler->IsPendingOwnedStringTemp(value);
+                if (keepBothMoved && llvm::isa<llvm::PHINode>(value))
+                    restoreMovedLeaves(value);
+                else if (keepBothMoved && storage != nullptr && storage->getType()->isPointerTy())
+                {
+                    compiler->UnregisterOwnedStringTemp(value);
+                    compiler->builder->CreateStore(value, storage);
+                    rearmMovedSource(storage);
+                }
+                else if (!pending)
+                    compiler->EmitOwnedStringTempFree(value);
+                return;
+            }
             if (!explicitMove || (!discard && !movedReceiverArms) || value == nullptr
                 || storage == nullptr || !storage->getType()->isPointerTy())
                 return;
@@ -3436,6 +3533,11 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                 auto* movedTemp = compiler->AllocaAtEntry(st, nullptr, "discardtemp");
                 compiler->builder->CreateStore(value, movedTemp);
                 compiler->RegisterOwnedStructTemp(movedTemp, st->getName().str());
+            }
+            else if (discard && llvm::isa<llvm::PHINode>(value))
+            {
+                restoreMovedLeaves(value);
+                return;
             }
             else
                 compiler->builder->CreateStore(value, storage);
@@ -4296,7 +4398,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             }
             else if (!trueCxxTernaryDeclDeferred)
                 FinishTernaryArm(compiler, trueValue, trueMark, trueOwnedString, branchBlock,
-                    bothArmsMoved);
+                    trueExplicitMove);
             armPostfix.Flush();
             trueEnd = compiler->builder->GetInsertBlock();
             trueBonded = compiler->lastCallIsBonded;
@@ -4538,7 +4640,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             }
             else if (!falseCxxTernaryDeclDeferred)
                 FinishTernaryArm(compiler, falseValue, falseMark, falseOwnedString, branchBlock,
-                    bothArmsMoved);
+                    falseExplicitMove);
             armPostfix.Flush();
             falseEnd = compiler->builder->GetInsertBlock();
             falseBonded = compiler->lastCallIsBonded;
@@ -4667,6 +4769,19 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     }
                     compiler->builder->restoreIP(savedIP);
                 };
+                // A nested join arm owns when every storage leaf is an unnamed owned class temp.
+                auto isOwnedCxxJoinTemp = [&](llvm::Value* value, llvm::Value* storage) {
+                    if (isOwnedCxxTemp(value, storage)) return true;
+                    if (!llvm::isa_and_nonnull<llvm::PHINode>(storage)) return false;
+                    llvm::SmallPtrSet<llvm::PHINode*, 16> visitedJoins;
+                    return ForEachPointerPhiLeaf(storage, visitedJoins, [&](llvm::Value* leaf) {
+                        auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(leaf);
+                        return slot != nullptr && compiler->FindVariableByStorage(slot) == nullptr
+                            && std::any_of(compiler->pendingOwnedStructTemps.begin(),
+                                compiler->pendingOwnedStructTemps.end(),
+                                [&](const auto& temp) { return temp.Alloca == slot; });
+                    });
+                };
                 const bool trueTemp = isOwnedCxxTemp(trueValue, trueStorage);
                 const bool falseTemp = isOwnedCxxTemp(falseValue, falseStorage);
                 const bool trueMoveLvalueJoin = trueShape.isExplicitMove
@@ -4687,6 +4802,20 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
                     && isAddressableLvalue(falseValue, falseStorage))
                     materializeArm(false, false);
                 else if (falseTemp && falseShape.isCxxSameTypeCastCopy && !trueTemp && !trueShape.isRvalue
+                    && isAddressableLvalue(trueValue, trueStorage))
+                    materializeArm(true, false);
+                // Imported class prvalue arm beside an unmoved non-const place: the join is a
+                // prvalue and the place arm is copied, as clang does (const leaf stays refused).
+                else if (compiler->IsForeignNontrivialCxxClass(typeName) && !lvalueJoinConst()
+                    && isOwnedCxxJoinTemp(trueValue, trueStorage) && !falseTemp
+                    && !falseShape.isRvalue && !falseShape.isExplicitMove
+                    && !falseDefault
+                    && isAddressableLvalue(falseValue, falseStorage))
+                    materializeArm(false, false);
+                else if (compiler->IsForeignNontrivialCxxClass(typeName) && !lvalueJoinConst()
+                    && isOwnedCxxJoinTemp(falseValue, falseStorage) && !trueTemp
+                    && !trueShape.isRvalue && !trueShape.isExplicitMove
+                    && !trueDefault
                     && isAddressableLvalue(trueValue, trueStorage))
                     materializeArm(true, false);
             }
@@ -6185,6 +6314,9 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
         bool ownedString = false;
         if (strTy != nullptr && trueValue->getType() == strTy)
         {
+            // A moved arm's buffer has no other owner (its source is zeroed): the join takes it.
+            if (trueExplicitMove) trueOwnedString = true;
+            if (falseExplicitMove) falseOwnedString = true;
             if (!trueOwnedString)  { atTrue();  trueValue  = AdoptTernaryStringArm(compiler, trueValue,  trueOwnedString); }
             if (!falseOwnedString) { atFalse(); falseValue = AdoptTernaryStringArm(compiler, falseValue, falseOwnedString); }
             ownedString = trueOwnedString && falseOwnedString;
@@ -6607,11 +6739,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             compiler->lastCallReturnsOwned = true;
             LLVMBackend::TypedValue result{ phi, true };
             // Arm copies into owned storage do not carry the source stack borrow through the join.
-            if (!bothArmsMoved)
-            {
-                if (trueOwnedString) trueShape.stackCharBufferBorrow = false;
-                if (falseOwnedString) falseShape.stackCharBufferBorrow = false;
-            }
+            if (trueOwnedString && !trueExplicitMove) trueShape.stackCharBufferBorrow = false;
+            if (falseOwnedString && !falseExplicitMove) falseShape.stackCharBufferBorrow = false;
             JoinConditionalStackCharBufferBorrow(result, trueShape, falseShape);
             result.isAlias = (trueAlias || falseAlias) && !cxxRefBorrowJoin;
             result.storage = storageJoin != nullptr ? storageJoin : cxxLvalueStorageJoin;
@@ -6987,6 +7116,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranchesBody(
             if (typeName.empty())
                 if (auto* st = llvm::dyn_cast<llvm::StructType>(value->getType());
                     st != nullptr && st->hasName()) typeName = st->getName().str();
+            if (CollectRangeElementArm(shape, value, storage, armBlock, result.conditionalMoveSources))
+                return;
             size_t firstThisSource = result.conditionalMoveSources.size();
             if (CollectBorrowedPointerArm(shape, value, storage, armBlock,
                     result.conditionalMoveSources))
@@ -7951,6 +8082,9 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                             shape.conditionalMoveSources.begin(), shape.conditionalMoveSources.end());
                         return;
                     }
+                    if (CollectRangeElementArm(shape, value, storage, armBlock,
+                            result.conditionalMoveSources))
+                        return;
                     size_t firstThisSource = result.conditionalMoveSources.size();
                     if (CollectBorrowedPointerArm(shape, value, storage, armBlock,
                             result.conditionalMoveSources)

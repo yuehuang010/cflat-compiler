@@ -11629,6 +11629,8 @@ public:
     {
         return cxxFriendNames_.count(simpleName) != 0;
     }
+    // CALLPAR: some C++ namespace declares a free function `simpleName` (an ADL target of a bare call).
+    bool IsCxxNamespaceFunctionName(const std::string& simpleName) const;
     // A C++ class object (not a pointer or reference to one) that is itself const.
     bool IsCxxConstClassObject(const TypeAndValue& t) const
     {
@@ -12132,6 +12134,8 @@ public:
     std::string CxxCopyInitRefusal(const NamedVariable& arg, const std::string& targetType);
     // Clang's refusal of a probed `X&& r = source;`, empty when not probed or it binds.
     std::string CxxRvalueRefBindRefusal(const NamedVariable& arg, const TypeAndValue& param);
+    std::string CxxInaccessibleReferenceConversionRefusal(const NamedVariable& arg,
+                                                          const TypeAndValue& param);
     bool CanImplicitlyConstructCxxClass(const NamedVariable& arg,
                                          const TypeAndValue& param,
                                          bool cxxByValueParam = false,

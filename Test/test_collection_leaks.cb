@@ -2182,7 +2182,7 @@ extern int main()
             && t356AuditAllocations == 1u && t356AuditFrees == 1u;
         total++; passed += Test("t356_deref_string_ternary_local", clean, true);
     }
-    // The field form keeps the master's one-leak baseline and avoids r1's additional allocation.
+    // The field form is leak-free like the local form (STRJOIN).
     {
         string source = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
         u64 before = HeapAudit.reportLeaks();
@@ -2192,8 +2192,8 @@ extern int main()
         int value = t356StoreTernaryDerefString(&source, &source, true);
         t356ForwardAudit = true;
         __alloc_audit_hook = cflat_heap_audit_alloc; __free_audit_hook = cflat_heap_audit_free;
-        bool resource = HeapAudit.reportLeaks() <= before + 1u
-            && t356AuditAllocations == 2u && t356AuditFrees >= 1u && t356AuditFrees <= 2u;
+        bool resource = HeapAudit.reportLeaks() == before
+            && t356AuditAllocations == 1u && t356AuditFrees == 1u;
         total++; passed += Test("t356_deref_string_ternary_field", resource && value == 46, true);
     }
     // `*w[0]` dereferences the pointer stored in the view, not the view's slot itself.

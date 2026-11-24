@@ -1,34 +1,29 @@
-# Discard sink leftovers after T352: `?:` move join leaks (native strings and dtor structs)
+# Discard sink leftovers after T352: raw owning field discard, converting-ctor gap
 
-Severity p3. Found by the T352 review (2026-10-20); pre-existing on master (same result before and after T352).
-Cases: scratch/repro_keep/box1021/t352_rev/cases/ (ternary_move.cb, owning_raw_field.cb).
+Severity p3. Found by the T352 review (2026-10-20). The native `?:` move-join leaks (MIX19 residue: mixed
+string joins, nested all-move joins, string assignment from a join, struct-with-dtor `_ =` joins, bare
+`c ? move a : move b;` statements) were fixed in STRJOIN; legs Test/test_move.cb testStrjoinTernaryMoveJoin.
+The C++ `_ = move p->c` item was fixed in TERNREST (3c95a46e2).
 
-1. Fixed in MIX19: `_ = c ? move o.s : move q.s;` (and `string r = c ? move o.s : move q.s;`, call arguments, parenthesized
-   arms) no longer leaks. Root cause (MIX19): the join deep-copied each moved string arm (AdoptTernaryStringArm) after the move
-   had zeroed its source, so the original buffer had no owner. Fix: FinishTernaryArm(movedString) keeps the moved buffer when
-   both arms are explicit moves; the join's existing RegisterOwnedStringTemp(phi) frees the selected one. Legs:
-   Test/test_move.cb testMix19TernaryMoveJoin. Not the discard sink: the sink already returns early on a join that the join owns.
-   Still open (same root cause, left as is per the MIX19 brief): a mixed join `_ = c ? move o.s : q.s;` with the move arm
-   selected still leaks (scratch/mix19_tmp/p1.cb case 3, c=1). Root cause (MIX19): same deep copy, one arm not a move.
-2. Fixed in TERNREST: `_ = move p->c;` (also `move s.f`, `move *p`, `(move s.f)`, nested fields) on an imported C++
-   class runs the move ctor into a temp and destroys it, as clang's `{ Cx t = std::move(p->c); }` (move=1, source
-   moved-from). Legs: Test/test_cpp_interop.cb TrFieldDiscard (99699-99704).
 3. Not fixed in MIX19 (by design, not a fix candidate). `_ = move o.raw;` where the user dtor deletes the raw field leaks.
    Root cause (MIX19): a raw `Val*` owns nothing (raw lifetimes are untracked, memory-safety-function-boundaries-only ruling).
    The move nulls the field, so ~O deletes nothing, and discarding a non-owning pointer has no drop. The owning spelling
-   `Val* p = move o.raw; delete p;` is leak-free (owning_raw_field.cb recorded in scratch/mix19_tmp/p2.cb case 3).
+   `Val* p = move o.raw; delete p;` is leak-free.
    Clang twin: a raw pointer move is a copy with no delete, so clang also frees nothing here.
+   Repro:
+   ```cflat
+   struct Val { int v = 0; };
+   struct O { Val* raw = default; ~O() { delete raw; } };
+   void f() { O o = default; o.raw = new Val(); _ = move o.raw; }   // leaks the Val (by design)
+   ```
 
-Open after MIX19 round 2 (measured on master and on the fix; each leaks the same on both unless noted):
-4. Nested all-move join `_ = c ? move a : (d ? move b : move x);` leaks 1 at c=1 (master 1). The outer arm is a
-   parenthesized `?:`, which the move-arm shape test does not see as a move. Root cause (MIX19): armIsMove
-   (MainListener_Expressions.cpp ~13186) stops at a non-move nested join.
-5. Assignment `r = c ? move a : move b;` leaks 1 (master 2; the fix removed one). Root cause (MIX19): the string
-   assignment copies the join's selected buffer (deep copy at MainListener_Expressions.cpp ~9852, the join result is
-   not IsMove), while the join's RegisterOwnedStringTemp(phi) still owns the buffer. A fix needs both: skip the copy
-   and unregister the phi on store, across the string-assign arms. Optional item of round 2, not attempted: not small.
-6. Struct-with-dtor field arms `_ = c ? move o.d : move q.d;` (`struct DT { int* p; ~DT() { delete p; } }`) leak the
-   dtor's int* (master 1, same). Root cause: not investigated in MIX19 (the round-1 join fix covers strings only).
 7. Converting-constructor gap (pre-existing on master): `A a = mkB();` is refused when A has a converting ctor A(B),
    although the converting-constructor ruling (string-literal-cpp-class-ruling.md) says it should convert. Master
    reports the decay text; MIX19 reports "cannot initialize or assign 'A' from unrelated struct type 'B'". Not MIX19's fix.
+   Repro:
+   ```cflat
+   struct B { int v = 1; };
+   struct A { int v = 0; A(B b) { v = b.v; } };
+   B mkB() { B b = default; return b; }
+   int main() { A a = mkB(); return a.v; }   // expected 1; refused
+   ```

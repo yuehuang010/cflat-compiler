@@ -26,22 +26,34 @@ slot when every return names it. T224 (2026-10-14) landed the single-local cases
   build the C++ class in the slot (clang 1 ctor / 0 dtor); a template converting constructor keeps
   its value (30, not a moved 31). Legs Test/test_cpp_interop.cb 13060-13065.
 
+## Landed (BRACEELIDE)
+
+- BRACEPRV order rule: a later element reading a scalar or pointer stack local by bare name (or a
+  construction from literals and such reads) no longer keeps an earlier element eager when no code
+  that ran before took the local's address (IR uses are plain loads/stores, no enclosing loop, no
+  goto) and earlier elements name it only as a direct by-value argument. `{ BS(k, 1), k }`,
+  by-value parameters, `{ mk(k), k }`, `{ mk(BS(2).v), BT(t), 2 }`: clang counts. Legs
+  Test/test_cpp_interop.cb 13616-13623.
+- BRACECALL: a call whose arguments are calls or temporaries (`{ mk(g()), 1 }`, `{ mk(S(2).v), 1 }`,
+  sole element `{ mk(g()) }`, leg 13632) is captured; `char* const*` parameters spell every const level on the
+  wrapper and the callable, so leg 13615 is clang parity (1001). Legs 13624-13626.
+- A call fed temporaries or nested calls initializing a CFlat struct field or a CFlat array element
+  of a C++ class builds in the slot (`W w = { e = rb(CV(1)) }`, `CV[2] a = { rb(CV(1)), rb(CV(2)) }`,
+  C++ callees alike): clang born 2 / 4, master 3 / 6 and value 2 / 23 for a mutable-copy class.
+  Legs 13627-13631.
+
 ## Still open
 
-1. BRACEPRV order rule: a constructor element is deferred only when every LATER element is a literal or a
-   construction from literals, and no earlier element left a CFlat class temp. So `int k = 4; Outer o = { BS(k, 1), k };`
-   (braceprv.hpp shapes) still moves: 1 ctor / 1 move / 1 dtor in scope, clang 1/0/0. Lifting it needs a proof that the
-   later element cannot observe the constructor (a local read the constructor may write through a pointer).
+1. Order rule declines, measured 2026-11-19 (clang 1001 for all; fix 1012):
+   - `{ mk(1), side() }` (leg 13611 pins it) and `{ mk(BS(note(3)).v), note(4) }`: a later element
+     with a side effect; parity needs the later element evaluated inside the wrapper in order.
+   - the local's address was taken earlier (`int* pk = &k;`), the local is a global, or the brace sits
+     in a loop (k declared in the loop body would be provable; not done).
 2. Paren-aggregate `CM l = CM(S(5), 3);` with `struct CM { S c; int k = 9; };` (see cpp-paren-aggregate-prvalue-member-move.md).
-3. BRACECALL call-element gaps, measured 2026-11-17 (value; ctor/copy/move/dtor; order):
-   - `{ mk(1), side() }`: master and fix are 5; 1/0/1/2; order 19. Clang is 5; 1/0/0/1; order 19.
-     Test leg `Test/test_cpp_interop.cb` 13611 pins this known ordering gap, not clang parity.
-   - A call whose argument is itself a call or temporary, `{ mk(g()), 1 }` and `{ mk(S(2).v), 1 }`,
-     stays on the eager path. `mk(g())`: master and fix are 3; 1/0/1/2; order 73, clang is 3; 1/0/0/1; order 73.
-     `mk(S(2).v)`: master and fix are 2; 2/0/1/3; order 22, clang is 2; 2/0/0/2; order 22.
-   - A callee parameter with const above the pointee level (`S mk(char* const* p)`, `{ mk(&s), 1 }`) declines capture
-     (the direct-brace wrapper's pointer spelling sites only spell pointee const): master and fix 1/0/1/2, clang 1/0/0/1.
-     Leg 13615 pins it. Fix: spell every PointeeConstMask level on all wrapper pointer sites, then drop the decline.
+3. A function-pointer parameter, `{ mkfp(f), 1 }` with `BS mkfp(int (*)(int))`: fix = master 1012, clang 1001
+   (BRACEELIDE review 1).
+4. A CFlat callee taking a C++ class by value as a C++ aggregate element, `Outer o = { rb(BS(1)), 1 }`:
+   clang 2002, fix 2013 (the capture takes scalar and pointer parameters only).
 
 ## Deferred, out of scope
 

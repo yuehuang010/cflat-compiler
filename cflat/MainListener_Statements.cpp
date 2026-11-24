@@ -6482,8 +6482,34 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
 
                     int dataFieldIndex = -1;
                     int sizeFieldIndex = -1;
-                    if (isDirectContainer && !isFaceType && !isFixedArray && !isArrayView && collNV.BaseType
-                        && collNV.BaseType->isStructTy())
+                    // list<T> / array<T> header, held directly or reached through one pointer (a `list<T>*` param).
+                    llvm::Type* headerStructType = nullptr;
+                    bool headerThroughPointer = false;
+                    if (isDirectContainer && !isFaceType && !isFixedArray && !isArrayView && collNV.BaseType)
+                    {
+                        if (collNV.BaseType->isStructTy())
+                            headerStructType = collNV.BaseType;
+                        else if (collNV.BaseType->isPointerTy() && collNV.TypeAndValue.Pointer
+                            && collNV.TypeAndValue.PointerDepth <= 1 && !collNV.TypeAndValue.IsArrayView
+                            && (collNV.Storage != nullptr || collNV.Primary != nullptr))
+                        {
+                            auto headerTv = collNV.TypeAndValue;
+                            headerTv.Pointer = false;
+                            headerTv.PointerDepth = 0;
+                            if (auto* headerTy = compiler->GetType(headerTv);
+                                headerTy != nullptr && headerTy->isStructTy())
+                            {
+                                headerStructType = headerTy;
+                                headerThroughPointer = true;
+                                // Evaluate the range pointer once: count()/get() and the slot read this value. A
+                                // storage-only global pointer was passed as its own address (zero iterations).
+                                if (collNV.Primary == nullptr)
+                                    collNV.Primary = compiler->builder->CreateLoad(
+                                        compiler->builder->getPtrTy(), collNV.Storage, "rangecollptr");
+                            }
+                        }
+                    }
+                    if (headerStructType != nullptr)
                     {
                         auto data = compiler->GetDataStructure(collNV.TypeAndValue.TypeName);
                         for (size_t i = 0; i < data.StructFields.size(); ++i)
@@ -6586,6 +6612,7 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                     llvm::Value* elemVal = nullptr;
                     llvm::Value* elemStorage = nullptr;
                     llvm::Value* rangeCollectionValue = nullptr;
+                    llvm::Value* rangeHeaderStorage = nullptr;
                     if (isFixedArray)
                     {
                         auto* arrTy = llvm::cast<llvm::ArrayType>(collNV.BaseType);
@@ -6625,8 +6652,9 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                     {
                         auto data = compiler->GetDataStructure(collNV.TypeAndValue.TypeName);
                         const auto& dataField = data.StructFields[(size_t)dataFieldIndex];
+                        rangeHeaderStorage = headerThroughPointer ? collNV.Primary : collNV.Storage;
                         auto* dataSlot = compiler->CreateStructGEP(
-                            collNV.BaseType, collNV.Storage, (uint32_t)dataFieldIndex);
+                            headerStructType, rangeHeaderStorage, (uint32_t)dataFieldIndex);
                         auto* dataPtr = compiler->builder->CreateLoad(
                             compiler->GetType(dataField), dataSlot, "rangeptr");
                         auto* elemLLVMType = compiler->GetType(elemType);
@@ -6683,6 +6711,19 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                     rangeCtx.elementBaseType = compiler->GetType(elemType);
                     rangeCtx.elementType = elemType;
                     rangeCtx.elementDeclaredUnique = HasSoftDeclarationSpecifier(declSpecCtx, "unique");
+                    if (isFixedArray)
+                    {
+                        rangeCtx.elementOwnershipKnown = true;
+                        rangeCtx.elementOwnedByCollection = collNV.TypeAndValue.IsUnique
+                            || compiler->IsCoreUniqueType(collNV.TypeAndValue.TypeName);
+                    }
+                    else if (isDirectContainer && !isFaceType && !isArrayView)
+                    {
+                        const std::string elementArg = MangledGenericArgument(*compiler,
+                            collNV.TypeAndValue.TypeName, 0);
+                        rangeCtx.elementOwnershipKnown = !elementArg.empty();
+                        rangeCtx.elementOwnedByCollection = compiler->IsCoreUniqueType(elementArg);
+                    }
                     rangeCtx.interfaceStorage = ifacePtr;
                     rangeCtx.isFixedArray = isFixedArray;
                     rangeCtx.isArrayView = isArrayView;
@@ -6691,6 +6732,8 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
                     {
                         rangeCtx.headerDataField = dataFieldIndex;
                         rangeCtx.headerSizeField = sizeFieldIndex;
+                        rangeCtx.headerStorage = rangeHeaderStorage;
+                        rangeCtx.headerType = headerStructType;
                         if (elemVal != nullptr && elemVal->getType()->isPointerTy())
                             rangeCtx.elementValue = elemVal;
                     }

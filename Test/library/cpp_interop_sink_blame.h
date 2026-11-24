@@ -61,6 +61,13 @@ template<class T> struct ByVal
     void add(T t) { items.push_back(std::move(t)); }
     int size() const { return (int)items.size(); }
 };
+// By-value only: clang itself refuses the lvalue argument for the deleted copy constructor.
+template<class T> struct ByValOnly
+{
+    std::vector<T> items;
+    void add(T t) { items.push_back(std::move(t)); }
+    int size() const { return (int)items.size(); }
+};
 
 // Invalid virtual member of a class template the program constructs: the failure surfaces at the
 // member's use, directly or through a helper template (no import-time sweep).

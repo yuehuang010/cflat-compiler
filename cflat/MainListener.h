@@ -3856,6 +3856,10 @@ private:
         LLVMBackend::TypeAndValue elementType;
         // The loop declaration says 'unique' (the container owns the element); elementType does not carry it.
         bool elementDeclaredUnique = false;
+        // The collection's own element type proves ownership (list<unique T*>, unique T*[N]): known = proven
+        // either way; unknown containers fall back to elementDeclaredUnique.
+        bool elementOwnershipKnown = false;
+        bool elementOwnedByCollection = false;
         llvm::Value* interfaceStorage = nullptr;
         bool isFixedArray = false;
         bool isArrayView = false;
@@ -3864,6 +3868,9 @@ private:
         // recomputed from the container since its buffer may move. -1 = no live slot.
         int headerDataField = -1;
         int headerSizeField = -1;
+        // The header those fields index (the collection itself, or its pointee for a `list<T>*`).
+        llvm::Value* headerStorage = nullptr;
+        llvm::Type* headerType = nullptr;
         // The element as the iteration bound it, loaded before the body: the adopted-value test.
         llvm::Value* elementValue = nullptr;
     };
@@ -5904,6 +5911,8 @@ public:
     // deferred element constructor running after it (see TryEmitForeignCxxAggregateBraceInitFields).
     bool IsCxxBraceDeferrableConstruction(antlr4::tree::ParseTree* node) const;
     bool IsQuietCxxBraceElement(antlr4::tree::ParseTree* node) const;
+    const void* CxxSretElementCallSite(CFlatParser::AssignmentExpressionContext* assign,
+                                       const std::string& typeName);
     void RefuseDeferredCxxConstructionNarrowing(const LLVMBackend::NamedVariable& value,
                                                 antlr4::ParserRuleContext* where);
     void PrepareCxxBraceElement(LLVMBackend::NamedVariable& element, llvm::Value* value,
@@ -6467,7 +6476,7 @@ public:
      * kept unless the copy above already consumed it. `hoistTo` is the block holding the arm
      * branch: an alloca-based struct temp is zeroed and re-keyed there instead of freed here, so
      * a joined pointer INTO it stays live until the statement ends (see FlushOwnedTempsSince).
-     * movedString (both arms explicit moves): a string arm is the moved-out buffer, not copied.
+     * movedString (the arm is an explicit move): a string arm is the moved-out buffer, not copied.
      */
     void FinishTernaryArm(LLVMBackend* compiler, llvm::Value*& value,
                           const LLVMBackend::OwnedTempMark& mark, bool& deepCopied,
@@ -6512,6 +6521,9 @@ public:
     // Returns false (nothing appended) for every other shape, which keeps the existing path.
     bool CollectOwningLocalPointerArm(const LLVMBackend::TypedValue& shape, llvm::Value* value,
         llvm::Value* storage, llvm::BasicBlock* armBlock, antlr4::ParserRuleContext* armCtx,
+        std::vector<LLVMBackend::ConditionalMoveSource>& out);
+    bool CollectRangeElementArm(const LLVMBackend::TypedValue& shape, llvm::Value* value,
+        llvm::Value* storage, llvm::BasicBlock* armBlock,
         std::vector<LLVMBackend::ConditionalMoveSource>& out);
     bool CollectBorrowedPointerArm(const LLVMBackend::TypedValue& shape, llvm::Value* value,
         llvm::Value* storage, llvm::BasicBlock* armBlock,
@@ -8171,6 +8183,7 @@ public:
     bool IsCxxTernaryArgument(antlr4::ParserRuleContext* ctx);
     // REFDEF: a `?:` whose leaves are exactly one `default` and one bare local place (a C++ prvalue).
     bool IsCxxMixedDefaultPlaceTernary(antlr4::ParserRuleContext* ctx);
+    bool IsCxxDefaultLocalTernary(antlr4::ParserRuleContext* ctx);
     // REFDEF: the caller can build `defaultType` (a default ctor resolves, or it needs none) before copying.
     bool CanMaterializeMixedDefault(const std::string& defaultType);
     // T459: `c ? default : place` into a `const T&` class parameter joins a temporary of that class.
@@ -8198,6 +8211,9 @@ public:
     // scope dtor, so we must not double-free it here. `alias` borrows and string/closure values
     // (own runtime owned-bit + temp lists) are excluded.
     void RegisterDiscardedOwningStructTemp(const LLVMBackend::NamedVariable& nv, bool bare = false);
+    // `_ = <?: join>` of an owning value struct: drops the join when its selected leaf was a `move`.
+    bool DropDiscardedMoveJoin(CFlatParser::ConditionalExpressionContext* join,
+                               const LLVMBackend::NamedVariable& nv);
 
     // Mandatory-nodiscard: an owning RETURN value used as a bare discarded statement (or a bare
     // for-update) must be consumed, not dropped. Value identity picks out exactly the top-level

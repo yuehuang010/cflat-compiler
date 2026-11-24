@@ -2581,6 +2581,23 @@ bool LLVMBackend::CxxThinFunctionPointerSpelling(const TypeAndValue& type, std::
             if (param.IsPointeeConst && one.find('(') == std::string::npos
                 && !one.starts_with("const "))
                 one = "const " + one;
+            // Const above the pointee (`char * const *`) is part of the parameter type too.
+            const int depth = param.PointerDepth > 0 ? param.PointerDepth : (param.Pointer ? 1 : 0);
+            const uint32_t upper = param.ConstMask > 0 && !param.IsArrayView && depth > 1
+                ? static_cast<uint32_t>(param.ConstMask)
+                    & TypeAndValue::ConstBitsBelow(depth) & ~uint32_t{ 1 } : 0;
+            if (upper != 0 && one.find('(') == std::string::npos
+                && static_cast<int>(std::count(one.begin(), one.end(), '*')) == depth)
+            {
+                std::string levels = one.substr(0, one.find('*'));
+                while (!levels.empty() && levels.back() == ' ') levels.pop_back();
+                for (int i = 1; i <= depth; ++i)
+                {
+                    levels += " *";
+                    if (i < depth && (upper & TypeAndValue::ConstBitAt(i)) != 0) levels += " const";
+                }
+                one = std::move(levels);
+            }
             if (param.IsAlias) one += " &";
             else if (param.IsRvalueRef) one += " &&";
             if (!params.empty()) params += ", ";

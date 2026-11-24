@@ -121,8 +121,8 @@ Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the pl
 | - | p3/cpp-reference-member-leftovers-after-t47 | ref members | residue: brace-form ctor args / extra copy / non-inert-arg wrapper path, elided-range prvalue/array, REFCTX raw-pointer/self-field refusal, return-gate untracked spots (frame pointer via local, CFlat callee, lambda capture); opaque-fn alias refusal and `&f` element RULED 2026-10-29 (stay as is) |
 | - | p3/auto-local-of-arithmetic-takes-cflat-width-type-at-cpp-calls | auto local at C++ template call | float and native-call residue |
 | - | p3/cpp-wrapper-request-misses-template-argument-headers | `std.unique_ptr<cppon.Cls>` wrappers | open: noinc implicit dtor, unpublished-specialization pointer binding |
-| - | p3/copy-constructor-overload-resolution-parity + p3/cpp-call-overload-and-copy-count-parity-leftovers | C++ copy ctor / copy-assign pick | template-ctor return pick + CFlat-callee elision landed cc2d19b64 (RETELIDE); residue: lambda-capturing callee keeps the extra copy (NEEDS RULING: drop the gate + re-pin bridge_capture_return to copy 1 / dtor 2), leftovers file (run CALLPAR in flight) |
-| - | p3/cpp-class-assignment-false-refusals | C++ same-class assignment | NEW 2026-11-19 from CPPOPEQ e3eb8921f (deleted / inaccessible / ambiguous operator= now refused like clang): C++ call-result source and target, [cpp] struct assignment, MoveOnly `?:` text; reference-member class still accepted NEEDS RULING |
+| - | p3/copy-constructor-overload-resolution-parity + p3/cpp-call-overload-and-copy-count-parity-leftovers | C++ copy ctor / copy-assign pick | template-ctor return pick + CFlat-callee elision landed cc2d19b64 (RETELIDE); residue: lambda-capturing callee keeps the extra copy (NEEDS RULING: drop the gate + re-pin bridge_capture_return to copy 1 / dtor 2), CALLPAR landed 069983274 (competing `?:` default, bare default ambiguity, ADL, template-only deferral); leftovers file = remaining pre-existing parity shapes |
+| - | p3/cpp-class-assignment-false-refusals | C++ same-class assignment | NEW 2026-11-19 from CPPOPEQ e3eb8921f (deleted / inaccessible / ambiguous operator= now refused like clang): C++ call-result source and target landed 14c9bd018 (ASGACC: register-returned sources, `mk() = b`); residue: [cpp] struct assignment, MoveOnly `?:` text; reference-member class still accepted NEEDS RULING |
 | - | p3/cpp-operator-ranking-and-fnptr-ctor-leftovers | C++ operator candidate set | imported enum free operators vs built-in (member templates vs free operators landed d6eeafe54) |
 | - | p3/cpp-null-constant-ctor-leftovers-after-t132 | literal-zero C++ ctor selection | only item 3 (char-only ctor narrowing, by design unless ruled) left |
 | B5b | p3/cpp-constrained-twin-default-argument-ranking | MSVC: same-mangled constrained twins share one emitted body | clang-cl residue only |
@@ -154,9 +154,9 @@ Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the pl
 | E3 | p3/cpp-unwind-cleanup-gaps-ctor-new-temporaries | item 2 landed a2111ce54; item 3 Windows funclet cleanup not exercised |
 | E4 | p3/cpp-new-remaining-allocator-gaps | by-design / out-of-scope residue only (bare `Sx(...)` in a reopened namespace beside a global function), Windows MS-ABI array new / delete names; volatile copy closed by ruling 2026-11-18 |
 | E5 | p3/cflat-default-param-temporaries-leftovers | residue after DEFTMP 9d70b56d0 (call-site native defaults die once): forwarding-wrapper defaults (earlier-param, caller above callee, unique/closure/fn-ptr/C++ holder) leak under a borrow-returning wrapper |
-| E6 | p3/discard-ternary-move-join-and-cxx-field-move | C++ class field `_ = move p->c` landed 3c95a46e2 (TERNREST); residue: native string / dtor-struct join leaks (run STRJOIN in flight) |
+| E6 | p3/discard-ternary-move-join-and-cxx-field-move | C++ class field `_ = move p->c` landed 3c95a46e2 (TERNREST); native string / dtor-struct join leaks landed 46fb989b8 (STRJOIN); residue: raw owning field discard, converting-ctor gap; bare all-move join statement keeps both sources NEEDS RULING (refuse like bare `move o.d;` or discard) |
 | E7 | p3/cpp-ternary-move-join-leftovers | TERNLEFT 0b6b7e59a + TERNREST 3c95a46e2 closed discarded / nested / place-arm joins and [cpp] mixed decls; residue: argument order, const leaf in nested join, [cpp] mixed return, no-move discard of place + prvalue, const by-value params |
-| E8 | p3/nrvo-leftovers-after-t130 + p3/cpp-paren-aggregate-prvalue-member-move | return / NRVO / paren-aggregate elision vs clang; residue: later non-literal aggregate element, call-argument calls, const above pointee |
+| E8 | p3/nrvo-leftovers-after-t130 + p3/cpp-paren-aggregate-prvalue-member-move | return / NRVO / paren-aggregate elision vs clang; brace-element in-place build landed 5bda3c58a (BRACEELIDE: unreachable local reads, call/temp args, char* const* params, field/array call slots); residue: see "Still open" in the nrvo file |
 | E9 | p3/cpp-unbound-wrapper-later-write-overloaded-byvalue | residue: same-arity overload sets, later C++ default param, mixed template arity (bound-wrapper divergences recorded) |
 | E11 | p3/lowered-cxx-field-structs-leftovers-after-t528 | with P2 (cflat-struct-nontrivial-cxx-fields) |
 | E12 | p3/cpp-override-callee-destroyed-byvalue-param-double-move | trivial_abi param through C++ dispatch moves twice (needs a per-function caller-destroyed convention); MS ABI: OVRMOVE 82c23505a is a no-op (inferred) |
@@ -179,9 +179,9 @@ Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the pl
 | Run | Issue(s) | Notes |
 |-----|----------|-------|
 | N-MOVESINK | p3/unique-field-assign-source-not-marked-moved | indirect-root consumes landed 0050627c8 (MOVESINK; move-sink-leftovers file closed); residue: sink-path false refusals through pointer roots, global/static implicit consume error, conservative misses, operator-call re-init, do-while condition |
-| N-FOREACH | p3/unique-foreach-element-adoption-leftovers | items 1 (1a / 1b), 4, 5 open: capturing-lambda adoption, other containers; items 2-3 closed by ruling 2026-11-18 |
+| N-FOREACH | p3/unique-foreach-element-adoption-leftovers | items 1, 4 + pointer-collection / global-pointer ranges landed 43f829835 (FOREACHADOPT); item 5 (C++ begin()/end() containers) NEEDS RULING; item 6 `sink2(c ? p : nullptr, p->id)` crash = shared conditional-transfer ordering |
 | N-RAWOWN | p3/raw-local-owner-bit-leftovers + p3/owning-pointer-release-withheld-when-alias-may-reach + p3/runtime-null-coalesce-new-into-local-leaks | raw owner bit: counter-dependent first-iteration sink, alias-withheld release (leak only), `g ?? new T` leak |
-| N-JOIN | p3/owned-borrowed-ternary-join-rejects-and-misclassifies + p3/moved-raw-heap-array-ternary-destroys-one-element | owned/borrowed `?:` joins; moved raw heap array ternary |
+| N-JOIN | p3/owned-borrowed-ternary-join-rejects-and-misclassifies + p3/moved-raw-heap-array-ternary-destroys-one-element | imported-class prvalue arm beside an unmoved non-const place landed 3080d7a0c (OBJOIN); residue: const place arm (run CONSTJOIN in flight); moved raw heap array ternary |
 | N-VIEW | p3/borrowed-view-fields-passed-through-retaining-calls + p3/move-borrowed-view-field-refused | view fields through retaining calls; `move` of a borrowed view field refused |
 | N-COPY | p3/raw-delete-string-array-skips-element-dtors | residue after 56aecbae4 (pointer-subscript reads copy, stores drop old): `delete[_]` element dtors NEEDS RULING (LANGUAGE.md + test_cpp_interop:20498 say frees only; options in the file) |
 | N-BORROW | p3/consolidate-named-variable-borrow-provenance + p3/iface-return-call-borrow-precision + p3/deref-of-moved-pointer-guard-inside-callee | borrow provenance of named variables; interface return precision; false positive behind a terminating callee |
@@ -250,7 +250,6 @@ Ruled but NOT ready: P9 `static` fields (two questions before phase 1, in the pl
 
 | Issue | DISABLED case | Summary |
 |---|---|---|
-| p3/cpp-reference-param-conversion-gaps-after-t42 | (C++ interop) | template ctor from non-template source, inherited operator X(), operator X&/X&& into C++ ref params refused (clang accepts; T42 follow-up) |
 | p3/generic-overload-not-joining-concrete-overload-set | (none) | `f(const int*)` + `f<T>(T*)` concrete pick CONFIRMED 2026-11-18; residue in the issue file |
 | p3/member-type-path-remaining-gaps | (none) | item 1 CFlat `static` field -> plan P9; item 2 open: `if const` C++ static above int32 |
 
@@ -267,7 +266,7 @@ this table.
 | 3 | NULLCTOR | L/M | p3/cpp-null-constant-ctor-leftovers-after-t132 | residue: item 3 only (char-only ctor narrowing) | CTOR-VIABILITY, PTRRANK | no |
 | 4 | NSLOOKUP | M/M | p3/cpp-struct-identity-underscore-namespace | residue: [cpp] struct vs same-named imported global class (identity table, direction coexist) | - | yes, careful on identity |
 | 15 | ASSIGN | L/M | p3/cpp-assignment-result-leftovers-after-b9 | residue: by-design B9 rulings only | - | no |
-| 16 | REFPARAM | M/H | p3/cpp-reference-param-conversion-gaps-after-t42, p3/cpp-reference-member-leftovers-after-t47 | conversions into C++ reference params (u) | CTOR-VIABILITY | no |
+| 16 | REFPARAM | M/H | p3/cpp-reference-member-leftovers-after-t47 | conversion-gaps file closed by REFCONV 26c853ae7 (`operator X&&()`, inherited ref operators, nonzero-offset base); residue: reference members | CTOR-VIABILITY | no |
 | 20 | FNWRAP-RES | L/H | p3/cpp-forwarded-closure-refusals-after-t525, p3/cpp-capturing-closure-to-std-function | residue after FNWRAP (see issue files) | ELIDE (P2 plan) | no |
 | 22 | CHUNK | M/H | p3/cpp-demand-chunk-order-numbering-per-interpreter, p3/cpp-default-wrapper-batch-chunk-stores-stripped-prefix | chunk store, CxxIncrementalGroup ParseRequest | CACHE-KEY, A3 | no |
 | 25 | CONSTTWIN | L/H | p3/cpp-constrained-twin-default-argument-ranking | residue: MSVC shared-symbol body choice (Windows host) | CONSTPOINTEE | no |

@@ -3179,6 +3179,33 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                     out.userFunction = classConversionOperator(arg, param, out.second);
                 continue;
             }
+            // A reference conversion operator (`operator X&()` / `operator X&&()`, own or from a
+            // public base) binds its result directly: one user-defined sequence, ranked by binding.
+            if (candidate.IsCxx && reference && IsCxxRecord(param.TypeName) && !at.Pointer
+                && !at.ElemPointer && IsCxxRecord(at.TypeName) && at.TypeName != param.TypeName
+                && !param.IsCxxRefToPointer && !param.ElemPointer
+                && !(candidate.IsMethod && i == 0))
+            {
+                bool needsStandard = false;
+                bool ambiguous = false;
+                std::vector<std::string> ambiguousOperators;
+                const std::string op = CxxConversionOperatorTo(at.TypeName, param, false,
+                    &needsStandard, &ambiguous, &ambiguousOperators, &at);
+                if (!op.empty() || ambiguous)
+                {
+                    out.rank = 3;
+                    out.cxxViable = true;
+                    out.from = argumentIdentity(arg);
+                    out.userFunction = op;
+                    out.second = needsStandard ? 2 : 0;
+                    out.ambiguousOperators = std::move(ambiguousOperators);
+                    out.cvBase = param.TypeName;
+                    out.cv = referenceCv;
+                    out.refTarget = param.TypeName;
+                    out.refBind = param.IsRvalueRef ? 1 : constReference ? 2 : 0;
+                    continue;
+                }
+            }
             // CVAMB: a by-value class parameter that only a class conversion operator reaches is a
             // user-defined sequence like a `const T&` one; clang copy-initializes it (lazy, cached).
             if (candidate.IsCxx && IsCxxRecord(param.TypeName) && !reference && !param.Pointer
@@ -3477,8 +3504,17 @@ int LLVMBackend::CompareCxxConversionRanks(const std::vector<CxxConversionRank>&
                                                            : tieBreak(x, y));
             // Two sequences through the SAME conversion function rank by the second standard
             // conversion; different functions (or an ambiguous one) are indistinguishable.
+            // [over.ics.rank] 3.3 then 3.2: an rvalue reference binding the result wins (3.2.3),
+            // then the less cv-qualified reference to the same class (3.2.6).
             else if (!x.userFunction.empty() && x.userFunction == y.userFunction)
-                order = x.second - y.second;
+            {
+                if (x.second != y.second) order = x.second - y.second;
+                else if (x.refBind != 0 && y.refBind != 0 && x.refBind != y.refBind)
+                    order = x.refBind - y.refBind;
+                else if (!x.refTarget.empty() && x.refTarget == y.refTarget && x.cv != y.cv
+                         && x.cvBase == y.cvBase && !x.cvBase.empty())
+                    order = (x.cv & y.cv) == x.cv ? -1 : (x.cv & y.cv) == y.cv ? 1 : 0;
+            }
             // One converting constructor to one class: only the reference binding differs.
             else if (x.userFunction.empty() && y.userFunction.empty() && !x.refTarget.empty()
                      && x.refTarget == y.refTarget && x.from == y.from && x.refBind != 0
@@ -7657,6 +7693,23 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // The bare-name table may also contain unrelated CFlat overloads, which disables C++ ranking.
         if (rankReceiverConstTwinWithMixed && !receiverMemberCandidates.empty())
             candidateSet = &receiverMemberCandidates;
+        // A C++ member call never reaches a CFlat function whose first param is not the receiver;
+        // left in the bare-name set it makes the set mixed and disables clang's ranking.
+        std::vector<FunctionSymbol> cxxReceiverOnlyCandidates;
+        auto foreignCflatCandidate = [&](const FunctionSymbol& candidate) {
+            return !candidate.IsCxx && !candidate.UniqueName.starts_with("__cflat_")
+                && (candidate.Parameters.empty()
+                    || ResolveTypeAlias(candidate.Parameters.front().TypeName)
+                        != ResolveTypeAlias(receiverType));
+        };
+        if (receiverHasCxxMember && !receiverMemberCandidates.empty()
+            && std::any_of(candidateSet->begin(), candidateSet->end(), foreignCflatCandidate))
+        {
+            for (const auto& candidate : *candidateSet)
+                if (!foreignCflatCandidate(candidate))
+                    cxxReceiverOnlyCandidates.push_back(candidate);
+            candidateSet = &cxxReceiverOnlyCandidates;
+        }
         std::vector<FunctionSymbol> joinedCandidateSet;
         const auto receiverConstTwinSet = rankReceiverConstTwinWithMixed
             ? functionTable.find(CxxConstTwinName(bareMemberName)) : functionTable.end();
@@ -9537,6 +9590,16 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 }
             }
 
+            // A reference conversion operator inherited through a non-public base: clang's access error.
+            if (resolvedCandidate.size() == 1 && resolvedCandidate.front().second.IsCxx)
+            {
+                const auto& [refArgs, refSym] = resolvedCandidate.front();
+                for (size_t i = 0; i < refArgs.size() && i < refSym.Parameters.size(); ++i)
+                    if (!(refSym.IsMethod && i == 0))
+                        if (const std::string block = CxxInaccessibleReferenceConversionRefusal(
+                                refArgs[i], refSym.Parameters[i]); !block.empty())
+                            LogError(std::format("argument {} of '{}': {}", i, shownFunctionName, block));
+            }
             if (resolvedCandidate.size() == 1)
             {
                 const auto& [rvalueArgs, rvalueSym] = resolvedCandidate.front();
@@ -9898,7 +9961,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     ReportAmbiguousCxxConversion(arg.TypeAndValue.TypeName, param,
                                                  ambiguousCandidates);
             }
-            const bool referenceConversionOperator = param.IsAlias && !param.IsCxxRefToPointer
+            const bool referenceConversionOperator = (param.IsAlias || param.IsRvalueRef)
+                && !param.IsCxxRefToPointer && !param.ElemPointer
                 && IsCxxRecord(param.TypeName) && !arg.TypeAndValue.Pointer
                 && !CxxConversionOperatorTo(arg.TypeAndValue.TypeName, param, false,
                     nullptr, nullptr, nullptr, &arg.TypeAndValue).empty();
