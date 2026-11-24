@@ -752,6 +752,7 @@ LLVMBackend::TypedValue MainListener::TypedValueOfNamedOperand(LLVMBackend::Name
         result.cxxClosureLenders = namedVar.CxxClosureLenders;
         result.cxxPointeeConst = namedVar.TypeAndValue.PointeeConstBit()
             && namedVar.TypeAndValue.Pointer;
+        result.cxxPointeeConstMask = namedVar.TypeAndValue.PointeeConstMask();
         result.cxxSpelledCvrQualifier = namedVar.TypeAndValue.CxxSpelledCvrQualifier;
         result.cxxObjectCv = Compiler(ctx)->CxxOperandObjectCv(namedVar);
         result.joinClassPointee = namedVar.JoinClassPointee;
@@ -2237,7 +2238,7 @@ bool MainListener::ReportCxxConstPointerOperatorFailure(
                 ? "<argument>" : source.VariableName;
             const size_t argumentIndex = i + (lhsCxxName.empty() ? 0 : 1) + 1;
             LogErrorContext(ctx, compiler->CxxConstPointerArgumentError(
-                argumentIndex, argumentName, {}));
+                argumentIndex, argumentName, {}, true));
             return true;
         }
         return false;
@@ -2295,7 +2296,15 @@ llvm::Value* MainListener::TryCxxInfixShift(CFlatParser::ShiftExpressionContext*
                 arg.TypeAndValue.TypeName = o.value.sourceTypeName;
                 arg.TypeAndValue.Pointer = true;
                 arg.TypeAndValue.ElemPointer = o.value.elemPointer || o.value.pointerDepth > 1;
-                arg.TypeAndValue.SetPointeeConstBit(o.value.cxxPointeeConst);
+                const int resultDepth = arg.TypeAndValue.ValuePointerDepth();
+                int sourceDepth = o.value.pointerDepth;
+                if (sourceDepth == 0 && o.value.hasSourceType && o.value.sourceType.Pointer)
+                    sourceDepth = o.value.sourceType.ValuePointerDepth();
+                if (sourceDepth == 0) sourceDepth = resultDepth;
+                uint32_t sourceMask = o.value.cxxPointeeConstMask;
+                if (o.value.cxxPointeeConst) sourceMask |= 1u;
+                arg.TypeAndValue.ConstMask |= LLVMBackend::TypeAndValue::RebasePointeeConstMask(
+                    sourceMask, sourceDepth, resultDepth);
             }
             else arg.InferSourceTypeName = o.value.sourceTypeName;
             if (!isClass && o.named.Storage == nullptr)

@@ -5032,6 +5032,21 @@ LLVMBackend::CxxPointeeConstRelation LLVMBackend::CxxCandidatePointeeConstRelati
         }
         if (candidate.IsCxx && !(candidate.IsMethod && index == 0)
             && decayedFrom.Pointer && !decayedFrom.ElemPointer
+            && !decayedFrom.IsFunctionPointer && !decayedFrom.IsArrayView
+            && decayedFrom.ValuePointerDepth() == 1
+            && to.Pointer && !to.ElemPointer && !to.IsAlias && !to.IsRvalueRef
+            && !to.IsCxxRefToPointer && !to.IsFunctionPointer && !to.IsArrayView
+            && to.ValuePointerDepth() == 1 && ResolveTypeAlias(to.TypeName) == "void")
+        {
+            bool targetConst = to.PointeeConst();
+            const std::string spelling = CxxReferenceParameterSpelling(candidate, index);
+            if (!spelling.empty() && spelling.find_first_of("&()[") == std::string::npos)
+                targetConst = CxxSpellingHasConstPointee(spelling);
+            if (decayedFrom.PointeeConst() && !targetConst)
+                return CxxPointeeConstRelation::Drops;
+        }
+        if (candidate.IsCxx && !(candidate.IsMethod && index == 0)
+            && decayedFrom.Pointer && !decayedFrom.ElemPointer
             && !decayedFrom.ConstInnerDimensions.empty() && to.Pointer && to.ElemPointer)
         {
             const std::string spelling = CxxReferenceParameterSpelling(candidate, index);

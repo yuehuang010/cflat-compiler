@@ -1,0 +1,94 @@
+// OVDEPTH: an unnamed `&object` argument is a proven single pointer, so a lone `T**` candidate
+// refuses it. Pre-fix each call below compiled and passed the object address as a T**.
+import cpp "cpp_ovdepth.h";
+struct OvdNs { int v = 7; };
+int ovdNsPP(OvdNs** p) { return 3; }
+int ovdIntPP(int** p) { return 3; }
+interface IOvdPP { int m(OvdNs** p); };
+class OvdPPImpl : IOvdPP { int m(OvdNs** p) { return 3; } };
+
+extern int main()
+{
+    OvdNs ns = default;
+    int i = 5;
+    OvdPPImpl impl = default;
+    IOvdPP io = &impl;
+    expect_error("no overload of 'ovdNsPP' matches the given arguments") {
+        int a = ovdNsPP(&ns);
+    }
+    expect_error("no overload of 'ovdIntPP' matches the given arguments") {
+        int b = ovdIntPP(&i);
+    }
+    expect_error("no overload of 'm' matches the given arguments") {
+        int c = io.m(&ns);
+    }
+    // Indirect calls: a function pointer and a closure taking OvdNs** refuse `&ns` too.
+    function<int(OvdNs**)> fp = ovdNsPP;
+    expect_error("call through function pointer 'fp': parameter 0 has type 'OvdNs**'") {
+        int d = fp(&ns);
+    }
+    function<int(OvdNs**)> fl = (OvdNs** p) => { return 4; };
+    expect_error("call through function pointer 'fl': parameter 0 has type 'OvdNs**'") {
+        int e = fl(&ns);
+    }
+    // OVDEPTH2: `&object` is a depth-1 pointer prvalue through an imported function pointer too.
+    OvD od = default;
+    expect_error("is a non-const reference to 'OvD*' and cannot bind the pointer rvalue") {
+        int f = ovd_get_fl()(&od);
+    }
+    expect_error("is a reference to 'OvD**' and the argument has type 'OvD*'") {
+        int g = ovd_get_fpc()(&od);
+    }
+    expect_error("is a reference to 'OvD**' and the argument has type 'OvD*'") {
+        int h = ovd_get_fpr()(&od);
+    }
+    // OVDEPTH2 r2: a symbol-derived signature, nullptr into a non-const `T*&`, `&p` into `T**&`.
+    auto symPC = ovd_fpc;
+    expect_error("is a reference to 'OvD**' and the argument has type 'OvD*'") {
+        int i2 = symPC(&od);
+    }
+    expect_error("is a non-const reference to 'OvD*' and cannot bind 'nullptr'") {
+        int j2 = ovd_get_fl()(nullptr);
+    }
+    // OVDEPTH2 r3: a bare-function ?: value keeps the symbols' reference metadata.
+    expect_error("is a reference to 'OvD**' and the argument has type 'OvD*'") {
+        bool odc = od.d == 3;
+        auto symJoin = odc ? ovd_fpc : ovd_fpc0;
+        int l2 = symJoin(&od);
+    }
+    OvD* odp = &od;
+    expect_error("is a non-const reference to 'OvD**' and cannot bind the pointer rvalue '&pointer'") {
+        int k2 = ovd_get_fpl()(&odp);
+    }
+    // OVDEPTH3: the `&pp` slot spelling still judges the slot's pointee const.
+    OvD** odpp = &odp;
+    expect_error("cannot bind a pointer whose pointee const would need to be added") {
+        int k3 = ovd_get_kpl()(&odpp);
+    }
+    // OVDEPTH3 r2: a slot of another class never binds, and `T**` never becomes `const T**` or `T* const*`.
+    OvA oda = default;
+    OvA* odap = &oda;
+    OvA** odapp = &odap;
+    expect_error("addresses a slot of another type") {
+        int k4 = ovd_get_fpl()(&odapp);
+    }
+    expect_error("addresses a slot of another type") {
+        auto symPL = ovd_fpl;
+        int k5 = symPL(&odapp);
+    }
+    expect_error("addresses a slot of another type") {
+        auto symFl = ovd_fl;
+        int k6 = symFl(&odap);
+    }
+    expect_error("cannot bind a pointer whose pointee const would need to be added") {
+        int k7 = ovd_get_kpc()(&odpp);
+    }
+    expect_error("cannot bind a pointer whose pointee const would need to be added") {
+        int k8 = ovd_get_ql()(&odpp);
+    }
+    // OVDEPTH3 r3: a `&&` never binds a converted slot; it would write through to the caller's `OvD**`.
+    expect_error("cannot bind a pointer whose pointee const would need to be added") {
+        int k9 = ovd_get_kqr()(&odpp);
+    }
+    return 0;
+}

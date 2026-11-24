@@ -20253,6 +20253,27 @@ void fe2RawSink(move Resource* q) { q->id = q->id + 1; }
 // Records the id it consumed: a '?:' / '??' foreach element arm into a move sink.
 int fe2TernSunk = 0;
 void fe2TernSink(move Resource* q) { if (q != nullptr) fe2TernSunk = fe2TernSunk + q->id; }
+void fe2OrderSink2(move Resource* q, int id)
+{
+    if (q != nullptr) fe2TernSunk = fe2TernSunk + q->id * 100 + id;
+}
+void fe2RunLambda(Lambda<void()> f) { f(); }
+unique T* fe2NestedGenericSink<T>(move T* q, bool d)
+{
+    unique T* keep = q;
+    fe2OrderSink2(d ? keep : nullptr, 7);
+    return nullptr;
+}
+void fe2OrderSink3(int before, move Resource* q, int after)
+{
+    fe2TernSunk = fe2TernSunk + before + after;
+    if (q != nullptr) fe2TernSunk = fe2TernSunk + q->id * 100;
+}
+struct Fe2OrderSink
+{
+    int seen = 0;
+    void sink2(move Resource* q, int id) { if (q != nullptr) seen = seen + q->id * 100 + id; }
+};
 // The same sinks over a collection reached through a pointer parameter: the slot is the pointee's buffer.
 void fe2PtrListDirectSink(list<unique Resource*>* elements) { for (unique Resource* p in elements) fe2TernSink(p); }
 void fe2PtrListTernSink(list<unique Resource*>* elements) { for (Resource* p in elements) fe2TernSink(fe2PriorYes ? p : nullptr); }
@@ -22043,7 +22064,8 @@ extern int main()
     total += 21;
 
     passed += testC15DataMutHeap();
-    total += 115;
+    total += 117;
+    total += 22;
     total += 12;
     total += 6;
 
@@ -27607,6 +27629,279 @@ int testC15DataMutHeap()
     }
     passed += Test("fe2_ptr_array_coalesce_sink_sunk", fe2TernSunk, 43);
     passed += Test("fe2_ptr_array_coalesce_sink_dtor_once", dtorCount, 1);
+
+    i64 fe2OrderHeapBefore = (i64)HeapAudit.reportLeaks();
+    // Move sinks keep the selected source live through later arguments, then clear it once.
+    // The false-arm cases and destructor counts check that unselected owners remain live.
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        bool c = true;
+        unique Resource* p = fe2GrowResource(1);
+        fe2OrderSink2(c ? p : nullptr, p->id);
+    }
+    passed += Test("fe2_tern_sink_argorder_local_true", dtorCount == 1 && fe2TernSunk == 101, true);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        bool c = false;
+        unique Resource* p = fe2GrowResource(1);
+        fe2OrderSink2(c ? p : nullptr, p->id);
+    }
+    passed += Test("fe2_tern_sink_argorder_local_false", dtorCount == 1 && fe2TernSunk == 0, true);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        bool c = true;
+        unique Resource* p = fe2GrowResource(1);
+        fe2OrderSink2(c ? nullptr : p, p->id);
+    }
+    passed += Test("fe2_tern_sink_argorder_reverse_true", dtorCount == 1 && fe2TernSunk == 0, true);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        bool c = false;
+        unique Resource* p = fe2GrowResource(1);
+        fe2OrderSink2(c ? nullptr : p, p->id);
+    }
+    passed += Test("fe2_tern_sink_argorder_reverse_false", dtorCount == 1 && fe2TernSunk == 101, true);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        bool c = true;
+        unique Resource* p = fe2GrowResource(1);
+        fe2OrderSink3(p->id, c ? p : nullptr, p->id);
+    }
+    passed += Test("fe2_tern_sink_argorder_before_after_true", dtorCount == 1 && fe2TernSunk == 102, true);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        bool c = false;
+        unique Resource* p = fe2GrowResource(1);
+        fe2OrderSink3(p->id, c ? p : nullptr, p->id);
+    }
+    passed += Test("fe2_tern_sink_argorder_before_after_false", dtorCount == 1 && fe2TernSunk == 2, true);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        bool c = true;
+        bool d = true;
+        unique Resource* p = fe2GrowResource(1);
+        fe2OrderSink2(c ? (d ? p : nullptr) : nullptr, p->id);
+    }
+    passed += Test("fe2_tern_sink_argorder_nested_tt", dtorCount == 1 && fe2TernSunk == 101, true);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        bool c = true;
+        bool d = false;
+        unique Resource* p = fe2GrowResource(1);
+        fe2OrderSink2(c ? (d ? p : nullptr) : nullptr, p->id);
+    }
+    passed += Test("fe2_tern_sink_argorder_nested_tf", dtorCount == 1 && fe2TernSunk == 0, true);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        bool c = false;
+        bool d = true;
+        unique Resource* p = fe2GrowResource(1);
+        fe2OrderSink2(c ? (d ? p : nullptr) : nullptr, p->id);
+    }
+    passed += Test("fe2_tern_sink_argorder_nested_ft", dtorCount == 1 && fe2TernSunk == 0, true);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        bool c = false;
+        bool d = false;
+        unique Resource* p = fe2GrowResource(1);
+        fe2OrderSink2(c ? (d ? p : nullptr) : nullptr, p->id);
+    }
+    passed += Test("fe2_tern_sink_argorder_nested_ff", dtorCount == 1 && fe2TernSunk == 0, true);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        unique Resource* p = fe2GrowResource(1);
+        unique Resource* other = fe2GrowResource(2);
+        fe2OrderSink2(p ?? other, p->id);
+    }
+    passed += Test("fe2_coalesce_sink_argorder_left", dtorCount == 2 && fe2TernSunk == 101, true);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        unique Resource* p = nullptr;
+        unique Resource* other = fe2GrowResource(2);
+        fe2OrderSink2(p ?? other, other->id);
+    }
+    passed += Test("fe2_coalesce_sink_argorder_right", dtorCount == 1 && fe2TernSunk == 202, true);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    bool slotCleared = false;
+    {
+        bool c = true;
+        list<unique Resource*> elements = default;
+        elements.add(fe2GrowResource(1));
+        for (unique Resource* p in elements)
+        {
+            fe2OrderSink2(c ? p : nullptr, p->id);
+            slotCleared = elements.get(0) == nullptr;
+        }
+    }
+    passed += Test("fe2_tern_sink_argorder_foreach_true",
+        slotCleared && dtorCount == 1 && fe2TernSunk == 101, true);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    bool slotKept = false;
+    int dtorAtCall = -1;
+    {
+        bool c = false;
+        list<unique Resource*> elements = default;
+        elements.add(fe2GrowResource(1));
+        for (unique Resource* p in elements)
+        {
+            fe2OrderSink2(c ? p : nullptr, p->id);
+            slotKept = elements.get(0) != nullptr;
+            dtorAtCall = dtorCount;
+        }
+    }
+    passed += Test("fe2_tern_sink_argorder_foreach_false",
+        slotKept && dtorAtCall == 0 && dtorCount == 1 && fe2TernSunk == 0, true);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    slotCleared = false;
+    {
+        bool c = false;
+        list<unique Resource*> elements = default;
+        elements.add(fe2GrowResource(1));
+        for (unique Resource* p in elements)
+        {
+            fe2OrderSink2(c ? nullptr : p, p->id);
+            slotCleared = elements.get(0) == nullptr;
+        }
+    }
+    passed += Test("fe2_tern_sink_argorder_foreach_reverse_false",
+        slotCleared && dtorCount == 1 && fe2TernSunk == 101, true);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    slotKept = false;
+    dtorAtCall = -1;
+    {
+        bool c = true;
+        list<unique Resource*> elements = default;
+        elements.add(fe2GrowResource(1));
+        for (unique Resource* p in elements)
+        {
+            fe2OrderSink2(c ? nullptr : p, p->id);
+            slotKept = elements.get(0) != nullptr;
+            dtorAtCall = dtorCount;
+        }
+    }
+    passed += Test("fe2_tern_sink_argorder_foreach_reverse_true",
+        slotKept && dtorAtCall == 0 && dtorCount == 1 && fe2TernSunk == 0, true);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        bool c = true;
+        Fe2FieldHolder t = default;
+        t.p = fe2GrowResource(1);
+        fe2OrderSink2(c ? t.p : nullptr, t.p->id);
+    }
+    passed += Test("fe2_tern_sink_argorder_field_true", dtorCount == 1 && fe2TernSunk == 101, true);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        bool c = false;
+        Fe2FieldHolder t = default;
+        t.p = fe2GrowResource(1);
+        fe2OrderSink2(c ? t.p : nullptr, t.p->id);
+    }
+    passed += Test("fe2_tern_sink_argorder_field_false", dtorCount == 1 && fe2TernSunk == 0, true);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        bool c = true;
+        unique Resource* p = fe2GrowResource(1);
+        Fe2OrderSink obj = default;
+        obj.sink2(c ? p : nullptr, p->id);
+        fe2TernSunk = obj.seen;
+    }
+    passed += Test("fe2_tern_sink_argorder_method_true",
+        dtorCount == 1 && fe2TernSunk == 101, true);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        bool c = false;
+        unique Resource* p = fe2GrowResource(1);
+        Fe2OrderSink obj = default;
+        obj.sink2(c ? p : nullptr, p->id);
+        fe2TernSunk = obj.seen;
+    }
+    passed += Test("fe2_tern_sink_argorder_method_false",
+        dtorCount == 1 && fe2TernSunk == 0, true);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    slotCleared = false;
+    {
+        unique Resource* other = fe2GrowResource(2);
+        list<unique Resource*> elements = default;
+        elements.add(fe2GrowResource(1));
+        for (unique Resource* p in elements)
+        {
+            fe2OrderSink2(p ?? other, p->id);
+            slotCleared = elements.get(0) == nullptr;
+        }
+    }
+    passed += Test("fe2_coalesce_sink_argorder_foreach",
+        slotCleared && dtorCount == 2 && fe2TernSunk == 101, true);
+
+    // Function bodies nested in a conditional call argument own separate selector slots.
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        bool c = true;
+        fe2RunLambda(c
+            ? (Lambda<void()>)(() => {
+                bool d = true;
+                unique Resource* p = fe2GrowResource(1);
+                fe2OrderSink2(d ? p : nullptr, 1);
+            })
+            : (Lambda<void()>)(() => { }));
+    }
+    passed += Test("fe2_tern_sink_nested_lambda_value_dtor",
+        dtorCount == 1 && fe2TernSunk == 101, true);
+
+    dtorCount = 0;
+    fe2TernSunk = 0;
+    {
+        bool c = true;
+        unique Resource* p = fe2GrowResource(1);
+        fe2OrderSink2(c ? fe2NestedGenericSink<Resource>(p, true) : nullptr, 3);
+    }
+    passed += Test("fe2_tern_sink_nested_generic_value_dtor",
+        dtorCount == 1 && fe2TernSunk == 107, true);
+
+    i64 fe2OrderHeapAfter = (i64)HeapAudit.reportLeaks();
+    passed += Test("fe2_tern_sink_argorder_heap_delta",
+        fe2OrderHeapAfter - fe2OrderHeapBefore, (i64)0);
 
     dtorCount = 0;
     {

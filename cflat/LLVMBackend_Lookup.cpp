@@ -1353,6 +1353,7 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrSigOfSymbol(const FunctionSymbol& 
             // Same predicate the callee lowers by: an alias closure/fn-ptr param is passed by address.
             fp.IsAlias = ParameterIsAliasByPointer(p);
             fp.IsPointeeConst = (fp.ConstMask & 1) != 0;
+            if (sym.IsCxx) fp.SetCxxReferentFromParameter(p);
             sig.FuncPtrParams.push_back(fp);
         }
         return sig;
@@ -1906,6 +1907,20 @@ bool LLVMBackend::ArgumentIsCodeValue(const NamedVariable& arg, size_t occurrenc
         // A join is the one shape carrying no declared facts at all - resolve it through the
         // per-value ledger, keyed by the caller's occurrence (see the header comment).
         return ArgumentIsFunctionPointerish(arg) || JoinCarriesCodeValue(arg.Primary, occurrence);
+    }
+
+bool LLVMBackend::ConditionalArmIsCodeValue(const TypeAndValue& sourceType,
+        llvm::Value* value, size_t occurrence) const
+{
+        if (value == nullptr || IsCodeValueDataCast(value, occurrence)) return false;
+        if (JoinCarriesCodeValue(value, occurrence)) return true;
+        if (FunctionPointerShapeOf(sourceType, nullptr) != 0) return false;
+        NamedVariable source;
+        source.Primary = value;
+        source.TypeAndValue = sourceType;
+        source.CastOccurrenceId = occurrence;
+        return ArgumentIsFunctionPointerish(source)
+            || (!sourceType.Pointer && ArgumentIsCodeValue(source, occurrence));
     }
 
 bool LLVMBackend::ArgumentIsDataValue(const NamedVariable& arg) const

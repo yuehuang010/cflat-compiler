@@ -3294,6 +3294,7 @@ llvm::Constant* MainListener::EvaluateFieldDefaultConstant(const std::string& ow
         auto* tempFn = llvm::Function::Create(
             llvm::FunctionType::get(compiler->builder->getVoidTy(), false),
             llvm::Function::PrivateLinkage, "__global_field_default_tmp", compiler->module.get());
+        ConditionalCallMoveSlotFunctionScope conditionalCallMoveSlotScope(deferredConditionalCallMoveSlot_);
         compiler->builder->SetInsertPoint(llvm::BasicBlock::Create(*compiler->context, "entry", tempFn));
         llvm::Constant* folded = nullptr;
         bool sourceIsUnsigned = false;
@@ -4295,8 +4296,10 @@ MainListener::MainListener(CFlatParser* parser, LLVMBackend* compilerLLVM, const
         };
         savedCflatDefaultArgumentEvaluator_ = compilerLLVM->cflatDefaultArgumentEvaluator;
         compilerLLVM->cflatDefaultArgumentEvaluator = [this](const std::string& functionName,
-                size_t parameterIndex, const LLVMBackend::TypeAndValue& parameterType) {
-            return EvaluateCFlatDefaultArgument(functionName, parameterIndex, parameterType);
+                size_t parameterIndex, const LLVMBackend::TypeAndValue& parameterType,
+                std::vector<LLVMBackend::NamedVariable>& earlierArguments) {
+            return EvaluateCFlatDefaultArgument(
+                functionName, parameterIndex, parameterType, earlierArguments);
         };
         savedDrainWaitingInstance_ = compilerLLVM->gts.drainWaitingInstance;
         compilerLLVM->gts.drainWaitingInstance = [this](const std::string& name) { DrainWaitingPointerInstance(name); };
@@ -4506,6 +4509,7 @@ void MainListener::GenerateInterfaceDefaultParamOverloads(
         const size_t line = method->getStart()->getLine();
         auto* fn = compiler->CreateFunctionDefinition(helperName, returnType, params,
                                                        false, false, line);
+        ConditionalCallMoveSlotFunctionScope conditionalCallMoveSlotScope(deferredConditionalCallMoveSlot_);
         compiler->InitializeBlock(&fn->front(), false);
         auto ifaceArg = compiler->GetFunctionArgument(ifaceParam.VariableName);
         ifaceArg.TypeAndValue.VariableName.clear();
@@ -6219,6 +6223,7 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
 
         ActiveLocalEnumFunctionScope localEnumFunctionScope(compiler, fn->getName().str());
 
+        ConditionalCallMoveSlotFunctionScope conditionalCallMoveSlotScope(deferredConditionalCallMoveSlot_);
         compiler->InitializeBlock(&fn->front(), false);
         NamedReturnElisionContext nrvoContext;
         nrvoContext.function = fn;
@@ -7757,6 +7762,7 @@ void MainListener::ParseEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx, co
                 auto* tmpFn = llvm::Function::Create(
                     llvm::FunctionType::get(backend->builder->getVoidTy(), false),
                     llvm::Function::PrivateLinkage, "__enum_init_tmp", backend->module.get());
+                ConditionalCallMoveSlotFunctionScope conditionalCallMoveSlotScope(deferredConditionalCallMoveSlot_);
                 backend->builder->SetInsertPoint(
                     llvm::BasicBlock::Create(*backend->context, "entry", tmpFn));
                 // currentFunction stays as is, like the global initializer: a constant `?:` keeps
@@ -8717,8 +8723,7 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
                     return nullptr;
                 LLVMBackend::NamedVariable candidate;
                 {
-                    CallArgumentScope callArgumentScope(
-                        inCallArgument_, ternaryCallArgumentDepth_);
+                    CallArgumentScope callArgumentScope(inCallArgument_, ternaryCallArgumentDepth_, callArgDestinationUnique_, false);
                     CxxCallArgumentScope cxxBraceElementScope(inCxxCallArgument_, true);
                     CxxCallArgumentExpectedTypeScope cxxArgumentExpected(
                         cxxCallArgumentExpectedType_, LLVMBackend::TypeAndValue{});
@@ -9117,10 +9122,29 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
                     LLVMBackend::TypeAndValue argExpected;
                     LLVMBackend::TypeAndValue constRefDest;
                     std::string constRefPlaceType;
+                    bool uniqueVoidPointerDestination = false;
                     if (topLevel && (IsDefaultOnlyExpression(expression)
                         || HasDefaultOnlyTernaryArm(expression)))
                         compiler->GetUniqueCxxConstructorValueParameter(typeName, braceElements.size(),
                             fields.size(), argExpected);
+                    auto* braceConditional = expression->conditionalExpression();
+                    if (topLevel && argExpected.TypeName.empty()
+                        && braceConditional != nullptr && braceConditional->Question() != nullptr
+                        && !HasAssignmentOperator(expression))
+                    {
+                        LLVMBackend::TypeAndValue ctorTarget;
+                        if (compiler->GetUniqueCxxConstructorParameter(typeName,
+                                braceElements.size(), fields.size(), ctorTarget)
+                            && ctorTarget.Pointer && !ctorTarget.IsFunctionPointer
+                            && !ctorTarget.IsArrayView && !ctorTarget.IsInterface
+                            && !ctorTarget.IsInterfacePointer && !ctorTarget.IsSimd
+                            && ctorTarget.ValuePointerDepth() == 1 && !ctorTarget.ElemPointer
+                            && compiler->ResolveTypeAlias(ctorTarget.TypeName) == "void")
+                        {
+                            argExpected = ctorTarget;
+                            uniqueVoidPointerDestination = true;
+                        }
+                    }
                     const bool constRefTernary = topLevel
                         && IsCxxDeferrableDefaultTernary(expression, constRefPlaceType)
                         && compiler->GetUniqueCxxConstructorValueParameter(
@@ -9164,7 +9188,8 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
                     }
                     else
                     {
-                        CallArgumentScope callArgumentScope(inCallArgument_, ternaryCallArgumentDepth_);
+                        CallArgumentScope callArgumentScope(inCallArgument_, ternaryCallArgumentDepth_,
+                            callArgDestinationUnique_, uniqueVoidPointerDestination);
                         CxxCallArgumentScope cxxBraceElementScope(inCxxCallArgument_, true);
                         auto prefetched = prefetchedBraceElements.find(element);
                         if (prefetched != prefetchedBraceElements.end())
@@ -9228,6 +9253,14 @@ bool MainListener::TryEmitForeignCxxAggregateBraceInitFields(
                         }
                         if (!capturedBraceCall)
                             NormalizeCxxRvalueReferenceArgument(expression, elementNV);
+                    }
+                    if (uniqueVoidPointerDestination && elementNV.Primary != nullptr
+                        && elementNV.Primary->getType()->isPointerTy())
+                    {
+                        elementNV.TypeAndValue.TypeName = "void";
+                        elementNV.TypeAndValue.Pointer = true;
+                        elementNV.TypeAndValue.PointerDepth = 1;
+                        elementNV.TypeAndValue.ElemPointer = false;
                     }
                     if (rejectFrameBoundReferences && targetIsReference
                         && !IsProgramLifetimeStorage(elementNV))
@@ -10079,6 +10112,34 @@ cxx_dtor_ready:
                 // A C++ constructor argument is a C++ call argument: `?:` arms use the usual
                 // arithmetic conversions (T55), so `rv.C(k ? 5 : 6)` deduces int like clang.
                 CxxCallArgumentScope cxxCtorArgumentScope(inCxxCallArgument_, true);
+                LLVMBackend::TypeAndValue ctorVoidPointerDest;
+                auto* ctorConditional = argAssign != nullptr
+                    ? argAssign->conditionalExpression() : nullptr;
+                const bool ctorVoidPointerTernary = ctorArgExpected.TypeName.empty()
+                    && ctorConditional != nullptr
+                    && (ctorConditional->Question() != nullptr
+                        || ctorConditional->QuestionQuestion() != nullptr)
+                    && !HasAssignmentOperator(argAssign)
+                    && compiler->GetUniqueCxxConstructorParameter(
+                        typeName, ctorArguments.size(),
+                        ctorArgs->argumentNamedExpression().size(), ctorVoidPointerDest)
+                    && ctorVoidPointerDest.Pointer && !ctorVoidPointerDest.IsFunctionPointer
+                    && !ctorVoidPointerDest.IsArrayView && !ctorVoidPointerDest.IsInterface
+                    && !ctorVoidPointerDest.IsInterfacePointer && !ctorVoidPointerDest.IsSimd
+                    && ctorVoidPointerDest.ValuePointerDepth() == 1
+                    && !ctorVoidPointerDest.ElemPointer
+                    && compiler->ResolveTypeAlias(ctorVoidPointerDest.TypeName) == "void";
+                std::optional<CallArgumentScope> ctorVoidCallArgumentScope;
+                std::optional<DeclExpectedTypeScope> ctorVoidExpectedScope;
+                std::optional<CxxCallArgumentExpectedTypeScope> ctorVoidCxxExpectedScope;
+                if (ctorVoidPointerTernary)
+                {
+                    ctorVoidCallArgumentScope.emplace(inCallArgument_, ternaryCallArgumentDepth_,
+                        callArgDestinationUnique_, true);
+                    ctorVoidExpectedScope.emplace(&declExpectedType, ctorVoidPointerDest, true);
+                    ctorVoidCxxExpectedScope.emplace(
+                        cxxCallArgumentExpectedType_, ctorVoidPointerDest);
+                }
                 // A by-value class parameter can consume a default ternary in its argument slot.
                 // Supplying the expected type lets the ternary build each arm there, avoiding a
                 // copy from its selected storage phi into the constructor's ABI argument temp.
@@ -10096,7 +10157,7 @@ cxx_dtor_ready:
                 std::optional<CxxCallArgumentExpectedTypeScope> ctorValueCxxExpectedScope;
                 if (ctorValueTernary)
                 {
-                    ctorValueCallArgumentScope.emplace(inCallArgument_, ternaryCallArgumentDepth_);
+                    ctorValueCallArgumentScope.emplace(inCallArgument_, ternaryCallArgumentDepth_, callArgDestinationUnique_, false);
                     ctorValueExpectedScope.emplace(&declExpectedType, ctorValueDest, true);
                     ctorValueCxxExpectedScope.emplace(cxxCallArgumentExpectedType_, ctorValueDest);
                 }
@@ -14928,38 +14989,6 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     || (coreUniqueIfaceArm
                                         && right->getType() == compiler->GetFatPtrType())))
                             {
-                                auto movedArmOwns = [&](auto&& self, antlr4::tree::ParseTree* node) -> bool {
-                                    if (node == nullptr) return false;
-                                    std::string text = node->getText();
-                                    size_t movedText = text.find("move");
-                                    size_t colonText = movedText == std::string::npos
-                                        ? std::string::npos : text.find(':', movedText);
-                                    if (movedText != std::string::npos && colonText != std::string::npos)
-                                    {
-                                        std::string sourceName = text.substr(movedText + 4,
-                                            colonText - movedText - 4);
-                                        if (auto* source = compiler->FindLiveNamedVariable(sourceName))
-                                            if (source->IsOwning
-                                                || source->TypeAndValue.IsUnique
-                                                || compiler->IsCoreUniqueType(source->TypeAndValue.TypeName)
-                                                || compiler->IsVariableOwning(sourceName))
-                                                return true;
-                                    }
-                                    if (auto* move = dynamic_cast<CFlatParser::MoveExpressionContext*>(node))
-                                    {
-                                        std::string sourceName = move->unaryExpression() != nullptr
-                                            ? move->unaryExpression()->getText() : std::string();
-                                        if (auto* source = compiler->FindLiveNamedVariable(sourceName))
-                                            if (source->IsOwning
-                                                || source->TypeAndValue.IsUnique
-                                                || compiler->IsCoreUniqueType(source->TypeAndValue.TypeName)
-                                                || compiler->IsVariableOwning(sourceName))
-                                                return true;
-                                    }
-                                    for (auto* child : node->children)
-                                        if (self(self, child)) return true;
-                                    return false;
-                                };
                                 // T250: `unique T* owner = raw = new T();` takes the inner local slot as
                                 // its source, exactly as `unique T* owner = raw;` does (the slot owns it).
                                 if (initializerSourceNV.IsBorrowed
@@ -14984,20 +15013,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     || initializerSourceNV.TypeAndValue.IsAlias
                                     || initializerSourceNV.BorrowsOwnedElement
                                     || initializerSourceNV.BorrowsOwningLocal;
-                                bool initializerOwns = compiler->lastOwningResult
-                                    || compiler->lastCallReturnsOwned
-                                    || initializerSourceNV.IsOwning
-                                    || initializerSourceNV.IsOwningStruct
-                                    || initializerSourceNV.TypeAndValue.IsMove
-                                    || initializerSourceNV.IsExplicitMove
-                                    || compiler->IsOwnedNewTemp(right)
-                                    || compiler->IsOwningPtrTempValue(right)
-                                    || compiler->IsMovedOutPtrValue(right)
-                                    || srcIsUniquePointerJoin
-                                    || movedArmOwns(movedArmOwns, initializer)
-                                    || (initializer != nullptr
-                                        && initializer->getText().find("move") != std::string::npos
-                                        && compiler->IsMovedOutPtrValue(right));
+                                bool initializerOwns = IsOwnedUniqueInitializerSource(
+                                    compiler, initializerSourceNV, right, srcIsUniquePointerJoin);
                                 initializerIsBorrowed = initializerIsBorrowed || !initializerOwns;
                                 if (srcIsUniquePointerJoin) initializerIsBorrowed = false;
                                 // A raw pointer binding can retain its original borrow bit after

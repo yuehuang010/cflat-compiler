@@ -5763,6 +5763,7 @@ void LLVMBackend::ResetForReanalysis()
 {
     movedStateMergeStack_.reset();
     cflatDefaultArgumentContexts.clear();
+    activeCFlatDefaultArgumentEvaluations.clear();
     scanTimeGlobalVariableTypes_.clear();
     scanTimeVariableTypeScopes_.clear();
     arrayViewFieldLengths_.clear();
@@ -6339,6 +6340,7 @@ void LLVMBackend::ResetForReanalysis()
     DropModuleEscapeMemo();
     poisonedFunctions.clear();
     firstCallLocation_.clear();
+    genericBodyFunctions_.clear();
     firstAliasReturnAddressUse_.clear();
     // Holds llvm::Function* into a module a rebuild invalidates.
     tempUniqueFieldArgs_.clear();
@@ -8288,6 +8290,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
             if (p.IsRvalueRef) po["rr"] = true;
             if (p.IsAlias) po["ia"] = true;
             if (p.IsCxxLvalueRef) po["lr"] = true;
+            if (p.CxxReferentDepth != 0) po["crd"] = p.CxxReferentDepth;
             if (p.IsCxxRefToPointer) po["crp"] = true;
             if (p.IsPointeeConst) po["pc"] = true;
             if (p.PointerDepth > 1) po["pd"] = static_cast<int64_t>(p.PointerDepth);
@@ -8408,6 +8411,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
                     if (auto v = po->getBoolean("pc")) p.IsPointeeConst = *v;
                     if (p.Pointer) p.PointerDepth = 1;
                     if (auto v = po->getInteger("pd")) p.PointerDepth = static_cast<int>(*v);
+                    if (auto v = po->getInteger("crd")) p.CxxReferentDepth = static_cast<int>(*v);
                     if (auto v = po->getString("rk")) p.ResolvedTypeKey = v->str();
                     if (auto v = po->getInteger("cm")) p.ConstMask = static_cast<int64_t>(*v);
                     if (auto v = po->getString("as")) p.AliasSpelling = v->str();
@@ -8842,8 +8846,9 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     // const floating global admission names; v13 stores function origin metadata; v16 adds
     // const interface methods; v17 function-type pointee const masks; v18 C/C++ pointee, reference
     // and field const folded into ConstMask; v22 borrowed pointer-return summaries and provenance;
-    // v23 generic aggregate instances retain their template key and resolved arguments.
-    root["version"]   = 23;
+    // v23 generic aggregate instances retain their template key and resolved arguments; v24
+    // function-pointer params record a C++ reference-to-pointer referent depth.
+    root["version"]   = 24;
     root["platform"]  = platform;
     root["core_hash"] = ComputeCoreHash(runtimeDir);
     if (CacheBuildStampEnabled()) root["cstamp"] = CompilerBuildStamp();
@@ -9419,7 +9424,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     auto ver      = root->getInteger("version");
     auto storedPl = root->getString("platform");
     auto storedH  = root->getString("core_hash");
-    if (!ver || *ver != 23) return false;
+    if (!ver || *ver != 24) return false;
     if (!storedPl || storedPl->str() != platform) return false;
     if (!storedH || storedH->str() != coreHash) return false;
     if (CacheBuildStampEnabled())

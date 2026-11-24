@@ -1177,6 +1177,17 @@ bool LLVMBackend::HasInterfaceMethod(const std::string& ifaceName, const std::st
         return false;
     }
 
+size_t LLVMBackend::CountInterfaceMethods(const std::string& ifaceName,
+                                          const std::string& methodName) const
+{
+        const auto* methods = FindInterface(ifaceName);
+        if (methods == nullptr) return 0;
+        size_t count = 0;
+        for (const auto& m : *methods)
+            if (m.Name == methodName) ++count;
+        return count;
+    }
+
 const LLVMBackend::InterfaceMethod* LLVMBackend::FindInterfaceMethod(const std::string& ifaceName,
                                                const std::string& methodName,
                                                size_t argCount) const

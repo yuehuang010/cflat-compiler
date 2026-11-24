@@ -1602,6 +1602,32 @@ bool LLVMBackend::FindUnmovableCxxStruct(const std::string& typeName, std::strin
         return FindUncopyableCxxField(resolved, true, fieldPath, fieldType, fault) && moveRefused(resolved);
 }
 
+bool LLVMBackend::RefuseCxxFieldByteCopy(const std::string& typeName)
+{
+        if (!HasCxxRecords()) return false;
+        std::string fieldPath, fieldType;
+        CxxCopyCtorFault fault = CxxCopyCtorFault::None;
+        if (!FindUncopyableCxxField(typeName, false, fieldPath, fieldType, fault)) return false;
+        const std::string why = LocalizeMessage(
+            "cannot copy struct '{}' because field '{}' contains C++ class '{}' whose "
+            "copy constructor is {}",
+            { SpellDiagnosticType(*this, TypeAndValue{ .TypeName = typeName }), fieldPath,
+              DisplayCxxClassName(fieldType),
+              fault == CxxCopyCtorFault::CopyDeleted ? "deleted" : "not accessible from the imported header" });
+        // Generic methods are instantiated eagerly; fire only if this one is called, like compile_error.
+        const auto& origin = gts.activeInstantiationOrigin;
+        auto* block = builder->GetInsertBlock();
+        if (origin.valid && block != nullptr && block->getParent() != nullptr
+            && (gts.genericStructTemplates.count(origin.templateName) != 0
+                || gts.genericClassTemplates.count(origin.templateName) != 0))
+        {
+            poisonedFunctions.emplace(block->getParent()->getName().str(), why);
+            return false;
+        }
+        LogError(why);
+        return true;
+}
+
 bool LLVMBackend::HasUncopyableCxxField(const std::string& typeName) const
 {
         std::unordered_set<std::string> seen;

@@ -3852,6 +3852,79 @@ LLVM_ATTRIBUTE_NOINLINE bool LLVMBackend::ApplyConditionalMoveParamSourceTransfe
                 return true;
             }
         }
+        std::vector<llvm::Value*> deferredSourceSlots;
+        if (beforeCall)
+            for (const auto& source : arg.ConditionalMoveSources)
+            {
+                if (!source.MoveParamSinkArgument || source.BorrowedPointer
+                    || source.DeferredSourceSlot == nullptr
+                    || std::find(deferredSourceSlots.begin(), deferredSourceSlots.end(),
+                        source.DeferredSourceSlot) != deferredSourceSlots.end())
+                    continue;
+                deferredSourceSlots.push_back(source.DeferredSourceSlot);
+            }
+        for (llvm::Value* deferredSlot : deferredSourceSlots)
+        {
+            for (const auto& source : arg.ConditionalMoveSources)
+            {
+                if (!source.MoveParamSinkArgument || source.BorrowedPointer
+                    || source.DeferredSourceSlot != deferredSlot
+                    || source.Storage == nullptr || source.ValueType == nullptr
+                    || source.ArmBlock == nullptr
+                    || cflat_llvm::GetTerminatorOrNull(source.ArmBlock) == nullptr)
+                    continue;
+                auto savedIP = builder->saveIP();
+                builder->SetInsertPoint(source.ArmBlock->getTerminator());
+                llvm::Value* sourceAddress = source.Storage;
+                if (sourceAddress->getType() != builder->getPtrTy())
+                    sourceAddress = builder->CreatePointerCast(sourceAddress, builder->getPtrTy());
+                builder->CreateStore(sourceAddress, deferredSlot);
+                builder->restoreIP(savedIP);
+            }
+
+            auto* pointerType = builder->getPtrTy();
+            auto* selectedSource = builder->CreateLoad(pointerType, deferredSlot,
+                "conditional.call.move.selected");
+            const ConditionalMoveSource* selectedSourceShape = nullptr;
+            for (const auto& source : arg.ConditionalMoveSources)
+            {
+                if (!source.MoveParamSinkArgument || source.BorrowedPointer
+                    || source.DeferredSourceSlot != deferredSlot
+                    || source.Storage == nullptr || source.ValueType == nullptr
+                    || source.ArmBlock == nullptr
+                    || cflat_llvm::GetTerminatorOrNull(source.ArmBlock) == nullptr)
+                    continue;
+                selectedSourceShape = &source;
+                break;
+            }
+            if (selectedSourceShape != nullptr)
+            {
+                auto* selectedArm = builder->CreateICmpNE(selectedSource,
+                    llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(pointerType)),
+                    "conditional.call.move.has_source");
+                auto* currentFunction = builder->GetInsertBlock()->getParent();
+                auto* transferBlock = llvm::BasicBlock::Create(
+                    *context, "conditional.call.move.transfer", currentFunction);
+                auto* nextBlock = llvm::BasicBlock::Create(
+                    *context, "conditional.call.move.continue", currentFunction);
+                builder->CreateCondBr(selectedArm, transferBlock, nextBlock);
+                builder->SetInsertPoint(transferBlock);
+                auto* sourceSlotType = llvm::PointerType::getUnqual(selectedSourceShape->ValueType);
+                auto* selectedSlot = builder->CreatePointerCast(selectedSource, sourceSlotType);
+                builder->CreateStore(llvm::Constant::getNullValue(selectedSourceShape->ValueType),
+                    selectedSlot);
+                for (const auto& source : arg.ConditionalMoveSources)
+                {
+                    if (!source.MoveParamSinkArgument || source.BorrowedPointer
+                        || source.DeferredSourceSlot != deferredSlot)
+                        continue;
+                    if (!source.NullKey.empty()) RecordNullSet(source.NullKey);
+                    if (source.PointeeMove) RecordNullSet(source.CallerName, true);
+                }
+                builder->CreateBr(nextBlock);
+                builder->SetInsertPoint(nextBlock);
+            }
+        }
         for (const auto& source : arg.ConditionalMoveSources)
         {
             if (!isOwningSink
@@ -3859,6 +3932,7 @@ LLVM_ATTRIBUTE_NOINLINE bool LLVMBackend::ApplyConditionalMoveParamSourceTransfe
                 continue;
             if (beforeCall)
             {
+                if (source.DeferredSourceSlot != nullptr) continue;
                 if (source.Storage == nullptr || source.ValueType == nullptr
                     || source.ArmBlock == nullptr
                     || cflat_llvm::GetTerminatorOrNull(source.ArmBlock) == nullptr)
@@ -5381,12 +5455,120 @@ bool LLVMBackend::IsAddressedUniqueSlotToRawSlot(const NamedVariable& arg,
             && !IsInterfaceType(param.TypeName);
 }
 
+/*
+ * A slot address `&p` / `&pp` bound to a C++ reference to a pointer (referent depth r): the slot
+ * must hold the referent's class, and its pointee const levels follow C++ reference binding. A
+ * non-const lvalue or `&&` reference needs an exact match (binding the slot directly); a `const&`
+ * also binds a temporary when the qualification conversion is legal (const added at a level
+ * needs const at every level above it, so `T**` never becomes `const T**`).
+ */
+bool LLVMBackend::CxxRefSlotBinds(const TypeAndValue& slot, const TypeAndValue::FuncPtrParam& p,
+                                  std::string* error) const
+{
+    const int referentDepth = p.CxxReferentDepth;
+    if (referentDepth < 1 || slot.ProvenPointerDepth() != referentDepth + 1 || p.ConstMask < 0)
+        return false;
+    if (slot.TypeName.empty() || slot.TypeName != p.TypeName)
+    {
+        if (error != nullptr)
+        {
+            TypeAndValue referent;
+            referent.TypeName = p.TypeName;
+            referent.Pointer = true;
+            referent.PointerDepth = referentDepth;
+            referent.ElemPointer = referentDepth >= 2;
+            TypeAndValue shownSlot = slot;
+            if (shownSlot.TypeName.empty()) shownSlot.TypeName = p.TypeName;
+            *error = std::format("is a reference to '{}' and the argument '{}' addresses a slot of "
+                "another type", SpellType(*this, referent), SpellType(*this, shownSlot));
+        }
+        return false;
+    }
+    const uint32_t valueMask = TypeAndValue::ConstBitsBelow(referentDepth);
+    const uint32_t sourceMask = slot.PointeeConstMask() & valueMask;
+    const uint32_t targetMask = static_cast<uint32_t>(p.ConstMask) & valueMask;
+    // The slot itself const (`N* const* pp` given as `&pp` for `N*&`) never binds a non-const ref.
+    const bool slotConst = (slot.PointeeConstMask() & TypeAndValue::ConstBitAt(referentDepth)) != 0;
+    const bool constReference = (static_cast<uint32_t>(p.ConstMask)
+        & TypeAndValue::ConstBitAt(p.PointerDepth)) != 0;
+    const bool nonConstLvalue = p.IsCxxLvalueRef && !p.IsRvalueRef && !constReference;
+    if (sourceMask == targetMask && !(slotConst && nonConstLvalue)) return true;
+    // Only a const& binds the converted temporary; a `&&` would bind the caller slot itself.
+    bool qualificationOk = constReference && (sourceMask & ~targetMask) == 0;
+    for (int level = 0; qualificationOk && level < referentDepth; ++level)
+    {
+        if ((sourceMask & TypeAndValue::ConstBitAt(level)) == (targetMask & TypeAndValue::ConstBitAt(level)))
+            continue;
+        for (int above = level + 1; above < referentDepth; ++above)
+            if ((targetMask & TypeAndValue::ConstBitAt(above)) == 0) qualificationOk = false;
+    }
+    if (qualificationOk) return true;
+    if (error != nullptr)
+    {
+        if (slotConst && nonConstLvalue && sourceMask == targetMask)
+            *error = "cannot bind a pointer whose pointee const would need to be removed";
+        else
+            *error = (sourceMask | targetMask) == targetMask
+                ? "cannot bind a pointer whose pointee const would need to be added"
+                : "cannot bind a pointer whose pointee const would need to be removed";
+    }
+    return false;
+}
+
 std::string LLVMBackend::FuncPtrArgDepthMismatch(const NamedVariable& arg,
         const TypeAndValue::FuncPtrParam& p) const
 {
         if (!p.Pointer || p.PointerDepth < 1 || p.TypeName == "void" || p.TypeName.empty())
             return "";
 
+        /*
+         * A C++ reference-to-pointer slot given a pointer PRVALUE (`&object`, `&p`, nullptr): a
+         * non-const lvalue `T*&` / `T**&` never binds one, and a referent deeper than the value is
+         * a depth mismatch. `T* const&` / `T*&&` bind a temporary (the call lowering makes it);
+         * a value one level deeper than the referent is the CFlat spelling of the slot itself.
+         */
+        bool slotSpelling = false;
+        if (p.CxxReferentDepth >= 1)
+        {
+            const bool nullArgument = IsNullPointerConstantArgument(arg, true)
+                || llvm::isa_and_nonnull<llvm::ConstantPointerNull>(arg.Primary);
+            int prvalueDepth = 0;
+            if (arg.IsAddressOfPlainObject && arg.TypeAndValue.Pointer && arg.TypeAndValue.PointerDepth == 0
+                && !arg.TypeAndValue.ElemPointer)
+                prvalueDepth = 1;
+            else if (arg.IsCxxAddressOfPointerValue && arg.TypeAndValue.IsProvenDoublePointer())
+                prvalueDepth = 2;
+            TypeAndValue referent;
+            referent.TypeName = p.TypeName;
+            referent.Pointer = true;
+            referent.PointerDepth = p.CxxReferentDepth;
+            referent.ElemPointer = p.CxxReferentDepth >= 2;
+            const std::string referentShown = SpellType(*this, referent);
+            const bool constReference = p.ConstMask >= 0 && (static_cast<uint32_t>(p.ConstMask)
+                & TypeAndValue::ConstBitAt(p.PointerDepth)) != 0;
+            const bool nonConstLvalue = p.IsCxxLvalueRef && !p.IsRvalueRef && !constReference;
+            if (nullArgument && nonConstLvalue)
+                return std::format("is a non-const reference to '{}' and cannot bind 'nullptr'; pass a "
+                    "pointer variable's address", referentShown);
+            if (prvalueDepth > 0 && prvalueDepth < p.CxxReferentDepth)
+            {
+                TypeAndValue shownArgument = arg.TypeAndValue;
+                if (shownArgument.TypeName.empty()) shownArgument.TypeName = p.TypeName;
+                return std::format("is a reference to '{}' and the argument has type '{}' - the pointer "
+                    "depths differ", referentShown, SpellType(*this, shownArgument));
+            }
+            if (prvalueDepth == p.CxxReferentDepth && nonConstLvalue)
+                return std::format("is a non-const reference to '{}' and cannot bind the pointer rvalue "
+                    "'{}'; pass a pointer variable's address", referentShown,
+                    prvalueDepth == 1 ? "&object" : "&pointer");
+            // A `const&` / `&&` slot binds the prvalue's temporary: no depth judgement below applies.
+            if (!nonConstLvalue && (nullArgument || prvalueDepth == p.CxxReferentDepth)) return "";
+            // One level deeper than the referent is the CFlat slot spelling (`&p` for `N*&`, `&pp`
+            // for `N**&`); CxxRefSlotBinds judges it once the plain depth check refuses.
+            slotSpelling = !nullArgument && arg.TypeAndValue.DepthIsAboutThisValue()
+                && arg.TypeAndValue.ProvenPointerDepth() == p.CxxReferentDepth + 1
+                && (arg.TypeAndValue.PointerDepth > 0 || arg.TypeAndValue.ElemPointer);
+        }
         // Rebuild the parameter as a judgeable value: depth 2 is what ElemPointer would say.
         TypeAndValue param;
         param.TypeName = p.TypeName;
@@ -5432,9 +5614,18 @@ std::string LLVMBackend::FuncPtrArgDepthMismatch(const NamedVariable& arg,
                 return "cannot bind a pointer whose pointee const would need to be removed";
             }
         }
-        if (IsAddressedUniqueSlotToRawSlot(arg, arg.TypeAndValue, param)
-            || !arg.TypeAndValue.PointerDepthRefuses(param))
+        // A reference-to-pointer slot keeps the referent-depth judgement above; only a plain pointer
+        // parameter takes the `&object` depth-1 proof.
+        const bool depthRefused = p.IsCxxRefToPointer || p.IsAlias
+            ? arg.TypeAndValue.PointerDepthRefuses(param) : arg.ArgumentPointerDepthRefuses(param);
+        if (IsAddressedUniqueSlotToRawSlot(arg, arg.TypeAndValue, param) || !depthRefused)
             return "";
+        if (slotSpelling)
+        {
+            std::string slotError;
+            if (CxxRefSlotBinds(arg.TypeAndValue, p, &slotError)) return "";
+            if (!slotError.empty()) return slotError;
+        }
 
         TypeAndValue parameterBase;
         parameterBase.TypeName = p.TypeName;

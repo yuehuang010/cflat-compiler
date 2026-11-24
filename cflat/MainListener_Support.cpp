@@ -4476,13 +4476,21 @@ bool IsLastUseOfForeignCxxParam(
                                     && compiler->HasUncopyableCxxField(source.TypeAndValue.TypeName));
 }
 
-// The function body enclosing `useCtx` (null inside a lambda or outside a function).
-static antlr4::tree::ParseTree* EnclosingFunctionBody(antlr4::ParserRuleContext* useCtx)
+// The function body enclosing `useCtx` (null outside a function, and inside a lambda unless
+// `ownParam` names one of that lambda's own parameters - then the lambda body).
+static antlr4::tree::ParseTree* EnclosingFunctionBody(antlr4::ParserRuleContext* useCtx,
+                                                      const std::string& ownParam = {})
 {
     for (antlr4::tree::ParseTree* node = useCtx; node != nullptr; node = node->parent)
     {
-        if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr)
+        if (auto* lambda = dynamic_cast<CFlatParser::LambdaExpressionContext*>(node))
+        {
+            if (!ownParam.empty() && lambda->lambdaParamList() != nullptr)
+                for (auto* param : lambda->lambdaParamList()->lambdaParam())
+                    if (param->Identifier() != nullptr && param->Identifier()->getText() == ownParam)
+                        return lambda->lambdaBody();
             return nullptr;
+        }
         if (auto* fn = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(node))
             return fn->compoundStatement();
     }
@@ -4547,7 +4555,7 @@ bool IsLastUseOfUncopyableStruct(
 bool IsLastBareUseInScope(antlr4::ParserRuleContext* useCtx, const std::string& name,
                           antlr4::tree::ParseTree* scope, bool returnEndsPath)
 {
-    antlr4::tree::ParseTree* body = EnclosingFunctionBody(useCtx);
+    antlr4::tree::ParseTree* body = EnclosingFunctionBody(useCtx, scope == nullptr ? name : std::string());
     if (body == nullptr) return false;
     if (scope != nullptr) body = scope;
 
@@ -4556,6 +4564,8 @@ bool IsLastBareUseInScope(antlr4::ParserRuleContext* useCtx, const std::string& 
         size_t token = 0;
         bool inLoop = false;
         bool inNestedLambda = false;
+        CFlatParser::LambdaExpressionContext* lambda = nullptr;   // outermost nested lambda
+        int lambdaDepth = 0;
     };
     std::vector<Occurrence> occurrences;
     // Declaration contexts supply lexical slot identity for later uses not visited yet.
@@ -4594,23 +4604,36 @@ bool IsLastBareUseInScope(antlr4::ParserRuleContext* useCtx, const std::string& 
     };
     auto collect = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
         if (node == nullptr) return;
-        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
+        // A nested lambda's own parameter named `name` is a different binding.
+        if (auto* lambda = dynamic_cast<CFlatParser::LambdaExpressionContext*>(node);
+            lambda != nullptr && lambda->lambdaParamList() != nullptr)
+            for (auto* param : lambda->lambdaParamList()->lambdaParam())
+                if (param->Identifier() != nullptr && param->Identifier()->getText() == name)
+                    return;
+        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+            primary != nullptr && primary->genericIdentifier() != nullptr)
         {
-            if (primary->genericIdentifier() != nullptr && primary->getText() == name)
+            if (primary->getText() == name)
             {
                 if (isShadowedByLocal(primary)) return;
                 bool inLoop = false;
                 bool inNestedLambda = false;
+                int lambdaDepth = 0;
+                CFlatParser::LambdaExpressionContext* outerLambda = nullptr;
                 for (auto* parent = primary->parent; parent != nullptr && parent != body;
                      parent = parent->parent)
                 {
                     if (dynamic_cast<CFlatParser::IterationStatementContext*>(parent) != nullptr)
                         inLoop = true;
-                    if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(parent) != nullptr)
+                    if (auto* lambda = dynamic_cast<CFlatParser::LambdaExpressionContext*>(parent))
+                    {
                         inNestedLambda = true;
+                        outerLambda = lambda;
+                        lambdaDepth++;
+                    }
                 }
                 occurrences.push_back({ (size_t)primary->getStart()->getTokenIndex(),
-                                        inLoop, inNestedLambda });
+                                        inLoop, inNestedLambda, outerLambda, lambdaDepth });
             }
             return;
         }
@@ -4647,6 +4670,94 @@ bool IsLastBareUseInScope(antlr4::ParserRuleContext* useCtx, const std::string& 
         }
         return false;
     };
+    // A capture before the use is harmless only when its lambda is the whole initializer of a
+    // named local whose binding (lexically resolved) appears only as the callee of a direct call
+    // `f(...)` before the use, never inside another lambda: the closure cannot run afterwards.
+    // Does `list` declare `id` with an initDeclarator that ends before `token` (in scope there)?
+    auto declaresBefore = [](CFlatParser::InitDeclaratorListContext* list, const std::string& id,
+                             size_t token) {
+        if (list == nullptr) return false;
+        for (auto* init : list->initDeclarator())
+        {
+            auto* direct = init->declarator() != nullptr ? init->declarator()->directDeclarator() : nullptr;
+            if (direct != nullptr && direct->Identifier() != nullptr && direct->Identifier()->getText() == id
+                && init->getStop() != nullptr && (size_t)init->getStop()->getTokenIndex() < token)
+                return true;
+        }
+        return false;
+    };
+    auto closureDeadAfterUse = [&](CFlatParser::LambdaExpressionContext* lambda) {
+        if (lambda == nullptr) return false;
+        CFlatParser::InitDeclaratorContext* init = nullptr;
+        for (auto* parent = lambda->parent; parent != nullptr && parent != body; parent = parent->parent)
+            if ((init = dynamic_cast<CFlatParser::InitDeclaratorContext*>(parent)) != nullptr) break;
+        if (init == nullptr || init->initializer() == nullptr
+            || init->initializer()->getText() != lambda->getText())
+            return false;
+        auto* direct = init->declarator() != nullptr ? init->declarator()->directDeclarator() : nullptr;
+        if (direct == nullptr || direct->Identifier() == nullptr) return false;
+        const std::string closureName = direct->Identifier()->getText();
+        CFlatParser::CompoundStatementContext* scope = nullptr;
+        for (auto* parent = init->parent; parent != nullptr; parent = parent->parent)
+            if ((scope = dynamic_cast<CFlatParser::CompoundStatementContext*>(parent)) != nullptr) break;
+        if (scope == nullptr) return false;
+        const size_t declEnd = (size_t)init->getStop()->getTokenIndex();
+        // Does `primary` resolve to the closure local (not a nested declaration or lambda param)?
+        auto bindsClosure = [&](CFlatParser::PrimaryExpressionContext* primary) {
+            const size_t token = (size_t)primary->getStart()->getTokenIndex();
+            for (auto* parent = primary->parent; parent != nullptr && parent != scope; parent = parent->parent)
+            {
+                if (auto* inner = dynamic_cast<CFlatParser::LambdaExpressionContext*>(parent);
+                    inner != nullptr && inner->lambdaParamList() != nullptr)
+                    for (auto* param : inner->lambdaParamList()->lambdaParam())
+                        if (param->Identifier() != nullptr && param->Identifier()->getText() == closureName)
+                            return false;
+                if (auto* block = dynamic_cast<CFlatParser::CompoundStatementContext*>(parent);
+                    block != nullptr && block->blockItemList() != nullptr)
+                    for (auto* item : block->blockItemList()->blockItem())
+                        if (item->declaration() != nullptr
+                            && declaresBefore(item->declaration()->initDeclaratorList(), closureName, token))
+                            return false;
+                if (auto* loop = dynamic_cast<CFlatParser::IterationStatementContext*>(parent);
+                    loop != nullptr && loop->forCondition() != nullptr
+                    && loop->forCondition()->forDeclaration() != nullptr
+                    && declaresBefore(loop->forCondition()->forDeclaration()->initDeclaratorList(),
+                                      closureName, token))
+                    return false;
+            }
+            return true;
+        };
+        bool safe = true;
+        auto scan = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+            if (node == nullptr || !safe) return;
+            if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+                primary != nullptr && primary->genericIdentifier() != nullptr)
+            {
+                const size_t token = (size_t)primary->getStart()->getTokenIndex();
+                if (primary->getText() != closureName || token <= declEnd || !bindsClosure(primary))
+                    return;
+                // `(inner)(...)`: the callee is the outermost parenthesized primary wrapping the name.
+                antlr4::ParserRuleContext* callee = primary;
+                for (auto* parent = primary->parent; parent != nullptr && parent != scope; parent = parent->parent)
+                    if (auto* wrap = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(parent))
+                    {
+                        if (wrap->getText() != "(" + callee->getText() + ")") break;
+                        callee = wrap;
+                    }
+                auto* call = dynamic_cast<CFlatParser::PostfixExpressionContext*>(callee->parent);
+                auto* open = call != nullptr && call->children.size() > 1 && call->children[0] == callee
+                    ? dynamic_cast<antlr4::tree::TerminalNode*>(call->children[1]) : nullptr;
+                bool inLambda = false;
+                for (auto* parent = primary->parent; parent != nullptr && parent != scope; parent = parent->parent)
+                    if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(parent) != nullptr) inLambda = true;
+                if (open == nullptr || open->getText() != "(" || inLambda || token > useToken) safe = false;
+                return;
+            }
+            for (auto* child : node->children) self(self, child);
+        };
+        scan(scan, scope);
+        return safe;
+    };
     bool found = false;
     bool later = false;
     for (const auto& occurrence : occurrences)
@@ -4657,7 +4768,13 @@ bool IsLastBareUseInScope(antlr4::ParserRuleContext* useCtx, const std::string& 
             if (occurrence.inLoop || occurrence.inNestedLambda) return false;
             continue;
         }
-        if (occurrence.inNestedLambda) return false;
+        if (occurrence.inNestedLambda)
+        {
+            if (occurrence.token > useToken || occurrence.lambdaDepth != 1
+                || !closureDeadAfterUse(occurrence.lambda))
+                return false;
+            continue;
+        }
         if (occurrence.token > useToken) later = true;
     }
     if (!found) return false;
@@ -5136,6 +5253,27 @@ void SetPointerBorrowReturnSummaries(
 bool UniquePointerSourceIsOwned(const LLVMBackend::NamedVariable& source)
 {
     return source.IsOwning || source.IsNewAllocated;
+}
+bool MainListener::IsOwnedUniqueInitializerSource(LLVMBackend* compiler,
+        const LLVMBackend::NamedVariable& source, llvm::Value* value, bool additionalOwnedProof)
+{
+    if (compiler == nullptr) return false;
+    const bool ownedConditionalMove = std::any_of(
+        source.ConditionalMoveSources.begin(), source.ConditionalMoveSources.end(),
+        [&](const auto& moveSource) {
+            if (!moveSource.IsExplicitMove || moveSource.CallerName.empty()
+                || moveSource.BorrowedPointer) return false;
+            const auto* movedSource = compiler->FindLiveNamedVariable(moveSource.CallerName);
+            return movedSource != nullptr
+                && (movedSource->IsOwning || movedSource->TypeAndValue.IsUnique
+                    || compiler->IsCoreUniqueType(movedSource->TypeAndValue.TypeName)
+                    || compiler->IsVariableOwning(moveSource.CallerName));
+        });
+    return compiler->lastOwningResult || compiler->lastCallReturnsOwned
+        || source.IsOwning || source.IsOwningStruct || source.TypeAndValue.IsMove
+        || source.IsExplicitMove || compiler->IsOwnedNewTemp(value)
+        || compiler->IsOwningPtrTempValue(value) || compiler->IsMovedOutPtrValue(value)
+        || ownedConditionalMove || additionalOwnedProof;
 }
 std::string ArrowNormalizeLockText(const std::string& text)
 {

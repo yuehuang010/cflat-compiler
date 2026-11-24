@@ -1148,6 +1148,135 @@ int defTmpUse(alias DefTmpP a, int k) { return a.v + k; }
 struct DefTmpPRef { int* p = default; };
 DefTmpPRef defTmpPr(alias DefTmpP d = defTmpMkP(7)) { DefTmpPRef r = default; r.p = &d.v; return r; }
 int* defTmpPvEarlier(DefTmpP first, alias DefTmpP d = defTmpMkP(first.v + 2)) { return &d.v; }
+alias DefTmpP defTmpPickEarlier(DefTmpP first, alias DefTmpP d = defTmpMkP(first.v + 1)) { return d; }
+int DefTmpEarlyBorrowCaller() { return *DefTmpLatePv(); }
+int* DefTmpLatePv(alias DefTmpP d = defTmpMkP(9)) { return &d.v; }
+struct DefTmpMethodHost
+{
+    int earlyBorrow() { return *lateBorrow(); }
+    int* lateBorrow(alias DefTmpP d = defTmpMkP(9)) { return &d.v; }
+};
+int DefTmpByp2(int* p = defTmpPv()) { return *p; }
+int defTmpFnOver(int x) { return x + 10; }
+int defTmpFnOver(double x) { return (int)x + 20; }
+int DefTmpFnCaller() { return DefTmpFnUse(); }
+int DefTmpFnUse(function<int(int)> f = defTmpFnOver) { return f(2); }
+int defTmp2AuditLive = 0;
+int defTmp2AuditDup = 0;
+struct DefTmp2Audit
+{
+    int v = default;
+    DefTmp2Audit(int x) { v = x; defTmp2AuditLive++; }
+    ~DefTmp2Audit()
+    {
+        if (v == -999) defTmp2AuditDup++;
+        else defTmp2AuditLive--;
+        v = -999;
+    }
+};
+DefTmp2Audit defTmp2MakeAudit(int x) { return DefTmp2Audit(x); }
+int defTmp2AuditSeen(int value)
+{
+    int seen = value * 100 + defTmp2AuditLive * 10 + defTmp2AuditDup;
+    defTmp2AuditLive = 0;
+    defTmp2AuditDup = 0;
+    return seen;
+}
+int defTmp2AliasRvalue(alias DefTmp2Audit a, DefTmp2Audit* d = &a)
+{
+    return a.v + d->v;
+}
+int defTmp2UniquePointerDefault(unique<DefTmp2Audit> a, int* d = &a->v)
+{
+    return *d + 1;
+}
+int defTmp2UniqueAliasDefault(unique<DefTmp2Audit> a,
+    alias DefTmp2Audit d = defTmp2MakeAudit(a->v))
+{
+    return d.v + 1;
+}
+int defTmp2RecursiveCalls = 0;
+int defTmp2RecursiveValue = 3;
+int* defTmp2RecursiveDefault(int n,
+    int* d = n > 0 ? defTmp2RecursiveDefault(n - 1) : &defTmp2RecursiveValue)
+{
+    defTmp2RecursiveCalls++;
+    return d;
+}
+int defTmp2MethodRecursiveCalls = 0;
+int defTmp2MethodRecursiveValue = 3;
+struct DefTmp2RecursiveMethodHost
+{
+    int* recursiveBorrow(int n,
+        int* d = n > 0 ? recursiveBorrow(n - 1) : &defTmp2MethodRecursiveValue)
+    {
+        defTmp2MethodRecursiveCalls++;
+        return d;
+    }
+    int* pointerReceiver(int n) { return recursiveBorrow(n); }
+};
+int defTmp2GenericMethodRecursiveCalls = 0;
+int defTmp2GenericMethodRecursiveValue = 33;
+struct DefTmp2RecursiveGenericMethodHost<T>
+{
+    T marker = default;
+    int* recursiveBorrow(int n,
+        int* d = n > 0 ? recursiveBorrow(n - 1) : &defTmp2GenericMethodRecursiveValue)
+    {
+        defTmp2GenericMethodRecursiveCalls++;
+        return d;
+    }
+};
+int defTmp2MutualMethodRecursiveCalls = 0;
+int defTmp2MutualMethodRecursiveValue = 34;
+struct DefTmp2MutualMethodHost
+{
+    int* left(int n, int* d = n > 0 ? right(n - 1) : &defTmp2MutualMethodRecursiveValue)
+    {
+        defTmp2MutualMethodRecursiveCalls++;
+        return d;
+    }
+    int* right(int n, int* d = n > 0 ? left(n - 1) : &defTmp2MutualMethodRecursiveValue)
+    {
+        defTmp2MutualMethodRecursiveCalls++;
+        return d;
+    }
+};
+int defTmp2EarlyOneArg()
+{
+    int value = *defTmp2LateOneArg(1);
+    return value;
+}
+int* defTmp2LateOneArg(int a, alias DefTmp2Audit d = defTmp2MakeAudit(7))
+{
+    return &d.v;
+}
+int defTmp2EarlyEarlierDefault()
+{
+    int value = *defTmp2LateEarlierDefault(1);
+    return value;
+}
+int* defTmp2LateEarlierDefault(int a,
+    alias DefTmp2Audit d = defTmp2MakeAudit(a + 6))
+{
+    return &d.v;
+}
+int defTmp2IntOverloadCalls = 0;
+int defTmp2DoubleOverloadCalls = 0;
+int defTmp2EarlyOverloadSet()
+{
+    return *defTmp2LateOverloadSet(1) + defTmp2LateOverloadSet(2.0);
+}
+int* defTmp2LateOverloadSet(int a, alias DefTmp2Audit d = defTmp2MakeAudit(7))
+{
+    defTmp2IntOverloadCalls++;
+    return &d.v;
+}
+int defTmp2LateOverloadSet(double a)
+{
+    defTmp2DoubleOverloadCalls++;
+    return 10;
+}
 DefTmpN defTmpGlobal = default;
 int defTmpBumpGlobal(alias DefTmpN d = defTmpGlobal) { d.v = d.v + 1; return d.v; }
 int defTmpByvPick(DefTmpP d = defTmpPick()) { return d.v; }
@@ -1263,9 +1392,64 @@ bool testDefaultParamNativeTemporaries()
     r = 0;
     for (int i = 0; i < 3; i++) r += *defTmpPv();
     result &= Test("deftmp_pointer_borrow_loop", DefTmpPSeen(r), 180);
-    // An earlier-parameter default stays in the wrapper; a borrowing result keeps it alive (leak).
+    // Earlier-parameter defaults are evaluated at the call site; temps last through this statement.
     r = *defTmpPvEarlier(DefTmpP(2));
+    result &= Test("deftmp2_earlier_param_full_expression", DefTmpPSeen(r), 40);
     result &= Test("deftmp_earlier_param_borrow_value", DefTmpPSeen(r) / 10, 4);
+    r = defTmpPickEarlier(DefTmpP(2)).v;
+    result &= Test("deftmp2_earlier_alias_full_expression", DefTmpPSeen(r), 30);
+    r = defTmp2AliasRvalue(DefTmp2Audit(3));
+    result &= Test("deftmp2_alias_rvalue_has_storage_once", defTmp2AuditSeen(r), 600);
+    r = defTmp2UniquePointerDefault(new DefTmp2Audit(4));
+    result &= Test("deftmp2_unique_rvalue_pointer_default_once", defTmp2AuditSeen(r), 500);
+    r = defTmp2UniqueAliasDefault(new DefTmp2Audit(4));
+    result &= Test("deftmp2_unique_rvalue_alias_default_once", defTmp2AuditSeen(r), 500);
+    defTmp2RecursiveCalls = 0;
+    r = *defTmp2RecursiveDefault(2);
+    result &= Test("deftmp2_recursive_default_uses_wrapper", defTmp2RecursiveCalls * 100 + r, 303);
+    defTmp2MethodRecursiveCalls = 0;
+    DefTmp2RecursiveMethodHost defTmp2RecursiveMethodHost = default;
+    r = *defTmp2RecursiveMethodHost.recursiveBorrow(2);
+    result &= Test("deftmp2_recursive_method_default",
+        defTmp2MethodRecursiveCalls * 100 + r, 303);
+    defTmp2MethodRecursiveCalls = 0;
+    DefTmp2RecursiveMethodHost* defTmp2RecursiveMethodPointer = &defTmp2RecursiveMethodHost;
+    r = *defTmp2RecursiveMethodPointer->recursiveBorrow(2);
+    result &= Test("deftmp2_recursive_method_pointer_receiver",
+        defTmp2MethodRecursiveCalls * 100 + r, 303);
+    defTmp2MethodRecursiveCalls = 0;
+    r = *defTmp2RecursiveMethodHost.pointerReceiver(2);
+    result &= Test("deftmp2_recursive_method_implicit_this",
+        defTmp2MethodRecursiveCalls * 100 + r, 303);
+    defTmp2GenericMethodRecursiveCalls = 0;
+    DefTmp2RecursiveGenericMethodHost<int> defTmp2RecursiveGenericMethodHost = default;
+    r = *defTmp2RecursiveGenericMethodHost.recursiveBorrow(2);
+    result &= Test("deftmp2_recursive_generic_method_default",
+        defTmp2GenericMethodRecursiveCalls * 100 + r, 333);
+    defTmp2MutualMethodRecursiveCalls = 0;
+    DefTmp2MutualMethodHost defTmp2MutualMethodHost = default;
+    r = *defTmp2MutualMethodHost.left(2);
+    result &= Test("deftmp2_mutual_method_defaults",
+        defTmp2MutualMethodRecursiveCalls * 100 + r, 334);
+    r = defTmp2EarlyOneArg();
+    result &= Test("deftmp2_caller_above_one_explicit_arg", defTmp2AuditSeen(r), 700);
+    r = defTmp2EarlyEarlierDefault();
+    result &= Test("deftmp2_caller_above_earlier_default", defTmp2AuditSeen(r), 700);
+    defTmp2IntOverloadCalls = 0;
+    defTmp2DoubleOverloadCalls = 0;
+    r = defTmp2EarlyOverloadSet();
+    result &= Test("deftmp2_caller_above_overload_set", defTmp2AuditSeen(r), 1700);
+    result &= Test("deftmp2_overload_int_selected_once", defTmp2IntOverloadCalls, 1);
+    result &= Test("deftmp2_overload_double_selected_once", defTmp2DoubleOverloadCalls, 1);
+    r = DefTmpEarlyBorrowCaller();
+    result &= Test("deftmp2_caller_above_callee_borrow", DefTmpPSeen(r), 90);
+    DefTmpMethodHost defTmpMethodHost = default;
+    r = defTmpMethodHost.earlyBorrow();
+    result &= Test("deftmp2_method_caller_above_callee", DefTmpPSeen(r), 90);
+    r = DefTmpByp2();
+    result &= Test("deftmp2_pointer_param_borrow", DefTmpPSeen(r), 60);
+    r = DefTmpFnCaller();
+    result &= Test("deftmp2_function_pointer_default_overload", r, 12);
     // An alias default naming a global binds the global itself, as C++ `N& d = g` does.
     defTmpGlobal.v = 40;
     r = defTmpBumpGlobal();
@@ -1276,8 +1460,10 @@ bool testDefaultParamNativeTemporaries()
     r = defTmpByaPick();
     result &= Test("deftmp_alias_call_default_alias", DefTmpPSeen(r), 60);
     r = defTmpPick2().v;
+    result &= Test("deftmp2_alias_return_nested_live", DefTmpPSeen(r), 60);
     result &= Test("deftmp_alias_call_default_alias_return", DefTmpPSeen(r) / 10, 6);
     r = defTmpGenPick(1).v;
+    result &= Test("deftmp2_generic_default_live", DefTmpPSeen(r), 60);
     result &= Test("deftmp_alias_call_default_generic", DefTmpPSeen(r) / 10, 6);
     // Interface defaults: the helper forwards a move param without destroying its shell.
     DefTmpPut putImpl = default;
@@ -9710,6 +9896,26 @@ int pcOvVoid(PsA* p) { return 100; }
 int pcOvVoid(void* p) { return 300 + *(int*)p; }
 int pcIface(IPs i) { return i.get(); }
 int pcGen<T>(T* p) { return (int)*p; }
+// JOINARG2: whole-row call arguments.
+int ja2PsView(PsA[] v) { return v[1].v; }
+int ja2Deref2(int** p) { return **p; }
+int ja2PsGen<T>(T* p) { return p->v; }
+// JOINARG2: a void* join into a function value / interface method argument (single destination).
+int ja2TakeVoid(void* p) { return p != nullptr ? 4 : 0; }
+int ja2Identity(int n) { return n; }
+interface IJa2Take { int take(void* p); };
+class Ja2TakeImpl : IJa2Take { int k = 0; int take(void* p) { return p != nullptr ? 4 : 0; } };
+int jv2Identity(int n) { return n; }
+namespace Jv2Ns { int take(void* p) { return p != nullptr ? 4 : 0; } }
+struct Jv2Method { int take(void* p) { return p != nullptr ? 4 : 0; } };
+struct Jv2Ctor { int result = 0; Jv2Ctor(void* p) { result = p != nullptr ? 4 : 0; } };
+int jv2ReadCtor(Jv2Ctor value) { return value.result; }
+int jv2ReadAndDeleteCtor(move Jv2Ctor* value) { int result = value->result; delete value; return result; }
+struct Jv2Agg { void* p = default; };
+int jv2ReadAgg(Jv2Agg value) { return value.p != nullptr ? 4 : 0; }
+int jv2ReadAndDeleteAgg(move Jv2Agg* value) { int result = value->p != nullptr ? 4 : 0; delete value; return result; }
+int jv2Default(void* p, int n = 4) { return p != nullptr ? n : 0; }
+int jv2Generic<T>(T marker, void* p) { return p != nullptr ? (int)marker : 0; }
 // AUTOTERN: a `?:` / `??` join over one native struct pointee keeps it (auto, deref, `->`, methods).
 struct PsM { int v = 0; int twice() { return v * 2; } };
 T* psPickAuto<T>(int c, T* a, T* b) { auto q = c ? a : b; return q; }
@@ -9721,6 +9927,17 @@ int* jsId(int* p) { return p; }
 // LITSUB: `[]` on a parenthesized string literal or a ?: / ?? join of literals reads a char, like C.
 int lsKind(char c) { return 1; }
 int lsKind(int c) { return 2; }
+
+// OVDEPTH: an unnamed `&object` / ?: join argument of depth 1 never binds a `T**` parameter.
+struct OvdNs { int v = 7; };
+int ovdNsOv(OvdNs** p) { return 1; }
+int ovdNsOv(OvdNs* p) { return p->v; }
+int ovdIntOv(int** p) { return 1; }
+int ovdIntOv(int* p) { return *p; }
+int ovdGenOv<T>(T** p) { return 1; }
+int ovdGenOv<T>(T* p) { return 2; }
+interface IOvdNs { int m(OvdNs** p); int m(OvdNs* p); };
+class OvdNsImpl : IOvdNs { int k = 0; int m(OvdNs** p) { return 1; } int m(OvdNs* p) { return p->v; } };
 
 extern int main()
 {
@@ -10172,6 +10389,70 @@ bool testPointerArithmetic()
     PsM* jsMp = jsMs; int* jsAddr = &(psSel ? jsP0 : jsP1)[2];
     result &= Test("joinsub method / address-of through [] on a join", (psSel ? jsMp : jsMp)[1].twice() * 10 + *jsAddr, 83);
     result &= Test("joinsub [] on parenthesized pointer arithmetic / call", (jsP0 + 1)[1] * 10 + (jsId(jsP1))[3], 38);
+    // JOINARG2: a row `m[1]` passed whole (or stored to `int**`) decays like a named T[N].
+    // Pre-fix each form was refused (no overload / array-view of a single value / depths differ).
+    int[2][3] ja2M = {{1, 2, 3}, {4, 5, 6}}; PsA[2][2] ja2Ps = default; ja2Ps[1][0].v = 3; ja2Ps[1][1].v = 9;
+    int ja2A = 5; int*[2][2] ja2Pp = default; ja2Pp[1][0] = &ja2A; int** ja2Q = ja2Pp[1];
+    result &= Test("joinarg2 row into generic T* / view / int** / generic struct T* / int** store",
+        pcGen(ja2M[1]) * 1000 + ja2PsView(ja2Ps[1]) * 100 + ja2Deref2(ja2Pp[1]) * 10
+            + ja2PsGen(ja2Ps[1]) + **ja2Q * 10000, 54953);
+    // ACCEPT SET (passes pre-fix too): a one-level `int*[2]` still decays to `int**`.
+    int*[2] ja2Flat = default; ja2Flat[0] = &ja2A; int** ja2FlatQ = ja2Flat;
+    result &= Test("joinarg2 int*[2] into int** param / store", ja2Deref2(ja2Flat) * 10 + **ja2FlatQ, 55);
+    // JOINARG2: a struct pointer / void* join into a void* destination is void*; pre-fix refused.
+    PsA ja2Obj = default; ja2Obj.v = 21; void* ja2Vp = &ja2Obj; PsA* ja2Pa = &ja2Obj;
+    void* ja2Vq = psSel ? ja2Pa : ja2Vp;
+    result &= Test("joinarg2 PsA* / void* join into void*",
+        (ja2Vq == (void*)ja2Pa ? 10 : 0) + pcVoid(psSel == 0 ? ja2Vp : ja2Pa), 31);
+    // JOINARG2 review: a function value / interface method argument has its own single destination,
+    // direct or nested in another call. Pre-fix the direct forms were refused, the nested ones compiled.
+    function<int(void*)> ja2Fn = ja2TakeVoid;
+    Ja2TakeImpl ja2Impl = default; IJa2Take ja2Take = ja2Impl;
+    result &= Test("joinarg2 void* join into function value / interface argument, direct and nested",
+        ja2Fn(psSel ? ja2Pa : ja2Vp) * 1000 + ja2Identity(ja2Fn(psSel ? ja2Pa : ja2Vp)) * 100
+            + ja2Take.take(psSel ? ja2Pa : ja2Vp) * 10 + ja2Identity(ja2Take.take(psSel ? ja2Pa : ja2Vp)), 4444);
+    // JOINVOID ACCEPT SET: assignment into an existing void* slot remains legal.
+    void* ja2Assigned = ja2Vp; ja2Assigned = psSel ? ja2Pa : ja2Vp;
+    result &= Test("joinvoid existing void* assignment destination",
+                   ja2Assigned == (void*)ja2Pa ? 1 : 0, 1);
+    // JOINVOID: each destination cell is checked directly and under an enclosing call.
+    result &= Test("joinvoid namespace and method single void* destinations",
+        Jv2Ns.take(psSel ? ja2Pa : ja2Vp) * 10
+            + jv2Identity(Jv2Ns.take(psSel ? ja2Pa : ja2Vp)), 44);
+    Jv2Method jv2Method = default;
+    result &= Test("joinvoid instance method single void* destination, direct and nested",
+        jv2Method.take(psSel ? ja2Pa : ja2Vp) * 10
+            + jv2Identity(jv2Method.take(psSel ? ja2Pa : ja2Vp)), 44);
+    Jv2Ctor jv2Ctor = Jv2Ctor(psSel ? ja2Pa : ja2Vp);
+    result &= Test("joinvoid constructor single void* destination, direct and nested",
+        jv2Ctor.result * 10 + jv2Identity(jv2ReadCtor(Jv2Ctor(psSel ? ja2Pa : ja2Vp))), 44);
+    Jv2Ctor* jv2New = new Jv2Ctor(psSel ? ja2Pa : ja2Vp);
+    int jv2NewValue = jv2New->result;
+    int jv2NewNested = jv2Identity(jv2ReadAndDeleteCtor(
+        new Jv2Ctor(psSel ? ja2Pa : ja2Vp)));
+    delete jv2New;
+    result &= Test("joinvoid new constructor single void* destination, direct and nested",
+                   jv2NewValue * 10 + jv2NewNested, 44);
+    result &= Test("joinvoid brace argument and aggregate field destination, direct and nested",
+        jv2ReadAgg({ p = psSel ? ja2Pa : ja2Vp }) * 10
+            + jv2Identity(jv2ReadAgg({ p = psSel ? ja2Pa : ja2Vp })), 44);
+    Jv2Agg jv2Agg = { p = psSel ? ja2Pa : ja2Vp };
+    result &= Test("joinvoid field initialization destination, direct and nested",
+        (jv2Agg.p != nullptr ? 4 : 0) * 10
+            + jv2Identity(jv2Agg.p != nullptr ? 4 : 0), 44);
+    Jv2Agg* jv2NewAgg = new Jv2Agg{ p = psSel ? ja2Pa : ja2Vp };
+    int jv2BraceValue = jv2NewAgg->p != nullptr ? 4 : 0;
+    int jv2BraceNested = jv2Identity(jv2ReadAndDeleteAgg(
+        new Jv2Agg{ p = psSel ? ja2Pa : ja2Vp }));
+    delete jv2NewAgg;
+    result &= Test("joinvoid new brace and field destinations, direct and nested",
+                   jv2BraceValue * 10 + jv2BraceNested, 44);
+    result &= Test("joinvoid defaulted callee destination, direct and nested",
+        jv2Default(psSel ? ja2Pa : ja2Vp) * 10
+            + jv2Identity(jv2Default(psSel ? ja2Pa : ja2Vp)), 44);
+    result &= Test("joinvoid generic void* parameter, direct and nested",
+        jv2Generic(4, psSel ? ja2Pa : ja2Vp) * 10
+            + jv2Identity(jv2Generic(4, psSel ? ja2Pa : ja2Vp)), 44);
     // LITSUB: pre-fix each parenthesized / joined literal leg was refused ("the type of the indexed
     // expression is unknown"), and a bare `"xyz"[0]` read the whole [4 x i8] literal.
     result &= Test("litsub [] on parenthesized literal", (int)("xyz")[2] * 1000 + (int)(("xyz"))[0], 122120);
@@ -15464,6 +15745,29 @@ bool testCountofSemantics()
     result &= Test("sizeof pointer-array row element and alignof row",
         (int)sizeof(sizeofRowPointers2[1]) * 100 + (int)sizeof(sizeofRowPointers2[1][2]) * 10
             + (int)alignof(sizeofRowPointers2[1]), 2488);
+
+    // OVDEPTH: pre-fix every `&object` below picked the T** overload (1).
+    OvdNs ovdNs = default;
+    OvdNs* ovdNsP = &ovdNs;
+    int ovdI = 5;
+    int* ovdIp = &ovdI;
+    bool ovdC = true;
+    OvdNsImpl ovdImpl = default;
+    IOvdNs ovdIf = &ovdImpl;
+    result &= Test("ovdepth address-of picks T* overload",
+        ovdNsOv(&ovdNs) * 1000 + ovdIntOv(&ovdI) * 100 + ovdIf.m(&ovdNs) * 10, 7570);
+    // ACCEPT SET (passes pre-fix too): named, join, real depth-2 and generic arguments.
+    result &= Test("ovdepth named, join and T** arguments",
+        ovdNsOv(ovdNsP) * 10000 + ovdNsOv(ovdC ? ovdNsP : ovdNsP) * 1000 + ovdNsOv(&ovdNsP) * 100
+            + ovdIntOv(&ovdIp) * 10 + ovdIf.m(&ovdNsP), 77111);
+    result &= Test("ovdepth generic T* vs T**",
+        ovdGenOv(&ovdNs) * 100 + ovdGenOv(ovdNsP) * 10 + ovdGenOv(&ovdNsP), 221);
+    // ACCEPT SET (passes pre-fix too): indirect calls with matching depth.
+    function<int(OvdNs*)> ovdFp = ovdNsOv;
+    function<int(OvdNs**)> ovdFpp = ovdNsOv;
+    function<int(OvdNs*)> ovdFl = (OvdNs* p) => { return p->v + 1; };
+    result &= Test("ovdepth indirect calls at matching depth",
+        ovdFp(&ovdNs) * 100 + ovdFpp(&ovdNsP) * 10 + ovdFl(&ovdNs), 718);
     return result;
 }
 

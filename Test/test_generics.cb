@@ -8589,6 +8589,182 @@ struct TdpItem { int v = default; ~TdpItem() { tdpRuns++; } };
 TdpItem tdpMake() { TdpItem d = default; d.v = 7; return d; }
 int tdpTakeParam((TdpItem, int) t) { return t.item_1; }
 
+int tupownRawDtorCount = 0;
+struct TupownRawOwner { int value = 23; ~TupownRawOwner() { tupownRawDtorCount++; } };
+T idg<T>(T value) { return value; }
+move TupownRawOwner* tupownRawMake(int value)
+{
+    TupownRawOwner* owner = new TupownRawOwner();
+    owner->value = value;
+    return owner;
+}
+(unique TupownRawOwner*, int) tupownRawReturn()
+{
+    return ((TupownRawOwner*)new TupownRawOwner(), 4);
+}
+int tupownRawSink(move (unique TupownRawOwner*, int) value)
+{
+    return value.item_0->value * 10 + value.item_1;
+}
+bool tupownTestMovedJoinTuple(bool choose)
+{
+    tupownRawDtorCount = 0;
+    bool result = true;
+    {
+        TupownRawOwner* owner = new TupownRawOwner();
+        (unique TupownRawOwner*, int) tuple = (choose ? move owner : nullptr, 4);
+        if (choose)
+        {
+            result &= Test("tupown moved-join tuple true value", tuple.item_0->value * 10 + tuple.item_1, 234);
+            result &= Test("tupown moved-join tuple true source nulled", owner == nullptr, true);
+        }
+        else
+        {
+            result &= Test("tupown moved-join tuple false null", tuple.item_0 == nullptr, true);
+            result &= Test("tupown moved-join tuple false source value", owner->value, 23);
+        }
+    }
+    if (choose)
+        result &= Test("tupown moved-join tuple true dtor once", tupownRawDtorCount, 1);
+    else
+        result &= Test("tupown moved-join tuple false dtor once", tupownRawDtorCount, 1);
+    return result;
+}
+bool tupownTestRawJoinTuple(bool choose)
+{
+    tupownRawDtorCount = 0;
+    bool result = true;
+    {
+        TupownRawOwner* r = new TupownRawOwner();
+        TupownRawOwner* s = new TupownRawOwner();
+        r->value = 31;
+        s->value = 47;
+        (unique TupownRawOwner*, int) tuple = (choose ? r : s, 4);
+        result &= Test(choose ? "tupown raw-join tuple true arm" : "tupown raw-join tuple false arm",
+            tuple.item_0->value * 10 + tuple.item_1, choose ? 314 : 474);
+    }
+    if (choose)
+        result &= Test("tupown raw-join tuple true dtors twice", tupownRawDtorCount, 2);
+    else
+        result &= Test("tupown raw-join tuple false dtors twice", tupownRawDtorCount, 2);
+    return result;
+}
+bool tupownTestMoveCallJoinTuple(bool choose, int shape)
+{
+    tupownRawDtorCount = 0;
+    int value = 0;
+    int moveSourceNulled = 0;
+    if (shape == 0)
+    {
+        { (unique TupownRawOwner*, int) tuple =
+            (choose ? tupownRawMake(31) : tupownRawMake(47), 4);
+          value = tuple.item_0->value * 10 + tuple.item_1; }
+    }
+    else if (shape == 1)
+    {
+        { (unique TupownRawOwner*, int) tuple =
+            (choose ? tupownRawMake(31) : new TupownRawOwner(), 4);
+          value = tuple.item_0->value * 10 + tuple.item_1; }
+    }
+    else if (shape == 2)
+    {
+        TupownRawOwner* owner = new TupownRawOwner();
+        owner->value = 31;
+        tupownRawDtorCount = 0;
+        { (unique TupownRawOwner*, int) tuple =
+            (choose ? move owner : tupownRawMake(47), 4);
+          moveSourceNulled = owner == nullptr;
+          value = tuple.item_0->value * 10 + tuple.item_1; }
+    }
+    else if (shape == 3)
+    {
+        { (unique TupownRawOwner*, int) tuple =
+            (choose ? tupownRawMake(31) : nullptr, 4);
+          value = tuple.item_0 == nullptr ? tuple.item_1
+              : tuple.item_0->value * 10 + tuple.item_1; }
+    }
+    else if (shape == 4)
+    {
+        { (unique TupownRawOwner*, int) tuple =
+            (tupownRawMake(31) ?? new TupownRawOwner(), 4);
+          value = tuple.item_0->value * 10 + tuple.item_1; }
+    }
+    else
+    {
+        { (unique TupownRawOwner*, int) tuple = default;
+          tuple = (choose ? tupownRawMake(31) : tupownRawMake(47), 4);
+          value = tuple.item_0->value * 10 + tuple.item_1; }
+    }
+    const int expectedValue = shape == 3 && !choose ? 4
+        : shape == 1 && !choose ? 234
+        : choose ? 314 : 474;
+    const int expectedDtors = shape == 2 && !choose ? 2
+        : shape == 3 && !choose ? 0 : 1;
+    bool result = Test("tupown move-call tuple value", value, expectedValue);
+    result &= Test("tupown move-call tuple dtors", tupownRawDtorCount, expectedDtors);
+    if (shape == 2)
+        result &= Test("tupown move-call tuple source null", moveSourceNulled, choose);
+    return result;
+}
+bool tupownTestNewNullJoinTuple(bool choose)
+{
+    tupownRawDtorCount = 0;
+    int value = 0;
+    { (unique TupownRawOwner*, int) tuple =
+        (choose ? tupownRawMake(31) : nullptr, 4);
+      value = tuple.item_0 == nullptr ? tuple.item_1
+          : tuple.item_0->value * 10 + tuple.item_1; }
+    bool result = Test("tupown new-null tuple value", value, choose ? 314 : 4);
+    result &= Test("tupown new-null tuple dtors", tupownRawDtorCount, choose ? 1 : 0);
+    return result;
+}
+bool tupownTestUniqueMoveNullJoinTuple(bool choose)
+{
+    tupownRawDtorCount = 0;
+    bool result = true;
+    {
+        unique TupownRawOwner* owner = (TupownRawOwner*)new TupownRawOwner();
+        tupownRawDtorCount = 0;
+        (unique TupownRawOwner*, int) tuple = (choose ? move owner : nullptr, 4);
+        result &= Test("tupown unique-move-null value",
+            tuple.item_0 == nullptr ? 4 : tuple.item_0->value * 10 + tuple.item_1,
+            choose ? 234 : 4);
+        result &= Test("tupown unique-move-null source",
+            owner == nullptr, choose);
+        if (!choose)
+            result &= Test("tupown unique-move-null source value", owner->value, 23);
+    }
+    result &= Test("tupown unique-move-null dtors", tupownRawDtorCount, 1);
+    return result;
+}
+bool tupownTestNestedNewNullJoinTuple(bool choose, bool inner)
+{
+    tupownRawDtorCount = 0;
+    int value = 0;
+    { (unique TupownRawOwner*, int) tuple =
+        (choose ? (inner ? tupownRawMake(31) : nullptr) : tupownRawMake(47), 4);
+      value = tuple.item_0 == nullptr ? tuple.item_1
+          : tuple.item_0->value * 10 + tuple.item_1; }
+    int expectedValue = choose ? (inner ? 314 : 4) : 474;
+    bool result = Test("tupown nested-new-null tuple value", value, expectedValue);
+    result &= Test("tupown nested-new-null tuple dtors", tupownRawDtorCount,
+        choose && !inner ? 0 : 1);
+    return result;
+}
+bool tupownTestRawCoalesceTuple()
+{
+    tupownRawDtorCount = 0;
+    int value = 0;
+    { TupownRawOwner* owner = new TupownRawOwner();
+      owner->value = 31;
+      tupownRawDtorCount = 0;
+      (unique TupownRawOwner*, int) tuple = (owner ?? new TupownRawOwner(), 4);
+      value = tuple.item_0->value * 10 + tuple.item_1; }
+    bool result = Test("tupown raw-coalesce tuple value", value, 314);
+    result &= Test("tupown raw-coalesce tuple dtor once", tupownRawDtorCount, 1);
+    return result;
+}
+
 struct TlcUnused { int k = 0; TlcUnused((int, int) x) { } };
 struct TlcUse { int k = 0; TlcUse((int, int) x) { k = x.item_1; } };
 
@@ -8597,6 +8773,25 @@ struct TlcUse { int k = 0; TlcUse((int, int) x) { k = x.item_1; } };
 bool testTupleLambdaParamsAndDtors()
 {
     bool result = true;
+
+    tupownRawDtorCount = 0;
+    {
+        unique TupownRawOwner* owner = (TupownRawOwner*)new TupownRawOwner();
+        result &= Test("tupown plain cast-new value", owner->value, 23);
+    }
+    result &= Test("tupown plain cast-new dtor once", tupownRawDtorCount, 1);
+    tupownRawDtorCount = 0;
+    {
+        unique TupownRawOwner* owner = (new TupownRawOwner());
+        result &= Test("tupown plain parenthesized-new value", owner->value, 23);
+    }
+    result &= Test("tupown plain parenthesized-new dtor once", tupownRawDtorCount, 1);
+    tupownRawDtorCount = 0;
+    {
+        unique TupownRawOwner* owner = idg(new TupownRawOwner());
+        result &= Test("tupown plain generic-call value", owner->value, 23);
+    }
+    result &= Test("tupown plain generic-call dtor once", tupownRawDtorCount, 1);
 
     Lambda<int(int, (int,int))> tl = (int x, (int,int) t) => x + t.item_0;
     result &= Test("tlam_inline_tuple_param", tl(1, (2,3)), 3);
@@ -8634,6 +8829,87 @@ bool testTupleLambdaParamsAndDtors()
         result &= Test("tdp_lambda_param_value", r, 1);
     }
     result &= Test("tdp_lambda_param_dtor_once", tdpRuns, 1);
+
+    tupownRawDtorCount = 0;
+    {
+        (unique TupownRawOwner*, int) tuple = ((TupownRawOwner*)new TupownRawOwner(), 4);
+        result &= Test("tupown cast-new tuple value", tuple.item_0->value * 10 + tuple.item_1, 234);
+    }
+    result &= Test("tupown cast-new tuple scope dtor once", tupownRawDtorCount, 1);
+    tupownRawDtorCount = 0;
+    {
+        (unique TupownRawOwner*, int) tuple = ((new TupownRawOwner()), 4);
+        result &= Test("tupown parenthesized-new tuple value", tuple.item_0->value * 10 + tuple.item_1, 234);
+    }
+    result &= Test("tupown parenthesized-new tuple scope dtor once", tupownRawDtorCount, 1);
+    tupownRawDtorCount = 0;
+    {
+        (unique TupownRawOwner*, int) tuple = (idg(new TupownRawOwner()), 4);
+        result &= Test("tupown generic-call tuple value", tuple.item_0->value * 10 + tuple.item_1, 234);
+    }
+    result &= Test("tupown generic-call tuple scope dtor once", tupownRawDtorCount, 1);
+
+    tupownRawDtorCount = 0;
+    {
+        bool choose = true;
+        (unique TupownRawOwner*, int) tuple =
+            (choose ? new TupownRawOwner() : new TupownRawOwner(), 4);
+        result &= Test("tupown owned-join tuple value", tuple.item_0->value * 10 + tuple.item_1, 234);
+    }
+    result &= Test("tupown owned-join tuple scope dtor once", tupownRawDtorCount, 1);
+
+    result &= tupownTestMovedJoinTuple(true);
+    result &= tupownTestMovedJoinTuple(false);
+    result &= tupownTestRawJoinTuple(true);
+    result &= tupownTestRawJoinTuple(false);
+    result &= tupownTestNewNullJoinTuple(true);
+    result &= tupownTestNewNullJoinTuple(false);
+    result &= tupownTestUniqueMoveNullJoinTuple(true);
+    result &= tupownTestUniqueMoveNullJoinTuple(false);
+    result &= tupownTestNestedNewNullJoinTuple(true, true);
+    result &= tupownTestNestedNewNullJoinTuple(true, false);
+    result &= tupownTestNestedNewNullJoinTuple(false, true);
+    result &= tupownTestRawCoalesceTuple();
+    result &= tupownTestMoveCallJoinTuple(true, 0);
+    result &= tupownTestMoveCallJoinTuple(false, 0);
+    result &= tupownTestMoveCallJoinTuple(true, 1);
+    result &= tupownTestMoveCallJoinTuple(false, 1);
+    result &= tupownTestMoveCallJoinTuple(true, 2);
+    result &= tupownTestMoveCallJoinTuple(false, 2);
+    result &= tupownTestMoveCallJoinTuple(true, 3);
+    result &= tupownTestMoveCallJoinTuple(false, 3);
+    result &= tupownTestMoveCallJoinTuple(true, 4);
+    result &= tupownTestMoveCallJoinTuple(true, 5);
+    result &= tupownTestMoveCallJoinTuple(false, 5);
+
+    tupownRawDtorCount = 0;
+    {
+        (unique TupownRawOwner*, int) tuple = default;
+        tuple = ((TupownRawOwner*)new TupownRawOwner(), 4);
+        result &= Test("tupown assigned tuple value", tuple.item_0->value * 10 + tuple.item_1, 234);
+    }
+    result &= Test("tupown assigned tuple scope dtor once", tupownRawDtorCount, 1);
+
+    tupownRawDtorCount = 0;
+    {
+        (unique TupownRawOwner*, int) tuple = tupownRawReturn();
+        result &= Test("tupown returned tuple value", tuple.item_0->value * 10 + tuple.item_1, 234);
+    }
+    result &= Test("tupown returned tuple scope dtor once", tupownRawDtorCount, 1);
+
+    tupownRawDtorCount = 0;
+    {
+        (unique TupownRawOwner*, int) tuple = (new TupownRawOwner(), 4);
+        result &= Test("tupown moved-call tuple value", tupownRawSink(move tuple), 234);
+    }
+    result &= Test("tupown moved-call tuple dtor once", tupownRawDtorCount, 1);
+    tupownRawDtorCount = 0;
+    {
+        (unique TupownRawOwner*, int) tuple =
+            ((TupownRawOwner*)new TupownRawOwner(), 4);
+        result &= Test("tupown cast-new moved-call tuple value", tupownRawSink(move tuple), 234);
+    }
+    result &= Test("tupown cast-new moved-call tuple dtor once", tupownRawDtorCount, 1);
 
     // Pointer depth 2 on a lambda parameter, tuple and plain.
     (int, int) pp = (6, 7);

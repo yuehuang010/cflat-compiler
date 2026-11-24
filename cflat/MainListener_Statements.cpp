@@ -2296,10 +2296,10 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             compiler->pendingCxxSretTypeName_ = compiler->currentFunctionReturnTypeName;
             compiler->pendingCxxSretReturn_ = true;
         }
-        // A classified CFlat struct is not a C++ class: its ternary arms share one sret slot,
-        // retargeted to the return slot after the parse (below).
+        // A C++ class return ternary initializes the result slot branch-by-branch, like a declaration.
         if (cxxReturnTernary && (!loweredCflatReturn
-                || compiler->IsImmovableCFlatStruct(compiler->currentFunctionReturnTypeName)))
+                || compiler->IsImmovableCFlatStruct(compiler->currentFunctionReturnTypeName)
+                || compiler->IsCppStructName(compiler->currentFunctionReturnTypeName)))
         {
             compiler->pendingCxxTernaryDeclDest_ = cxxSretDest;
             compiler->pendingCxxTernaryDeclTypeName_ = compiler->currentFunctionReturnTypeName;
@@ -7622,16 +7622,26 @@ void MainListener::ParseStatementBody(CFlatParser::StatementContext* statement) 
 
 LLVMBackend::NamedVariable MainListener::EvaluateCFlatDefaultArgument(
         const std::string& functionName, size_t parameterIndex,
-        const LLVMBackend::TypeAndValue& parameterType)
+        const LLVMBackend::TypeAndValue& parameterType,
+        std::vector<LLVMBackend::NamedVariable>& earlierArguments)
 {
     auto* compiler = compilerLLVM;
+    const auto activeKey = std::make_pair(functionName, parameterIndex);
+    if (!compiler->activeCFlatDefaultArgumentEvaluations.insert(activeKey).second)
+        return {};
+    struct RestoreActiveDefaultEvaluation
+    {
+        std::set<std::pair<std::string, size_t>>& Active;
+        std::pair<std::string, size_t> Key;
+        ~RestoreActiveDefaultEvaluation() { Active.erase(Key); }
+    } restoreActiveDefaultEvaluation{ compiler->activeCFlatDefaultArgumentEvaluations, activeKey };
     auto found = compiler->cflatDefaultArgumentContexts.find(functionName);
     if (found == compiler->cflatDefaultArgumentContexts.end()
         || parameterIndex >= found->second.size())
         return {};
     const auto& defaultContext = found->second[parameterIndex];
     auto* initializer = defaultContext.Initializer;
-    if (initializer == nullptr || initializer->assignmentExpression() == nullptr)
+    if (initializer == nullptr)
         return {};
 
     auto savedStack = std::move(compiler->stackNamedVariable);
@@ -7648,7 +7658,79 @@ LLVMBackend::NamedVariable MainListener::EvaluateCFlatDefaultArgument(
         LLVMBackend::TypeAndValue Saved;
         ~RestoreExpectedType() { Slot = std::move(Saved); }
     } restoreExpectedType{ declExpectedType, declExpectedType };
-    declExpectedType = parameterType;
+    declExpectedType = compiler->IsCoreUniqueType(parameterType.TypeName)
+        ? LLVMBackend::TypeAndValue{} : parameterType;
+    auto savedSubstitutions = std::move(activeTypeSubstitutions);
+    activeTypeSubstitutions = TypeSubstitutionMap{};
+    for (const auto& [name, type] : defaultContext.TypeSubstitutions)
+        activeTypeSubstitutions[name] = type;
+    for (const auto& [name, depth] : defaultContext.TypeConstDepths)
+        activeTypeSubstitutions.BindConstDepth(name, depth);
+    struct RestoreTypeSubstitutions
+    {
+        TypeSubstitutionMap& Slot;
+        TypeSubstitutionMap Saved;
+        ~RestoreTypeSubstitutions() { Slot = std::move(Saved); }
+    } restoreSubstitutions{ activeTypeSubstitutions, std::move(savedSubstitutions) };
+    auto savedLambdaExpectedType = std::move(lambdaExpectedType);
+    lambdaExpectedType = {};
+    struct RestoreLambdaExpectedType
+    {
+        LLVMBackend::TypeAndValue& Slot;
+        LLVMBackend::TypeAndValue Saved;
+        ~RestoreLambdaExpectedType() { Slot = std::move(Saved); }
+    } restoreLambdaExpectedType{ lambdaExpectedType, std::move(savedLambdaExpectedType) };
+    if (parameterType.IsFunctionPointer)
+        lambdaExpectedType = parameterType;
+    else if (const auto* encoded = compiler->GetEncodedClosureType(parameterType.TypeName))
+        lambdaExpectedType = *encoded;
+    compiler->stackNamedVariable.emplace_back();
+    auto& boundFrame = compiler->stackNamedVariable.back();
+    for (size_t i = 0; i < earlierArguments.size()
+         && i < parameterIndex && i < defaultContext.Parameters.size(); ++i)
+    {
+        const auto& formal = defaultContext.Parameters[i];
+        if (formal.VariableName.empty()) continue;
+        auto& actualArgument = earlierArguments[i];
+        if (compiler->IsRawPointerToCoreUnique(actualArgument, formal))
+        {
+            llvm::Value* wrapped = compiler->CreateCoreUniqueFromRawPointerCall(actualArgument, formal);
+            if (wrapped == nullptr) return {};
+            actualArgument.Primary = wrapped;
+            actualArgument.BaseType = wrapped->getType();
+            actualArgument.Storage = nullptr;
+            actualArgument.TypeAndValue = formal;
+            actualArgument.TypeAndValue.VariableName.clear();
+            actualArgument.IsRvalue = true;
+            actualArgument.IsExplicitMove = false;
+            actualArgument.IsDefaultParamForward = true;
+        }
+        auto argument = actualArgument;
+        argument.TypeAndValue = formal;
+        argument.TypeAndValue.VariableName = formal.VariableName;
+        argument.CallerName = formal.VariableName;
+        argument.IsRvalue = false;
+        argument.IsExplicitMove = false;
+        // A method receiver arrives as the object's address; `this` binds a slot holding it,
+        // like a method body's own `this`, so a nested implicit-this call never loads the object.
+        if (formal.Pointer && !actualArgument.TypeAndValue.Pointer
+            && argument.Primary == nullptr && argument.Storage != nullptr
+            && argument.Storage->getType()->isPointerTy())
+        {
+            auto* thisSlot = compiler->CreateAlloca(argument.Storage->getType());
+            compiler->builder->CreateStore(argument.Storage, thisSlot);
+            argument.Storage = thisSlot;
+        }
+        if (argument.Storage == nullptr && argument.Primary != nullptr
+            && argument.Primary->getType()->isStructTy()
+            && !formal.Pointer && !formal.IsRvalueRef
+            && !compiler->IsCxxRecord(formal.TypeName))
+        {
+            argument.Storage = compiler->CreateAlloca(argument.Primary->getType());
+            compiler->builder->CreateStore(argument.Primary, argument.Storage);
+        }
+        boundFrame.functionArgument.emplace(formal.VariableName, std::move(argument));
+    }
     LLVMBackend::NamespaceScope namespaceScope(compiler, defaultContext.NamespaceName);
     struct RestoreDefaultArgumentLookup
     {
@@ -7675,8 +7757,77 @@ LLVMBackend::NamedVariable MainListener::EvaluateCFlatDefaultArgument(
     } restoreDefaultArgumentGlobals{
         *compiler, cflatDefaultInjectedGlobals_, cflatDefaultInjectedGlobals_.size() };
 
-    auto value = ParseAssignmentExpressionNamed(initializer->assignmentExpression());
-    return value;
+    if (initializer->assignmentExpression() != nullptr)
+    {
+        auto parsed = ParseAssignmentExpressionNamed(initializer->assignmentExpression());
+        if (compiler->IsCoreUniqueType(parameterType.TypeName)
+            && parsed.Primary != nullptr
+            && llvm::isa<llvm::ConstantPointerNull>(parsed.Primary))
+        {
+            LLVMBackend::DeclTypeAndValue defaultType;
+            static_cast<LLVMBackend::TypeAndValue&>(defaultType) = parameterType;
+            llvm::Value* value = GenerateDefaultValue(defaultType);
+            if (value == nullptr) return {};
+            parsed.TypeAndValue = parameterType;
+            parsed.Primary = value;
+            parsed.BaseType = value->getType();
+            parsed.Storage = nullptr;
+            parsed.IsRvalue = true;
+            parsed.IsDefaultParamForward = true;
+            return parsed;
+        }
+        return parsed;
+    }
+
+    if (initializer->Default() == nullptr && initializer->LeftBrace() == nullptr)
+        return {};
+
+    LLVMBackend::DeclTypeAndValue defaultType;
+    static_cast<LLVMBackend::TypeAndValue&>(defaultType) = parameterType;
+    defaultType.Initializer = initializer;
+    llvm::Value* value = GenerateDefaultValue(defaultType, initializer);
+    if (initializer->LeftBrace() != nullptr && initializer->initializerList() != nullptr)
+    {
+        if (value == nullptr) return {};
+        auto* slot = compiler->CreateAlloca(value->getType());
+        compiler->CreateAssignment(value, slot);
+        EmitConstructedFieldOverrides(slot, parameterType.TypeName, initializer->initializerList());
+        value = compiler->CreateLoad(slot);
+        compiler->RegisterOwnedStructTemp(slot, parameterType.TypeName);
+        LLVMBackend::NamedVariable result;
+        result.TypeAndValue = parameterType;
+        if (result.TypeAndValue.IsAlias && !result.TypeAndValue.Pointer)
+            result.TypeAndValue.IsAlias = false;
+        result.Primary = value;
+        result.BaseType = value->getType();
+        result.Storage = slot;
+        result.IsRvalue = true;
+        result.IsDefaultParamForward = true;
+        result.IsCFlatBraceInitTemp = true;
+        return result;
+    }
+    if (value == nullptr) return {};
+
+    LLVMBackend::NamedVariable result;
+    result.TypeAndValue = parameterType;
+    if (result.TypeAndValue.IsAlias && !result.TypeAndValue.Pointer)
+        result.TypeAndValue.IsAlias = false;
+    result.Primary = value;
+    result.BaseType = value->getType();
+    if (value == compiler->lastCxxRetValue_ && compiler->lastCxxRetTemp_ != nullptr)
+    {
+        result.Storage = compiler->lastCxxRetTemp_;
+        result.IsCxxPrvalueTemp = true;
+    }
+    else if (value == compiler->lastLoweredRetValue_
+        && compiler->lastLoweredRetTemp_ != nullptr)
+    {
+        result.Storage = compiler->lastLoweredRetTemp_;
+        result.IsCxxPrvalueTemp = true;
+    }
+    result.IsRvalue = true;
+    result.IsDefaultParamForward = true;
+    return result;
 }
 
 void MainListener::GenerateDefaultParamOverloads(
@@ -7706,12 +7857,18 @@ void MainListener::GenerateDefaultParamOverloads(
         auto& defaultContexts = compiler->cflatDefaultArgumentContexts[fullMangledName];
         defaultContexts.clear();
         defaultContexts.resize(params.size());
-        const bool hasActiveTypeSubstitutions = !activeTypeSubstitutions.empty();
+        std::vector<LLVMBackend::TypeAndValue> contextParams(params.begin(), params.end());
         for (size_t i = 0; i < params.size(); ++i)
             if (params[i].DefaultValue != nullptr)
                 defaultContexts[i] = {
-                    hasActiveTypeSubstitutions ? nullptr : params[i].DefaultValue,
-                    compiler->GetCurrentNamespace() };
+                    params[i].DefaultValue,
+                    compiler->GetCurrentNamespace(),
+                    contextParams,
+                    activeTypeSubstitutions,
+                    {} };
+        for (auto& context : defaultContexts)
+            for (const auto& [typeParam, _] : activeTypeSubstitutions)
+                context.TypeConstDepths[typeParam] = activeTypeSubstitutions.ConstDepth(typeParam);
 
         std::vector<bool> defaultParamNeedsWrapper(params.size(), false);
         for (int cutoff = firstDefault; cutoff < (int)params.size(); cutoff++)
@@ -7753,6 +7910,7 @@ void MainListener::GenerateDefaultParamOverloads(
                             "cflat_default_param_wrapper";
                         break;
                     }
+            ConditionalCallMoveSlotFunctionScope conditionalCallMoveSlotScope(deferredConditionalCallMoveSlot_);
             compiler->InitializeBlock(&wrapperFn->front(), false);
             // Fresh straight-line for the wrapper body; restore the enclosing walk's flag on exit.
             ReturnFlagGuard wrapperReturnFlagGuard(&straightLineReturned_);
@@ -7777,6 +7935,21 @@ void MainListener::GenerateDefaultParamOverloads(
 
             for (int i = cutoff; i < (int)params.size(); i++)
             {
+                const auto activeKey = std::make_pair(fullMangledName, static_cast<size_t>(i));
+                const bool insertedActiveKey = params[i].DefaultValue != nullptr
+                    && compiler->IsNativeCallSiteDefaultParam(params[i])
+                    && compiler->activeCFlatDefaultArgumentEvaluations.insert(activeKey).second;
+                struct RestoreActiveDefaultEvaluation
+                {
+                    std::set<std::pair<std::string, size_t>>& Active;
+                    std::pair<std::string, size_t> Key;
+                    bool Inserted;
+                    ~RestoreActiveDefaultEvaluation()
+                    {
+                        if (Inserted) Active.erase(Key);
+                    }
+                } restoreActiveDefaultEvaluation{
+                    compiler->activeCFlatDefaultArgumentEvaluations, activeKey, insertedActiveKey };
                 auto* initCtx = params[i].DefaultValue;
                 llvm::Value* defaultVal = nullptr;
                 LLVMBackend::NamedVariable defaultArg;
@@ -7887,7 +8060,7 @@ void MainListener::GenerateDefaultParamOverloads(
                             auto* expression = fieldExpressions.front();
                             braceSource += "__cflat_arg_" + std::to_string(elements.size()) + "__";
                             CxxCallArgumentParseStateScope argumentState(compiler);
-                            CallArgumentScope callArgumentScope(inCallArgument_, ternaryCallArgumentDepth_);
+                            CallArgumentScope callArgumentScope(inCallArgument_, ternaryCallArgumentDepth_, callArgDestinationUnique_, false);
                             CxxCallArgumentScope cxxBraceElementScope(inCxxCallArgument_, true);
                             CxxCallArgumentExpectedTypeScope elementExpectedType(
                                 cxxCallArgumentExpectedType_, {});
@@ -8302,9 +8475,9 @@ void MainListener::GenerateDefaultParamOverloads(
         {
             const auto& param = params[i];
             if (param.DefaultValue == nullptr) continue;
-            hasCallSiteDefault = (!param.Pointer && !param.IsAlias && !param.IsRvalueRef
-                    && compiler->HasCxxClassMember(param.TypeName) && compiler->IsCxxRecord(param.TypeName))
-                || (!defaultParamNeedsWrapper[i] && compiler->IsNativeCallSiteDefaultParam(param));
+            const bool cxxClassDefault = !param.Pointer && !param.IsAlias && !param.IsRvalueRef
+                && compiler->HasCxxClassMember(param.TypeName) && compiler->IsCxxRecord(param.TypeName);
+            hasCallSiteDefault = cxxClassDefault || compiler->IsNativeCallSiteDefaultParam(param);
         }
         if (!hasCallSiteDefault)
             return;
@@ -8317,8 +8490,8 @@ void MainListener::GenerateDefaultParamOverloads(
             const bool cxxHolderDefault = !params[i].Pointer && !params[i].IsAlias
                 && !params[i].IsRvalueRef && compiler->HasCxxClassMember(params[i].TypeName);
             const bool cxxClassDefault = cxxHolderDefault && compiler->IsCxxRecord(params[i].TypeName);
+            if (!cxxClassDefault && compiler->IsNativeCallSiteDefaultParam(params[i])) continue;
             if (cxxHolderDefault && !cxxClassDefault) continue;
-            if (!params[i].Pointer && compiler->IsCoreUniqueType(params[i].TypeName)) continue;
             const bool hasExpression = initCtx->assignmentExpression() != nullptr;
             const bool isDefault = initCtx->Default() != nullptr;
             const bool emptyBrace = initCtx->LeftBrace() != nullptr
@@ -8355,6 +8528,7 @@ void MainListener::GenerateDefaultParamOverloads(
             helperReturn.IsMove = false;
             auto* helperFn = compiler->CreateFunctionDefinition(
                 helperName, helperReturn, {}, false, false, initCtx->getStart()->getLine());
+            ConditionalCallMoveSlotFunctionScope conditionalCallMoveSlotScope(deferredConditionalCallMoveSlot_);
             compiler->InitializeBlock(&helperFn->front(), false);
             ReturnFlagGuard helperReturnFlagGuard(&straightLineReturned_);
             straightLineReturned_ = false;
@@ -8426,6 +8600,9 @@ void MainListener::GenerateDefaultParamOverloads(
                             symbol.DefaultArguments[i].kind = "cflat_callsite";
                             symbol.DefaultArguments[i].value = factoryNames[i];
                         }
+                        else if (params[i].DefaultValue != nullptr
+                            && compiler->IsNativeCallSiteDefaultParam(params[i]))
+                            symbol.DefaultArguments[i].kind = "cflat_callsite";
                     break;
                 }
     }
@@ -8566,6 +8743,7 @@ std::optional<int64_t> MainListener::EmitAndFoldIfConstLeaf(antlr4::tree::ParseT
         auto* voidTy = llvm::FunctionType::get(compiler->builder->getVoidTy(), false);
         auto* tmpFn = llvm::Function::Create(
             voidTy, llvm::Function::PrivateLinkage, "__if_const_eval_tmp", compiler->module.get());
+        ConditionalCallMoveSlotFunctionScope conditionalCallMoveSlotScope(deferredConditionalCallMoveSlot_);
         auto* tmpBB = llvm::BasicBlock::Create(*compiler->context, "entry", tmpFn);
         compiler->builder->SetInsertPoint(tmpBB);
         compiler->currentFunction = tmpFn;

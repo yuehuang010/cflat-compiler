@@ -1058,6 +1058,17 @@ Lambda<int(int)> makeLeakAdderLiteral(int base)
 // caller's temporary env is freed at end of the call statement by FlushOwnedClosureTemps).
 int applyLeak(Lambda<int(int)> fn, int v) { return fn(v); }
 
+Lambda<int()> deftmp2MakeClosure(int value)
+{
+    string captured = "closure default temp allocation abcdefghijklmnopqrstuvwxyz";
+    return () => value + (int)captured.length();
+}
+
+Lambda<int()> deftmp2ForwardClosure(Lambda<int()> fn = deftmp2MakeClosure(7))
+{
+    return fn;
+}
+
 // === String-RETURN ownership (runtime-bit model) regression helpers ===
 // Before the fix, the string destructor was gated on a COMPILE-TIME `IsOwningString` flag
 // instead of the runtime OWNED bit (_len high bit), so a genuinely-owned string returned
@@ -3830,6 +3841,16 @@ extern int main()
         total++; passed += Test("inline-invoke literal-return call result", makeLeakAdderLiteral(1000)(7), 1007);
         total++; passed += Test("inline-invoke variable-return call result", makeLeakAdder(2000)(3), 2003);
         total++; passed += Test("inline-arg call result (by-value borrow)", applyLeak(makeLeakAdder(10), 5), 15);
+
+        u64 deftmp2Before = HeapAudit.reportLeaks();
+        int deftmp2Value = 0;
+        {
+            Lambda<int()> returned = deftmp2ForwardClosure();
+            deftmp2Value = returned();
+        }
+        total++; passed += Test("DEFTMP2 closure default value", deftmp2Value, 65);
+        total++; passed += Test("DEFTMP2 closure default frees env",
+            (i64)(HeapAudit.reportLeaks() - deftmp2Before), (i64)0);
     }
 
     // === String RETURNS: owned transfer + borrow (runtime-bit ownership model) ===

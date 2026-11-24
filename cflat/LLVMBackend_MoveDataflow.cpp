@@ -2835,6 +2835,9 @@ bool LLVMBackend::ConversionDiscardsConst(const llvm::Value* value, const TypeAn
         if (LiteralMismatchesPointee(value, source, target, depth)) return false;
         std::string name;
         uint32_t from = StoredConstLevels(value, name);
+        // Joined pointer masks are the expression's composite type. Honor them for primitive and
+        // void pointers; C++ record-pointer compatibility keeps its separate established rules.
+        if (!IsCxxRecord(source.TypeName)) from |= DeclaredPointeeConstLevels(source);
         // A C++ class pointer result (`const D* f()`) carries its pointee const on its type. The
         // same class keeps it (no CFlat const spelling); a base-class pointer drops it, as in C++.
         if (depth == 1 && source.Pointer && source.ValuePointerDepth() == 1 && source.PointeeConstBit()

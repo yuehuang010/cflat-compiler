@@ -189,6 +189,16 @@ public:
     inline ~TernaryCnt() noexcept { ++dtors; }
     int v;
 };
+inline int ternaryPlaceCalls = 0;
+inline TernaryCnt ternaryRefObject = TernaryCnt(33);
+inline void resetTernaryPlaceCalls() noexcept { ternaryPlaceCalls = 0; }
+inline void setTernaryRefObject(int value) noexcept { ternaryRefObject.v = value; }
+inline int ternaryRefValue() noexcept { return ternaryRefObject.v; }
+inline TernaryCnt* ternaryGetPlace(TernaryCnt* value) noexcept { ++ternaryPlaceCalls; return value; }
+inline int ternaryPlaceIndex() noexcept { ++ternaryPlaceCalls; return 0; }
+inline int ternaryPlaceCallCount() noexcept { return ternaryPlaceCalls; }
+inline TernaryCnt& ternaryGetLvalue() noexcept { return ternaryRefObject; }
+inline TernaryCnt&& ternaryGetRvalue() noexcept { return static_cast<TernaryCnt&&>(ternaryRefObject); }
 inline int takeTernaryCnt(TernaryCnt value) noexcept { return value.v; }
 inline int readTernaryCnt(const TernaryCnt* value) noexcept { return value->v; }
 struct TernaryHost { TernaryCnt a; };

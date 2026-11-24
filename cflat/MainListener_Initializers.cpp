@@ -6155,6 +6155,7 @@ llvm::ConstantInt* MainListener::TryFoldArrayDim(CFlatParser::AssignmentExpressi
         auto* voidTy = llvm::FunctionType::get(compiler->builder->getVoidTy(), false);
         auto* tmpFn = llvm::Function::Create(
             voidTy, llvm::Function::PrivateLinkage, "__global_arr_dim_tmp", compiler->module.get());
+        ConditionalCallMoveSlotFunctionScope conditionalCallMoveSlotScope(deferredConditionalCallMoveSlot_);
         auto* tmpBB = llvm::BasicBlock::Create(*compiler->context, "entry", tmpFn);
         compiler->builder->SetInsertPoint(tmpBB);
         // `&&` and `?:` create blocks in currentFunction; at file scope it is null, which left the

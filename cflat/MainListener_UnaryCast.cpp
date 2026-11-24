@@ -1848,6 +1848,7 @@ MainListener::UnevaluatedOperandType MainListener::EvaluateOperandTypeOnly(
             out.Type = nv.TypeAndValue;
             out.SourceTypeName = nv.InferSourceTypeName;
             out.BaseType = nv.BaseType;
+            out.IsRvalue = nv.IsRvalue || nv.IsExplicitMove;
             if (nv.Primary != nullptr)
             {
                 out.ValueType = nv.Primary->getType();
@@ -2625,6 +2626,9 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                     namedVar.TypeAndValue.ConstArraySize = 0;
                     namedVar.TypeAndValue.ConstInnerDimensions.clear();
                 }
+                // `&object` of a non-pointer object proves depth 1 (PointerDepth stays unrecorded).
+                const bool addressedPlainObject = !namedVar.TypeAndValue.Pointer
+                    && namedVar.TypeAndValue.DepthIsAboutThisValue() && !namedVar.TypeAndValue.IsCxxRefToPointer;
                 const int addressedDepth = namedVar.TypeAndValue.Pointer
                     ? namedVar.TypeAndValue.ValuePointerDepth() + 1 : 0;
                 namedVar.TypeAndValue.PointerDepth = addressedDepth;
@@ -2644,6 +2648,7 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                     namedVar.TypeAndValue.SetPointeeConstBit(true);
                 namedVar.IsCxxAddressOfPointerValue = addressOfPointerObject
                     && namedVar.TypeAndValue.IsProvenDoublePointer();
+                namedVar.IsAddressOfPlainObject = addressedPlainObject && !addressOfUniqueSlot;
                 // The address of an element borrows, it does not own - clear IsOwning so taking
                 // `&a[i]` does not move/consume the owning buffer `a` it points into.
                 namedVar.IsOwning = false;

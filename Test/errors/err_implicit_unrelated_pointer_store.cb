@@ -22,6 +22,22 @@ import cpp "../library/cpp_record_pointee.h";
 import cpp "../library/cpp_joinarg.h";
 int jaErrCfTakeB(JaB* p) { return p->b; }
 int jaErrCfTakeBpp(JaB** p) { return (*p)->b; }
+// JOINARG2: a void* join into an overload set has no single destination, whatever the order.
+int jaErrChooseVoidFirst(void* p) { return 3; }
+int jaErrChooseVoidFirst(JaD* p) { return 2; }
+int jaErrChooseVoidLast(JaD* p) { return 2; }
+int jaErrChooseVoidLast(void* p) { return 3; }
+namespace JaErrJoinNsFirst { int take(void* p) { return 3; } int take(JaD* p) { return 2; } }
+namespace JaErrJoinNsLast { int take(JaD* p) { return 2; } int take(void* p) { return 3; } }
+struct JaErrJoinHostFirst { int take(void* p) { return 3; } int take(JaD* p) { return 2; } };
+struct JaErrJoinHostLast { int take(JaD* p) { return 2; } int take(void* p) { return 3; } };
+int jaErrJoinIdentity(int value) { return value; }
+int jaErrTakeIntPp(int** p) { return **p; }
+// JOINARG2: an overloaded interface method name has no single destination, whatever the order.
+interface IJaErrVoidFirst { int take(void* p); int take(JaD* p); };
+class JaErrVoidFirstImpl : IJaErrVoidFirst { int k = 0; int take(void* p) { return 3; } int take(JaD* p) { return 2; } };
+interface IJaErrVoidLast { int take(JaD* p); int take(void* p); };
+class JaErrVoidLastImpl : IJaErrVoidLast { int k = 0; int take(JaD* p) { return 2; } int take(void* p) { return 3; } };
 [cpp] struct UrpCpp { int z = 3; };
 int urpCfTake(UrpB* p) { return p->v; }
 interface IUrp { int m(); };
@@ -684,6 +700,123 @@ extern int main()
     expect_error("no overload of 'ja_take_x' matches the given arguments") {
         JaD[2][2] rows = default;
         int r = ja_take_x(rows[1]);
+    }
+    // JOINARG2: a reference-arm join call argument keeps its class (pre-fix each relabelled to
+    // the first candidate's parameter and compiled).
+    expect_error("ambiguous call to 'ja_ov_ab'") {
+        JaD d = default; JaD* p = &d; int c = 1;
+        int r = ja_ov_ab(c ? ja_ref_d() : p);
+    }
+    expect_error("no overload of 'ja_take_x' matches the given arguments") {
+        JaD d = default; JaD* p = &d; int c = 1;
+        int r = ja_take_x(c ? ja_ref_d() : p);
+    }
+    // JOINARG2: an int row is an `int[2]`, not an `int**` (pre-fix it compiled).
+    expect_error("the pointer depths differ") {
+        int[2][2] m = default;
+        int** q = m[1];
+    }
+    // ACCEPT SET guard (refused pre-fix too): a void* join still needs a void* destination.
+    expect_error("the pointee types differ") {
+        JaD d = default; JaD* p = &d; void* v = &d; int c = 1;
+        JaB* q = c ? p : v;
+    }
+    expect_error("the pointee types differ") {
+        JaD d = default; JaD* p = &d; void* v = &d; int c = 1;
+        int r = ja_take_b(c ? p : v);
+    }
+    // JOINARG2 review: the void* exemption never takes a provisional overload candidate (pre-fix
+    // round 1 compiled the void-first order only).
+    expect_error("the pointee types differ") {
+        JaD d = default; JaD* p = &d; void* v = &d; int c = 1;
+        int r = jaErrChooseVoidFirst(c ? p : v);
+    }
+    expect_error("the pointee types differ") {
+        JaD d = default; JaD* p = &d; void* v = &d; int c = 1;
+        int r = jaErrChooseVoidLast(c ? p : v);
+    }
+    // JOINARG2 review: an overloaded interface method (pre-fix round 3 compiled the void-first order).
+    expect_error("the pointee types differ") {
+        JaD d = default; JaD* p = &d; void* v = &d; int c = 1;
+        JaErrVoidFirstImpl impl = default; IJaErrVoidFirst i = impl;
+        int r = i.take(c ? p : v);
+    }
+    expect_error("the pointee types differ") {
+        JaD d = default; JaD* p = &d; void* v = &d; int c = 1;
+        JaErrVoidLastImpl impl = default; IJaErrVoidLast i = impl;
+        int r = i.take(c ? p : v);
+    }
+    // JOINARG2 review: nested in a single-candidate call, the overload set still has no single
+    // destination (pre-fix round 2 inherited the outer call's answer).
+    expect_error("the pointee types differ") {
+        JaD d = default; JaD* p = &d; void* v = &d; int c = 1;
+        int r = ja_take_void(jaErrChooseVoidFirst(c ? p : v) == 3 ? p : nullptr);
+    }
+    expect_error("the pointee types differ") {
+        JaD d = default; JaD* p = &d; void* v = &d; int c = 1;
+        int r = ja_take_void(jaErrChooseVoidLast(c ? p : v) == 3 ? p : nullptr);
+    }
+    // JOINARG2 review: a fixed array decays one level only (pre-fix each compiled and crashed).
+    expect_error("no overload of 'jaErrTakeIntPp' matches the given arguments") {
+        int[2] a = {1, 2};
+        int r = jaErrTakeIntPp(a);
+    }
+    expect_error("no overload of 'jaErrTakeIntPp' matches the given arguments") {
+        int[2] a = default;
+        int r = jaErrTakeIntPp(a);
+    }
+    expect_error("no overload of 'jaErrTakeIntPp' matches the given arguments") {
+        int[2][2] m = default;
+        int r = jaErrTakeIntPp(m);
+    }
+    expect_error("no overload of 'jaErrTakeIntPp' matches the given arguments") {
+        int*[2][2] pp = default;
+        int r = jaErrTakeIntPp(pp);
+    }
+    expect_error("a multi-dimensional array decays to a pointer to its first row") {
+        int*[2][2] pp = default;
+        int** q = pp;
+    }
+    expect_error("a multi-dimensional array decays to a pointer to its first row") {
+        int*[2][2] pp = default;
+        int** q = nullptr;
+        q = pp;
+    }
+    // JOINVOID: namespace and receiver overload sets stay ambiguous in either order,
+    // including when their call is nested in a single-candidate outer call.
+    expect_error("the pointee types differ") {
+        JaD d = default; JaD* p = &d; void* v = &d; int c = 1;
+        int r = JaErrJoinNsFirst.take(c ? p : v);
+    }
+    expect_error("the pointee types differ") {
+        JaD d = default; JaD* p = &d; void* v = &d; int c = 1;
+        int r = jaErrJoinIdentity(JaErrJoinNsFirst.take(c ? p : v));
+    }
+    expect_error("the pointee types differ") {
+        JaD d = default; JaD* p = &d; void* v = &d; int c = 1;
+        int r = JaErrJoinNsLast.take(c ? p : v);
+    }
+    expect_error("the pointee types differ") {
+        JaD d = default; JaD* p = &d; void* v = &d; int c = 1;
+        int r = jaErrJoinIdentity(JaErrJoinNsLast.take(c ? p : v));
+    }
+    expect_error("the pointee types differ") {
+        JaD d = default; JaD* p = &d; void* v = &d; int c = 1;
+        JaErrJoinHostFirst host = default; int r = host.take(c ? p : v);
+    }
+    expect_error("the pointee types differ") {
+        JaD d = default; JaD* p = &d; void* v = &d; int c = 1;
+        JaErrJoinHostFirst host = default;
+        int r = jaErrJoinIdentity(host.take(c ? p : v));
+    }
+    expect_error("the pointee types differ") {
+        JaD d = default; JaD* p = &d; void* v = &d; int c = 1;
+        JaErrJoinHostLast host = default; int r = host.take(c ? p : v);
+    }
+    expect_error("the pointee types differ") {
+        JaD d = default; JaD* p = &d; void* v = &d; int c = 1;
+        JaErrJoinHostLast host = default;
+        int r = jaErrJoinIdentity(host.take(c ? p : v));
     }
     return 0;
 }

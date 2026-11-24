@@ -4477,6 +4477,27 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 }
                             }
                         }
+                        // `x.copy()` of a struct with no copy() byte-copies it; a trivial C++ field clang
+                        // cannot copy refuses that, unless x is our by-value parameter at its last use.
+                        if (tokenType == CFlatParser::Dot && !namedVar.TypeAndValue.Pointer
+                            && !namedVar.TypeAndValue.IsInterface
+                            && !namedVar.TypeAndValue.TypeName.empty()
+                            && Compiler(ctx)->HasCxxRecords()
+                            && !Compiler(ctx)->IsCxxRecord(namedVar.TypeAndValue.TypeName)
+                            && !Compiler(ctx)->HasCopyOverloadFor(namedVar.TypeAndValue.TypeName)
+                            && NextMemberName(ctx, parseTree) == "copy")
+                        {
+                            auto* compiler = Compiler(ctx);
+                            auto* receiver = ctx->primaryExpression();
+                            const std::string receiverName = receiver != nullptr ? receiver->getText() : "";
+                            const bool ownedLastUse = receiver != nullptr && ctx->children.size() > 1
+                                && ctx->children[1] == parseTree && namedVar.Storage != nullptr
+                                && compiler->IsFunctionParameter(receiverName)
+                                && compiler->GetFunctionArgument(receiverName).Storage == namedVar.Storage
+                                && IsLastBareUseInScope(receiver, receiverName, nullptr, true);
+                            if (!ownedLastUse)
+                                compiler->RefuseCxxFieldByteCopy(namedVar.TypeAndValue.TypeName);
+                        }
                         // [PFX-1a] user operator-> : forward-on-miss. CFlat's `.` and `->` are flexible
                         // (either token works on a value or a pointer). When the member that follows is
                         // NOT a member of a value-type receiver but that type defines `operator->`, forward
@@ -6305,7 +6326,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             && (ctx->children[1]->getText() == "."
                                 || ctx->children[1]->getText() == "->"
                                 || ctx->children[1]->getText() == "?."))
-                            receiverTernaryScope.emplace(inCallArgument_, ternaryCallArgumentDepth_);
+                            receiverTernaryScope.emplace(inCallArgument_, ternaryCallArgumentDepth_, callArgDestinationUnique_, false);
 
                         // `global::name` scope-escape qualifier: resolve the following name at the
                         // ROOT (file/global) scope, bypassing the enclosing-namespace lookup. The
@@ -9064,10 +9085,24 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 && sourceNV.TypeAndValue.IsOwningSink
                                 && compiler->OwningSinkConsumesConcrete(sourceNV.TypeAndValue);
                             sourceNV.IsRvalue = sourceNV.IsRvalue || sourceNV.IsExplicitMove
-                                || sourceNV.TypeAndValue.IsMove || consumesInferredSink;
+                                || sourceNV.TypeAndValue.IsMove || sourceNV.UncopyableStructLastUse
+                                || consumesInferredSink;
                             if (sourceValue == nullptr && !builtInPlace)
                             {
                                 LogErrorContext(ctx, "construct_at second argument does not produce a value");
+                                namedVar = {};
+                                break;
+                            }
+
+                            // A trivial C++ field keeps the enclosing CFlat struct on the byte-copy
+                            // path; refuse its lvalue copy before that fallback.
+                            if (!builtInPlace && !destType.Pointer && !sourceNV.IsRvalue
+                                && !sourceNV.TypeAndValue.Pointer
+                                && !compiler->IsCxxRecord(destType.TypeName)
+                                && compiler->ResolveTypeAlias(sourceNV.TypeAndValue.TypeName)
+                                    == compiler->ResolveTypeAlias(destType.TypeName)
+                                && compiler->RefuseCxxFieldByteCopy(destType.TypeName))
+                            {
                                 namedVar = {};
                                 break;
                             }
@@ -10972,8 +11007,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                 "cannot initialize string '{}' from nullptr",
                                                 argExpectedDest.VariableName.empty()
                                                     ? "parameter" : argExpectedDest.VariableName));
-                                        CallArgumentScope callArgumentScope(
-                                            inCallArgument_, ternaryCallArgumentDepth_);
+                                        CallArgumentScope callArgumentScope(inCallArgument_, ternaryCallArgumentDepth_, callArgDestinationUnique_,
+                                            argParamIndex < funcPtrTV.FuncPtrParams.size());  // one signature
                                         DirectViewCallArgumentScope directViewArgumentScope(
                                             directViewCallArgument_, namedArgument->assignmentExpression());
                                         auto* backend = Compiler(ctx);
@@ -11355,7 +11390,56 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         // An alias closure/fn-ptr param: the callee reads its caller slot by address.
                                         if (argParamIndex < funcPtrTV.FuncPtrParams.size()
                                             && backend->ParameterIsAliasByPointer(argExpectedDest))
-                                            argValue = backend->LowerAliasByPointerArg(argNV, argExpectedDest);
+                                        {
+                                            // A symbol-derived `T*&` slot given the slot address (`&p`, `&pp`) binds
+                                            // that slot directly, like the direct call's `&p` rewrite.
+                                            const auto& slotParam = funcPtrTV.FuncPtrParams[argParamIndex];
+                                            const int slotDepth = slotParam.CxxReferentDepth;
+                                            if (slotParam.IsCxxRefToPointer && slotDepth >= 1 && argValue != nullptr
+                                                && argValue->getType()->isPointerTy()
+                                                && argNV.TypeAndValue.DepthIsAboutThisValue()
+                                                && argNV.TypeAndValue.PointerDepth > 0
+                                                && backend->CxxRefSlotBinds(argNV.TypeAndValue, slotParam, nullptr))
+                                            {
+                                                LLVMBackend::NamedVariable slotArg = argNV;
+                                                slotArg.TypeAndValue.PointerDepth = slotDepth;
+                                                slotArg.TypeAndValue.ElemPointer = slotDepth >= 2;
+                                                slotArg.Storage = argValue;
+                                                slotArg.Primary = nullptr;
+                                                slotArg.BaseType = backend->GetType(slotArg.TypeAndValue);
+                                                slotArg.IsRvalue = false;
+                                                slotArg.IsCxxAddressOfPointerValue = false;
+                                                argValue = backend->LowerAliasByPointerArg(slotArg, argExpectedDest);
+                                            }
+                                            // A reference the depth judge below refuses reports there, not as a lowering error.
+                                            else if (slotDepth < 1 || backend->FuncPtrArgDepthMismatch(argNV, slotParam).empty())
+                                                argValue = backend->LowerAliasByPointerArg(argNV, argExpectedDest);
+                                        }
+                                        // A C++ `T* const&` / `T*&&` slot given a pointer VALUE at its referent depth (or
+                                        // nullptr) binds a materialized temporary, as a direct call does; a deeper `&p` is the slot.
+                                        if (argParamIndex < funcPtrTV.FuncPtrParams.size() && argValue != nullptr
+                                            && argValue->getType()->isPointerTy())
+                                        {
+                                            const auto& refParam = funcPtrTV.FuncPtrParams[argParamIndex];
+                                            const bool constReference = refParam.ConstMask >= 0
+                                                && (static_cast<uint32_t>(refParam.ConstMask)
+                                                    & LLVMBackend::TypeAndValue::ConstBitAt(refParam.PointerDepth)) != 0;
+                                            const int argDepth = argNV.IsAddressOfPlainObject
+                                                    && argNV.TypeAndValue.PointerDepth == 0 && !argNV.TypeAndValue.ElemPointer
+                                                ? 1 : argNV.TypeAndValue.DepthIsAboutThisValue() ? argNV.TypeAndValue.PointerDepth : 0;
+                                            const bool nullArgument = llvm::isa<llvm::ConstantPointerNull>(argValue);
+                                            // A flagged symbol-derived slot (IsCxxRefToPointer) is materialized by its own lowering.
+                                            if (refParam.Pointer && refParam.CxxReferentDepth >= 1 && !refParam.IsCxxRefToPointer
+                                                && (refParam.IsRvalueRef || constReference)
+                                                && (nullArgument || (argNV.TypeAndValue.Pointer
+                                                    && argDepth == refParam.CxxReferentDepth)))
+                                            {
+                                                llvm::AllocaInst* temp = backend->AllocaAtEntry(
+                                                    argValue->getType(), nullptr, "cxx_ref_ptr_tmp");
+                                                backend->builder->CreateStore(argValue, temp);
+                                                argValue = temp;
+                                            }
+                                        }
                                         if (argParamIndex < funcPtrTV.FuncPtrParams.size())
                                         {
                                             const auto& param = funcPtrTV.FuncPtrParams[argParamIndex];
@@ -11856,8 +11940,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             "cannot initialize string '{}' from nullptr",
                                             ifaceArgExpectedDest.VariableName.empty()
                                                 ? "parameter" : ifaceArgExpectedDest.VariableName));
-                                    CallArgumentScope callArgumentScope(
-                                        inCallArgument_, ternaryCallArgumentDepth_);
+                                    // One method of that name (FindInterfaceMethod returns the FIRST match, so an
+                                    // overloaded name is no proof): its parameter is the one destination.
+                                    CallArgumentScope callArgumentScope(inCallArgument_, ternaryCallArgumentDepth_,
+                                        callArgDestinationUnique_, ifaceParams != nullptr && declaredIdx[argIdx] >= 0
+                                            && declaredIdx[argIdx] < (int64_t)ifaceParams->size()
+                                            && Compiler(ctx)->CountInterfaceMethods(
+                                                interfaceVar.TypeAndValue.TypeName, primaryIdentifier) == 1);
                                     DirectViewCallArgumentScope directViewArgumentScope(
                                         directViewCallArgument_, namedArgument->assignmentExpression());
                                     auto argNV = ParseCallArgument([&] {
@@ -11969,6 +12058,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.IsRvalue = argNV.IsRvalue;
                                     argVar.IsCxxAddressOfPointerValue = argNV.IsCxxAddressOfPointerValue;
                                     argVar.IsCxxAddressOfFunction = argNV.IsCxxAddressOfFunction;
+                                    argVar.IsAddressOfPlainObject = argNV.IsAddressOfPlainObject;
                                     argVar.IsCxxPrvalueTemp = argNV.IsCxxPrvalueTemp;
                                     argVar.IsCxxDirectConstruction = argNV.IsCxxDirectConstruction;
                                     argVar.CxxDirectConstructionUsesBraces =
@@ -12674,6 +12764,53 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     if (binding.Ok) declaredIdx = binding.PosMap;
                                 }
 
+                                const std::string callReceiverType = !structVar.TypeAndValue.TypeName.empty()
+                                    ? structVar.TypeAndValue.TypeName
+                                    : implicitCallReceiver.TypeAndValue.TypeName;
+                                bool uniqueResolvedCallCandidate = false;
+                                if (funcSym != nullptr && funcSymFamily != nullptr)
+                                {
+                                    const size_t wantedParams = paramOffset + namedArgCtx.size();
+                                    size_t candidateCount = 0;
+                                    for (const auto& candidate : *funcSymFamily)
+                                    {
+                                        if (funcSym->IsCxx != candidate.IsCxx) continue;
+                                        if (candidate.IsMethod != funcSym->IsMethod) continue;
+                                        if (candidate.IsMethod
+                                            && (callReceiverType.empty() || candidate.Parameters.empty()
+                                                || candidate.Parameters.front().TypeName != callReceiverType))
+                                            continue;
+                                        if (!candidate.IsCxx)
+                                        {
+                                            if (candidate.Parameters.size() == wantedParams)
+                                                ++candidateCount;
+                                            continue;
+                                        }
+                                        // A generated C++ default wrapper and its declaration are one
+                                        // candidate. Count the declaration when its defaults cover the call.
+                                        if (candidate.UniqueName.starts_with("__cflat_dflt_")) continue;
+                                        const size_t fixedParams = candidate.Parameters.size();
+                                        if (wantedParams > fixedParams && !candidate.Variadic) continue;
+                                        bool defaultsCoverOmitted = true;
+                                        for (size_t index = wantedParams; index < fixedParams; ++index)
+                                            if (index >= candidate.DefaultArguments.size()
+                                                || candidate.DefaultArguments[index].kind.empty())
+                                            {
+                                                defaultsCoverOmitted = false;
+                                                break;
+                                            }
+                                        if (defaultsCoverOmitted) ++candidateCount;
+                                    }
+                                    uniqueResolvedCallCandidate = candidateCount == 1;
+                                }
+
+                                auto isVoidPointerDestination = [&](const LLVMBackend::TypeAndValue& type) {
+                                    return type.Pointer && !type.IsFunctionPointer && !type.IsArrayView
+                                        && !type.IsInterface && !type.IsInterfacePointer && !type.IsSimd
+                                        && type.ValuePointerDepth() == 1 && !type.ElemPointer
+                                        && Compiler(ctx)->ResolveTypeAlias(type.TypeName) == "void";
+                                };
+
                                 for (size_t argIdx = 0; argIdx < namedArgCtx.size(); ++argIdx)
                                 {
                                     const auto& namedArgument = namedArgCtx[argIdx];
@@ -12723,7 +12860,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         // the CFlat field-initializer resolver to diagnose those braces.
                                         std::string structType;
                                         const auto* braceParam = funcSym != nullptr
-                                            && (!funcSym->IsCxx || uniqueCxxCandidateForArity)
+                                            && (!funcSym->IsCxx || uniqueResolvedCallCandidate)
                                             && declaredIdx[argIdx] >= 0
                                             && declaredIdx[argIdx] < (int64_t)funcSym->Parameters.size()
                                             ? &funcSym->Parameters[declaredIdx[argIdx]] : nullptr;
@@ -12779,13 +12916,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             if (initList != nullptr
                                                 && CanFreshBraceInitializeAggregate(structType, initList))
                                             {
+                                                CallArgumentScope braceTernaryScope(inCallArgument_,
+                                                    ternaryCallArgumentDepth_, callArgDestinationUnique_,
+                                                    uniqueResolvedCallCandidate);
                                                 auto* alloca = Compiler(ctx)->CreateAlloca(
                                                     Compiler(ctx)->GetType(paramType));
                                                 if (!EmitFreshBraceInitializeAggregate(
                                                         alloca, structType, initList))
                                                     continue;
-                                                CallArgumentScope braceTernaryScope(
-                                                    inCallArgument_, ternaryCallArgumentDepth_);
                                                 llvm::Value* loaded = Compiler(ctx)->CreateLoad(alloca);
                                                 LLVMBackend::NamedVariable argVar;
                                                 argVar.Primary = loaded;
@@ -12802,8 +12940,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                 {
                                                     auto* alloca = Compiler(ctx)->CreateAlloca(defaultVal->getType());
                                                     Compiler(ctx)->CreateAssignment(defaultVal, alloca);
-                                                    CallArgumentScope braceTernaryScope(
-                                                        inCallArgument_, ternaryCallArgumentDepth_);
+                                                    CallArgumentScope braceTernaryScope(inCallArgument_,
+                                                        ternaryCallArgumentDepth_, callArgDestinationUnique_,
+                                                        uniqueResolvedCallCandidate);
                                                     // An empty brace has no initializerList() child. It means
                                                     // "the default-initialized value", so there is no overlay.
                                                     if (initList != nullptr)
@@ -12849,7 +12988,45 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                         && JsonConstIntegerToken(expression->getText());
                                                     Compiler(ctx)->lastCxxRetTemp_ = nullptr;
                                                     Compiler(ctx)->lastCxxRetValue_ = nullptr;
+                                                    LLVMBackend::TypeAndValue elementExpected;
+                                                    bool uniqueVoidBraceDestination = false;
+                                                    if (uniqueResolvedCallCandidate
+                                                        && braceParam != nullptr
+                                                        && !braceParam->Pointer)
+                                                    {
+                                                        LLVMBackend::TypeAndValue ctorTarget;
+                                                        if (Compiler(ctx)->GetUniqueCxxConstructorParameter(
+                                                                braceParam->TypeName,
+                                                                brace.elements.size(),
+                                                                list->fieldInit().size(), ctorTarget)
+                                                            && isVoidPointerDestination(ctorTarget))
+                                                        {
+                                                            elementExpected = ctorTarget;
+                                                            uniqueVoidBraceDestination = true;
+                                                        }
+                                                    }
+                                                    std::optional<DeclExpectedTypeScope> elementExpectedScope;
+                                                    if (!elementExpected.TypeName.empty())
+                                                        elementExpectedScope.emplace(
+                                                            &declExpectedType, elementExpected, true);
+                                                    CxxCallArgumentExpectedTypeScope cxxElementExpected(
+                                                        cxxCallArgumentExpectedType_, elementExpected);
+                                                    CallArgumentScope elementCallArgumentScope(
+                                                        inCallArgument_, ternaryCallArgumentDepth_,
+                                                        callArgDestinationUnique_,
+                                                        uniqueVoidBraceDestination);
+                                                    CxxCallArgumentScope cxxElementArgumentScope(
+                                                        inCxxCallArgument_, true);
                                                     auto elementNV = ParseAssignmentExpressionNamed(expression);
+                                                    if (uniqueVoidBraceDestination
+                                                        && elementNV.Primary != nullptr
+                                                        && elementNV.Primary->getType()->isPointerTy())
+                                                    {
+                                                        elementNV.TypeAndValue.TypeName = "void";
+                                                        elementNV.TypeAndValue.Pointer = true;
+                                                        elementNV.TypeAndValue.PointerDepth = 1;
+                                                        elementNV.TypeAndValue.ElemPointer = false;
+                                                    }
                                                     NormalizeCxxRvalueReferenceArgument(expression, elementNV);
                                                     llvm::Value* elementValue = elementNV.Primary
                                                         ? elementNV.Primary : LoadNamedVariable(elementNV);
@@ -13005,6 +13182,74 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         if (Compiler(ctx)->GetUniqueCxxConstructorValueParameter(
                                                 functionName, argIdx, namedArgCtx.size(), ctorTarget))
                                             argExpectedDest = ctorTarget;
+                                    }
+                                    bool uniqueVoidConstructorDestination = false;
+                                    auto* argumentConditional = argumentExpression != nullptr
+                                        ? argumentExpression->conditionalExpression() : nullptr;
+                                    const bool isConditionalCallArgument = argumentConditional != nullptr
+                                        && !HasAssignmentOperator(argumentExpression)
+                                        && argumentConditional->Question() != nullptr;
+                                    if (cxxConstructorCall && isConditionalCallArgument)
+                                    {
+                                        LLVMBackend::TypeAndValue ctorTarget;
+                                        if (Compiler(ctx)->GetUniqueCxxConstructorParameter(
+                                                functionName, argIdx, namedArgCtx.size(), ctorTarget)
+                                            && isVoidPointerDestination(ctorTarget))
+                                        {
+                                            argExpectedDest = ctorTarget;
+                                            uniqueVoidConstructorDestination = true;
+                                        }
+                                    }
+                                    bool uniqueGenericVoidDestination = false;
+                                    if (funcSym == nullptr && isConditionalCallArgument)
+                                    {
+                                        const std::string genericBase =
+                                            Compiler(ctx)->ResolveGenericFunctionBase(functionName);
+                                        auto templates = genericFunctionTemplates.find(genericBase);
+                                        const auto functionCandidates =
+                                            Compiler(ctx)->functionTable.find(functionName);
+                                        const bool noResolvedOverloads = functionCandidates
+                                            == Compiler(ctx)->functionTable.end()
+                                            || functionCandidates->second.empty();
+                                        if (templates != genericFunctionTemplates.end()
+                                            && templates->second.size() == 1 && noResolvedOverloads)
+                                        {
+                                            auto* genericDecl = templates->second.front();
+                                            auto* parameterList = genericDecl->parameterTypeList();
+                                            if (parameterList != nullptr)
+                                            {
+                                                auto parameters = ParseParameterTypeList(parameterList);
+                                                const int64_t parameterIndex = declaredIdx[argIdx];
+                                                if (parameterIndex >= 0
+                                                    && static_cast<size_t>(parameterIndex) < parameters.size()
+                                                    && isVoidPointerDestination(parameters[parameterIndex]))
+                                                {
+                                                    argExpectedDest = parameters[parameterIndex];
+                                                    uniqueGenericVoidDestination = true;
+                                                }
+                                            }
+                                        }
+                                        const std::string templateOwner = structVar.BaseType != nullptr
+                                            ? structVar.TypeAndValue.TypeName : std::string();
+                                        const std::string templateName = templateOwner.empty()
+                                            ? functionName : primaryIdentifier;
+                                        const bool noBoundCandidates = functionCandidates
+                                            == Compiler(ctx)->functionTable.end()
+                                            || functionCandidates->second.empty()
+                                            || (funcSym != nullptr && funcSym->IsCxxTemplateSpecialization
+                                                && funcSymFamily != nullptr
+                                                && funcSymFamily->size() == 1);
+                                        if (!uniqueGenericVoidDestination && noBoundCandidates)
+                                        {
+                                            LLVMBackend::TypeAndValue templateParameter;
+                                            if (Compiler(ctx)->GetUniqueCxxFunctionTemplateVoidPointerParameter(
+                                                    templateName, templateOwner, argIdx,
+                                                    namedArgCtx.size(), templateParameter))
+                                            {
+                                                argExpectedDest = templateParameter;
+                                                uniqueGenericVoidDestination = true;
+                                            }
+                                        }
                                     }
                                     /*
                                      * CALLPAR: C++ overloads of this arity disagree at this slot, so the front candidate
@@ -13559,8 +13804,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         !priorArgsHaveValidConversions);
                                     std::optional<DeclExpectedTypeScope> argExpectedScope;
                                     argExpectedScope.emplace(&declExpectedType, ternaryArgDest, true);
-                                    CallArgumentScope callArgumentScope(
-                                        inCallArgument_, ternaryCallArgumentDepth_);
+                                    // One candidate: its parameter is the argument's proven destination.
+                                    CallArgumentScope callArgumentScope(inCallArgument_, ternaryCallArgumentDepth_,
+                                        callArgDestinationUnique_, uniqueResolvedCallCandidate
+                                            || uniqueVoidConstructorDestination
+                                            || uniqueGenericVoidDestination);
                                     DirectViewCallArgumentScope directViewArgumentScope(
                                         directViewCallArgument_, namedArgument->assignmentExpression());
                                     const bool cxxMemberReceiver = structVar.BaseType != nullptr
@@ -14107,6 +14355,18 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         }
                                         return parsed;
                                     });
+                                    if ((uniqueGenericVoidDestination || uniqueVoidConstructorDestination
+                                            || uniqueResolvedCallCandidate)
+                                        && isConditionalCallArgument
+                                        && isVoidPointerDestination(argExpectedDest)
+                                        && argNV.Primary != nullptr
+                                        && argNV.Primary->getType()->isPointerTy())
+                                    {
+                                        argNV.TypeAndValue.TypeName = "void";
+                                        argNV.TypeAndValue.Pointer = true;
+                                        argNV.TypeAndValue.PointerDepth = 1;
+                                        argNV.TypeAndValue.ElemPointer = false;
+                                    }
                                     GuardOwningTempRawPointerFieldIntoUnique(
                                         argNV, argExpectedDest, namedArgument, functionName);
                                     const auto tempOwners = Compiler(ctx)->FindOwningTempRawPointerFieldOwners(
@@ -14571,6 +14831,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.IsRvalue = argNV.IsRvalue;
                                     argVar.IsCxxAddressOfPointerValue = argNV.IsCxxAddressOfPointerValue;
                                     argVar.IsCxxAddressOfFunction = argNV.IsCxxAddressOfFunction;
+                                    argVar.IsAddressOfPlainObject = argNV.IsAddressOfPlainObject;
                                     argVar.IsCxxPrvalueTemp = argNV.IsCxxPrvalueTemp;
                                     argVar.IsDefaultArgument = argNV.IsDefaultArgument;
                                     argVar.IsUnboundCxxTypeDefault = argNV.IsUnboundCxxTypeDefault;
@@ -18489,6 +18750,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
 
         auto* fn = compiler->CreateFunctionDefinition(lambdaName, returnType, allParams);
         if (ctorClosure != nullptr) ctorClosure->Family.insert(fn);
+        ConditionalCallMoveSlotFunctionScope conditionalCallMoveSlotScope(deferredConditionalCallMoveSlot_);
         compiler->InitializeBlock(&fn->front(), false);
         NamedReturnElisionContext nrvoContext;
         nrvoContext.function = fn;
@@ -18762,6 +19024,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         deferredCheckGuard.Completed = true;
 
         savedState.restore();
+        conditionalCallMoveSlotScope.Restore();
 
         // Build user-visible function-pointer TypeAndValue (no __env param).
         LLVMBackend::TypeAndValue tv;
@@ -19097,7 +19360,7 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
             auto nv = ParseAssignmentExpressionNamed(entry->assignmentExpression());
             if (expectedFields.empty() && tupleIsCallArgument
                 && nv.TypeAndValue.TypeName.empty()
-                && IsNullptrLiteralExpressionTree(entry->assignmentExpression()))
+                && IsNullptrTypedExpressionTree(entry->assignmentExpression()))
             {
                 nv.TypeAndValue = LLVMBackend::TypeAndValue{
                     .TypeName = "void", .Pointer = true, .PointerDepth = 1 };
@@ -19145,7 +19408,7 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
                     matchesExpectedTupleElement = true;
                 }
                 if (!matchesExpectedTupleElement && expectedType != nullptr
-                    && IsNullptrLiteralExpressionTree(entry->assignmentExpression()))
+                    && IsNullptrTypedExpressionTree(entry->assignmentExpression()))
                 {
                     if (expectedType->isPointerTy())
                         loaded = llvm::ConstantPointerNull::get(
@@ -19171,19 +19434,30 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
                     && loaded->getType()->isPointerTy())
                 {
                     const bool moved = nv.TypeAndValue.IsMove || nv.IsExplicitMove;
-                    const bool directNew = AsDirectNew(entry->assignmentExpression()) != nullptr;
+                    const bool ownedUniquePointerJoin =
+                        compiler->CanAdoptUniquePointerJoin(loaded);
+                    const bool owned = IsOwnedUniqueInitializerSource(
+                        compiler, nv, loaded, ownedUniquePointerJoin);
+                    // A non-adoptable join is borrowed only when the fallback has no ownership proof.
+                    const bool borrowedJoin = !moved && !owned
+                        && !compiler->JoinArmValues(loaded).empty()
+                        && !ownedUniquePointerJoin;
                     const std::string borrowedParamCall = BorrowedParameterCallName(nv, loaded);
                     // An explicit move of a proven borrow stays a borrow (declaration srcIsBorrowed rule).
                     const bool borrowedMove = moved && nv.IsBorrowed && !compiler->lastMovedFromContainerSlot;
-                    const bool borrowed = nv.TypeAndValue.Pointer && (borrowedMove || (!moved
-                        && (!(UniquePointerSourceIsOwned(nv) || directNew)
-                            || !borrowedParamCall.empty())));
+                    // The core unique slot can carry a raw pointer join with Pointer=false.
+                    const bool borrowed = borrowedJoin || (nv.TypeAndValue.Pointer
+                        && (borrowedMove || (!moved
+                        && (!owned
+                            || !borrowedParamCall.empty()))));
                     if (!borrowed)
                     {
                         matchesExpectedTupleElement = true;
                         transferUniqueRaw = nv.TypeAndValue.Pointer
-                            && UniquePointerSourceIsOwned(nv) && !moved && !directNew
-                            && nv.Storage != nullptr;
+                            && owned && !moved
+                            && nv.Storage != nullptr && !ownedUniquePointerJoin;
+                        if (ownedUniquePointerJoin)
+                            compiler->ConsumeOwningLocalJoinArms(loaded, true);
                     }
                     else
                     {
@@ -19897,7 +20171,7 @@ LLVMBackend::NamedVariable MainListener::ParseStringFunctionalConstruction(
         };
         auto typeOfArgument = [&](CFlatParser::ArgumentNamedExpressionContext* arg) {
             return EvaluateOperandTypeOnly([&]() {
-                CallArgumentScope callArgumentScope(inCallArgument_, ternaryCallArgumentDepth_);
+                CallArgumentScope callArgumentScope(inCallArgument_, ternaryCallArgumentDepth_, callArgDestinationUnique_, false);
                 DirectViewCallArgumentScope directViewScope(
                     directViewCallArgument_, arg->assignmentExpression());
                 return ParseAssignmentExpressionNamed(arg->assignmentExpression());

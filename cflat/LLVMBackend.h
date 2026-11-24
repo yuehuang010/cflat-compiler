@@ -1261,6 +1261,28 @@ public:
             bool IsCxxLvalueRef = false;
             bool IsPointeeConst = false;  // spelled `const T*` (a C++ signature: ConstMask is -1)
             int PointerDepth = 0;   // 0 = not recorded; see FuncPtrReturnPointerDepth
+            // A C++ reference-to-pointer parameter's REFERENT depth (`N*&` 1, `N** const&` 2); 0 = not recorded.
+            int CxxReferentDepth = 0;
+            /*
+             * The same metadata for a signature built from a C++ function SYMBOL's parameter: an
+             * lvalue `T*&` / `T** const&` is flagged and stored at its referent depth; a `T*&&`
+             * counts the reference as a level unless flagged (`T**&&`).
+             */
+            void SetCxxReferentFromParameter(const TypeAndValue& parameter)
+            {
+                if (!parameter.Pointer) return;
+                if (parameter.IsCxxRefToPointer && parameter.IsCxxRef() && !parameter.IsRvalueRef)
+                {
+                    CxxReferentDepth = parameter.ValuePointerDepth();
+                    IsCxxLvalueRef = true;
+                }
+                else if (parameter.IsRvalueRef)
+                {
+                    const int referent = parameter.IsCxxRefToPointer
+                        ? parameter.ValuePointerDepth() : parameter.ValuePointerDepth() - 1;
+                    if (referent >= 1) CxxReferentDepth = referent;
+                }
+            }
             std::string ResolvedTypeKey;  // "" = not recorded; see FuncPtrReturnResolvedKey
             int64_t ConstMask = -1; // -1 = not recorded; see FuncPtrReturnConstMask
             // Diagnostic spelling of a named pointer alias param ("" = none). TypeName/Pointer
@@ -1513,6 +1535,22 @@ public:
             if (depth <= 0) return 0;
             if (depth >= 32) return ~uint32_t{ 0 };
             return (uint32_t{ 1 } << depth) - 1u;
+        }
+
+        static uint32_t RebasePointeeConstMask(uint32_t mask, int sourceDepth, int resultDepth)
+        {
+            if (sourceDepth <= 0 || resultDepth <= 0) return 0;
+            if (sourceDepth > resultDepth)
+            {
+                const int shift = sourceDepth - resultDepth;
+                mask = shift >= 32 ? 0 : mask >> shift;
+            }
+            else if (resultDepth > sourceDepth)
+            {
+                const int shift = resultDepth - sourceDepth;
+                mask = shift >= 32 ? 0 : mask << shift;
+            }
+            return mask & ConstBitsBelow(resultDepth);
         }
 
         static uint32_t ConstBitAt(int depth)
@@ -1794,6 +1832,7 @@ public:
             bool IsCxxLvalueRef = false;
             bool IsPointeeConst = false;
             int PointerDepth = 0;
+            int CxxReferentDepth = 0;
             std::string ResolvedTypeKey;
             int64_t ConstMask = -1;
             std::string AliasSpelling;  // "" = none; see TypeAndValue::FuncPtrParam
@@ -1887,6 +1926,7 @@ public:
                 q.IsCxxLvalueRef = p.IsCxxLvalueRef;
                 q.IsPointeeConst = p.IsPointeeConst;
                 q.PointerDepth = p.PointerDepth;
+                q.CxxReferentDepth = p.CxxReferentDepth;
                 q.ResolvedTypeKey = p.ResolvedTypeKey;
                 q.ConstMask = p.ConstMask;
                 q.AliasSpelling = p.AliasSpelling;
@@ -1981,6 +2021,7 @@ public:
                 q.IsCxxLvalueRef = p.IsCxxLvalueRef;
                 q.IsPointeeConst = p.IsPointeeConst;
                 q.PointerDepth = p.PointerDepth;
+                q.CxxReferentDepth = p.CxxReferentDepth;
                 q.ResolvedTypeKey = p.ResolvedTypeKey;
                 q.ConstMask = p.ConstMask;
                 q.AliasSpelling = p.AliasSpelling;
@@ -2055,6 +2096,9 @@ public:
     {
         CFlatParser::InitializerContext* Initializer = nullptr;
         std::string NamespaceName;
+        std::vector<TypeAndValue> Parameters;
+        std::unordered_map<std::string, std::string> TypeSubstitutions;
+        std::unordered_map<std::string, int> TypeConstDepths;
     };
 
     struct ManifestFragment
@@ -2095,6 +2139,9 @@ public:
         std::string ThisFieldPath;
         // Null-state key for a joined unique-field call-sink arm.
         std::string NullKey;
+        // Call-argument selector slot: arm evaluation records this source address here; the
+        // transfer clears it after all arguments have been evaluated.
+        llvm::Value* DeferredSourceSlot = nullptr;
         bool PointeeMove = false;
         bool IsExplicitMove = false;
     };
@@ -2229,6 +2276,21 @@ public:
         bool IsCxxAddressOfPointerValue = false;
         // Address-of a function name: a pointer value, where the bare name is a function lvalue. Transient.
         bool IsCxxAddressOfFunction = false;
+        // `&object` of a non-pointer object: a proven single pointer even though PointerDepth stays
+        // unrecorded (0) for the `&value` reference spellings. Transient.
+        bool IsAddressOfPlainObject = false;
+        // PointerDepthRefuses plus the `&object` proof: a `T*` address never binds a `T**` parameter.
+        bool ArgumentPointerDepthRefuses(const LLVMBackend::TypeAndValue& parameter) const
+        {
+            return TypeAndValue.PointerDepthRefuses(parameter) || AddressOfObjectDepthRefuses(parameter);
+        }
+        // The `&object` half alone, for judges that compare a separately built argument type.
+        bool AddressOfObjectDepthRefuses(const LLVMBackend::TypeAndValue& parameter) const
+        {
+            return IsAddressOfPlainObject && TypeAndValue.Pointer && TypeAndValue.PointerDepth == 0
+                && !TypeAndValue.ElemPointer && TypeAndValue.DepthIsAboutThisValue()
+                && TypeAndValue.ProvenDecayedPointerDepth() == 0 && parameter.ProvenPointerDepth() > 1;
+        }
         // CFlat brace arguments load from their construction slot instead of a call instruction.
         bool IsCFlatBraceInitTemp = false;
         // Storage is this argument's C++ prvalue temp (call, operator or ctor result), not a named slot.
@@ -2740,6 +2802,8 @@ public:
         std::vector<ConditionalMoveSource> conditionalMoveSources;
         // A forwarded C++ closure result whose holder is kept by a later consumer.
         std::vector<std::pair<llvm::Value*, std::string>> cxxClosureLenders;
+        // Full pointee ConstMask from the arms of a C++ pointer join; transient across parsing.
+        uint32_t cxxPointeeConstMask = 0;
 
         TypedValue() = default;
         TypedValue(llvm::Value* v, bool u = false) : value(v), isUnsigned(u) {}
@@ -4096,6 +4160,8 @@ private:
     // end-of-module diagnostic (CheckPoisonedFunctionCalls) point at the real call site.
     struct FirstCallSite { size_t Line = 0; size_t Column = 0; size_t Order = 0; };
     std::unordered_map<std::string, FirstCallSite> firstCallLocation_;
+    // Functions of eagerly instantiated generic struct/class bodies that emitted a call: not live roots.
+    std::unordered_set<const llvm::Function*> genericBodyFunctions_;
     struct AliasReturnAddressUse
     {
         std::string File;
@@ -4730,7 +4796,9 @@ private:
     // These parse trees live for the current analysis only and are never cache-serialized.
     std::unordered_map<std::string, std::vector<CFlatDefaultArgumentContext>>
         cflatDefaultArgumentContexts;
-    std::function<NamedVariable(const std::string&, size_t, const TypeAndValue&)>
+    std::set<std::pair<std::string, size_t>> activeCFlatDefaultArgumentEvaluations;
+    std::function<NamedVariable(const std::string&, size_t, const TypeAndValue&,
+                                std::vector<NamedVariable>&)>
         cflatDefaultArgumentEvaluator;
     std::unordered_map<const llvm::Function*, bool> cxxNoexceptByFunction_;
     std::unordered_map<std::string, std::vector<InterfaceMethod>> interfaceTable;
@@ -8187,6 +8255,9 @@ private:
     bool IsCxxFunctionTemplateParameterDirectType(const std::string& functionName,
                                                   const std::string& ownerType,
                                                   size_t parameterIndex, size_t arity) const;
+    bool GetUniqueCxxFunctionTemplateVoidPointerParameter(
+        const std::string& functionName, const std::string& ownerType,
+        size_t parameterIndex, size_t arity, TypeAndValue& out) const;
     // T-constst3: every static member template that fits the arity takes the slot by `const place &`.
     bool IsCxxStaticTemplateConstRefParameter(const std::string& qualifiedName,
                                               size_t parameterIndex, size_t arity,
@@ -8201,6 +8272,11 @@ private:
                                              size_t parameterIndex, size_t arity) const;
     bool IsCxxConstructorParameterByValue(const std::string& typeName,
                                            size_t parameterIndex, size_t arity) const;
+    // Return a parameter only when one non-template constructor is viable by arity and
+    // defaults; unlike the value-slot helper, this also returns pointer parameters.
+    bool GetUniqueCxxConstructorParameter(const std::string& typeName,
+                                          size_t parameterIndex, size_t arity,
+                                          TypeAndValue& out) const;
     // constRef: select the unique `const T&` parameter instead of the by-value one (T459).
     bool GetUniqueCxxConstructorValueParameter(const std::string& typeName,
                                                size_t parameterIndex, size_t arity,
@@ -8311,7 +8387,8 @@ private:
     std::unordered_map<std::string, std::string> cxxDirectCalleeSymbols_;
     std::string CxxConstPointerArgumentError(size_t argumentIndex,
                                              const std::string& argumentName,
-                                             const std::string& parameterName) const;
+                                             const std::string& parameterName,
+                                             bool cxxConstSource = true) const;
     /*
      * A free C++ call with brace-list arguments and no bound declaration (std.max({3, 9, 4})):
      * each list's elements become wrapper parameters and the wrapper writes the list back as
@@ -9420,6 +9497,8 @@ public:
     static TypeAndValue ArrayDecayedPointer(const TypeAndValue& value);
     // A multi-dimensional array's row (`arr[1]`: no leading size, inner dimensions) as `T[N]`.
     static TypeAndValue RowAsFixedArray(const TypeAndValue& row);
+    // A fixed array decays one level only: `int[2]` / `int*[2][2]` into `int**` (not void*) is refused.
+    bool IsFixedArrayPointerDepthMismatch(const TypeAndValue& array, const TypeAndValue& to) const;
     // `B* = D[2][2]` (D a C++ class other than B): the array decays to a row pointer, refused.
     bool IsCxxMultiDimArrayClassPointerConversion(const TypeAndValue& dest,
                                                   const TypeAndValue& src) const;
@@ -9670,6 +9749,8 @@ public:
     }
 
     bool HasInterfaceMethod(const std::string& ifaceName, const std::string& methodName) const;
+    // Methods named `methodName` (any arity, inherited ones included: the table is flattened).
+    size_t CountInterfaceMethods(const std::string& ifaceName, const std::string& methodName) const;
 
     /*
      * The name-matching slot whose arity is argCount, or the first name match when no slot has
@@ -10720,6 +10801,8 @@ public:
      * (C interop, WinRT and synthesized signatures never fill it), so a POSITIVE depth on the
      * parameter is required before anything is refused. Returns the diagnostic clause, or "".
      */
+    bool CxxRefSlotBinds(const TypeAndValue& slot, const TypeAndValue::FuncPtrParam& p,
+                         std::string* error) const;
     std::string FuncPtrArgDepthMismatch(const NamedVariable& arg, const TypeAndValue::FuncPtrParam& p) const;
 
     // A marked address of a core unique owner is its raw T* storage slot and can bind to T**.
@@ -12998,6 +13081,9 @@ public:
     // is_copyable(T) of a CFlat struct: false when a by-value NONTRIVIAL C++ class field has no usable
     // copy ctor (its synthesized copy cannot be emitted). Trivial fields keep FindUncopyableCxxField.
     bool HasUncopyableCxxField(const std::string& typeName) const;
+    // Refuse a byte copy of `typeName` whose trivial C++ field clang cannot copy. Inside an eagerly
+    // instantiated generic body it poisons the function like compile_error; true = logged now.
+    bool RefuseCxxFieldByteCopy(const std::string& typeName);
     bool HasCxxRecords() const { return !cxxRecordEntries_.empty(); }
     // Where a copy-init lands, for CxxCopyInitRefusal's message: local `name`, parameter `name` of
     // `owner`, the return slot, element `name` of `owner`, field `name`.
@@ -13401,6 +13487,10 @@ public:
     // occurrence: a stamped argument passes arg.CastOccurrenceId; LoadNamedVariable's
     // synchronous mid-evaluation check passes CurrentCastOccurrence() instead.
     bool ArgumentIsCodeValue(const NamedVariable& arg, size_t occurrence) const;
+
+    // Read code provenance from one conditional arm before its join type erases the source shape.
+    bool ConditionalArmIsCodeValue(const TypeAndValue& sourceType, llvm::Value* value,
+                                   size_t occurrence) const;
 
     /*
      * Is this ARGUMENT a value PROVEN to be data - a pointer whose declared type is not code? The
@@ -15806,7 +15896,10 @@ public:
     // 354: C++ records carry hasClassDelete / hasUsualClassDelete (unusable class delete refusal).
     // 355: wrapper keys name their types' dependency groups; system-macro lookup-level refusal.
     // 356: a fallback request TU publishes no plain free function of the group's headers.
-    static constexpr int kCHeaderCacheVersion = 357;
+    // 358: C++ function-pointer reference-to-pointer params record their referent depth ("crd").
+    // 359: a `T** const* &`-style fn-ptr param masks every referent level's const.
+    // 360: a flagged `T**&` fn-ptr param keeps IsCxxRefToPointer ("crp").
+    static constexpr int kCHeaderCacheVersion = 360;
     static std::string CompilerBuildStamp();
     static std::string EffectiveBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request

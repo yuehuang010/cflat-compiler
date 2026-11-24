@@ -595,6 +595,7 @@ LLVMBackend::TypeAndValue LLVMBackend::MakeFuncPtrTypeAndValue(const std::string
                 fp.ConstMask |= static_cast<int64_t>(TypeAndValue::ConstBitAt(fp.PointerDepth));
             fp.IsPointeeConst = (fp.ConstMask & 1) != 0;
             fp.IsAlias = ParameterIsAliasByPointer(p);
+            if (chosen->IsCxx) fp.SetCxxReferentFromParameter(p);
             tv.FuncPtrParams.push_back(fp);
         }
         return tv;

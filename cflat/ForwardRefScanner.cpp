@@ -1198,9 +1198,10 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
         auto& defaultContexts = compiler->cflatDefaultArgumentContexts[uniqueName];
         defaultContexts.clear();
         defaultContexts.resize(params.size());
+        std::vector<LLVMBackend::TypeAndValue> contextParams(params.begin(), params.end());
         for (size_t i = 0; i < params.size(); ++i)
             if (params[i].DefaultValue != nullptr)
-                defaultContexts[i] = { params[i].DefaultValue, namespaceName };
+                defaultContexts[i] = { params[i].DefaultValue, namespaceName, contextParams, {}, {} };
         compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs,
                                             returnsOwned, isMethod, returnType.CallConv, linkageName);
         if (!returnType.external)
@@ -1213,11 +1214,17 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
                         for (size_t i = 0; i < params.size(); ++i)
                         {
                             auto* initializer = params[i].DefaultValue;
-                            if (initializer == nullptr || initializer->assignmentExpression() == nullptr
-                                || isMethod
-                                || params[i].Pointer || params[i].IsAlias || params[i].IsRvalueRef
-                                || !compiler->HasCxxClassMember(params[i].TypeName)
-                                || !compiler->IsCxxRecord(params[i].TypeName))
+                            if (initializer == nullptr) continue;
+                            const auto& param = params[i];
+                            const bool nativeDefault =
+                                compiler->IsNativeCallSiteDefaultParam(param);
+                            if (isMethod && !nativeDefault) continue;
+                            const bool cxxClassExpression = initializer->assignmentExpression() != nullptr
+                                && !param.Pointer && !param.IsAlias && !param.IsRvalueRef
+                                && !isMethod
+                                && compiler->HasCxxClassMember(param.TypeName)
+                                && compiler->IsCxxRecord(param.TypeName);
+                            if (!cxxClassExpression && !nativeDefault)
                                 continue;
                             if (symbol.DefaultArguments.size() < params.size())
                                 symbol.DefaultArguments.resize(params.size());
@@ -1498,6 +1505,18 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
         {
             std::vector<LLVMBackend::TypeAndValue> wrapperParams(params.begin(), params.begin() + cutoff);
             compiler->CreateFunctionDeclaration(name, returnType, wrapperParams, false, false);
+            const std::string wrapperUniqueName = compiler->ComputeMangledName(
+                name, returnType, wrapperParams, false);
+            if (auto table = compiler->functionTable.find(name); table != compiler->functionTable.end())
+                for (auto& symbol : table->second)
+                    if (symbol.UniqueName == wrapperUniqueName && !symbol.IsCxx)
+                    {
+                        if (symbol.DefaultArguments.size() <= symbol.Parameters.size())
+                            symbol.DefaultArguments.resize(symbol.Parameters.size() + 1);
+                        symbol.DefaultArguments[symbol.Parameters.size()].kind =
+                            "cflat_default_param_wrapper";
+                        break;
+                    }
         }
     }
 

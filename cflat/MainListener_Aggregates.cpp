@@ -1542,6 +1542,7 @@ void MainListener::ParseInlineAggregateBody(
         else
         {
             compiler->CreateFunctionDefinition(typeName, returnType, {});
+            ConditionalCallMoveSlotFunctionScope conditionalCallMoveSlotScope(deferredConditionalCallMoveSlot_);
             auto& storedFields = compiler->dataStructures.at(typeName).StructFields;
             if (isUnion)
                 EmitUnionDefaultConstructorBody(nullptr, typeName, structType, storedFields);
@@ -3866,6 +3867,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         if (!isCppStruct && !hasExplicitNoArgCtor)
         {
             auto funcDef = compiler->CreateFunctionDefinition(structName, returnType, {});
+            ConditionalCallMoveSlotFunctionScope conditionalCallMoveSlotScope(deferredConditionalCallMoveSlot_);
 
             // A native ctor result (closure fields) is in its final slot too: fields build there.
             const bool sretCtor = !isUnion && (compiler->ReturnsViaInPlaceSret(structName)
@@ -4731,6 +4733,7 @@ void MainListener::RejectIfProgramMemberSlotTaken(CFlatParser::ProgramDefinition
 
 void MainListener::EmitProgramRunWrapper(const std::string& name, CFlatParser::ProgramDefinitionContext* ctx) {
         auto* compiler = compilerLLVM;
+        ConditionalCallMoveSlotFunctionScope conditionalCallMoveSlotScope(deferredConditionalCallMoveSlot_);
         const std::string listStringTypeName = MangleGenericInstance(*compiler, "list", { "string" });
 
         // Resolve types - all must be concrete by this point (ProcessPendingInstantiations ran)
@@ -5798,6 +5801,7 @@ void MainListener::EmitProgramRunWrapper(const std::string& name, CFlatParser::P
 
 void MainListener::ParseImportedProgramDefinition(const std::string& name) {
         auto* compiler = compilerLLVM;
+        ConditionalCallMoveSlotFunctionScope conditionalCallMoveSlotScope(deferredConditionalCallMoveSlot_);
 
         if (compiler->IsVerbose())
             std::cout << "[verbose]     parse imported program: " << name << "\n";
@@ -6118,6 +6122,7 @@ void MainListener::ParseImportedProgramDefinition(const std::string& name) {
 
 void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext* ctx) {
         auto* compiler = Compiler(ctx);
+        ConditionalCallMoveSlotFunctionScope conditionalCallMoveSlotScope(deferredConditionalCallMoveSlot_);
         if (ctx->children.empty() || ctx->children[0]->getText() != "program")
             compiler->LogError("expected 'program' at the start of a program definition");
         std::string name = ctx->directDeclarator()->getText();
@@ -7037,6 +7042,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
         if (!hasExplicitNoArgCtor)
         {
             auto funcDef = compiler->CreateFunctionDefinition(structName, returnType, {});
+            ConditionalCallMoveSlotFunctionScope conditionalCallMoveSlotScope(deferredConditionalCallMoveSlot_);
 
             // The struct default ctor's field walk: a field initializer that unwinds destroys the
             // fields already built.
@@ -7670,6 +7676,7 @@ void MainListener::EmitCppStructConstructorThunk(
             || (!fn->empty() && cflat_llvm::GetTerminatorOrNull(&fn->getEntryBlock()) != nullptr))
             return;
         ActiveLocalEnumFunctionScope localEnumFunctionScope(compiler, fn->getName().str());
+        ConditionalCallMoveSlotFunctionScope conditionalCallMoveSlotScope(deferredConditionalCallMoveSlot_);
         compiler->InitializeBlock(&fn->front(), false);
         LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
         ReturnFlagGuard functionReturnFlagGuard(&straightLineReturned_);
@@ -7799,6 +7806,7 @@ void MainListener::EmitCppStructDestructorThunk(
         if (fn->isMaterializable()
             || (!fn->empty() && cflat_llvm::GetTerminatorOrNull(&fn->getEntryBlock()) != nullptr))
             return;
+        ConditionalCallMoveSlotFunctionScope conditionalCallMoveSlotScope(deferredConditionalCallMoveSlot_);
         compiler->InitializeBlock(&fn->front(), false);
         LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
         ReturnFlagGuard functionReturnFlagGuard(&straightLineReturned_);
@@ -7844,6 +7852,7 @@ void MainListener::EmitCppStructMoveThunk(antlr4::ParserRuleContext* ctx,
         if (fn->isMaterializable()
             || (!fn->empty() && cflat_llvm::GetTerminatorOrNull(&fn->getEntryBlock()) != nullptr))
             return;
+        ConditionalCallMoveSlotFunctionScope conditionalCallMoveSlotScope(deferredConditionalCallMoveSlot_);
         compiler->InitializeBlock(&fn->front(), false);
         LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
         auto getPointer = [&](const char* name) -> llvm::Value* {
@@ -7968,6 +7977,7 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
             return;
 
         ActiveLocalEnumFunctionScope localEnumFunctionScope(compiler, fn->getName().str());
+        ConditionalCallMoveSlotFunctionScope conditionalCallMoveSlotScope(deferredConditionalCallMoveSlot_);
         compiler->InitializeBlock(&fn->front(), false);
         LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
         // Fresh straight-line for this function/lambda body; restore the enclosing walk's flag on
@@ -8272,6 +8282,7 @@ void MainListener::ParseDestructorDefinition(CFlatParser::DestructorDefinitionCo
                                                          false, false,
                                                          static_cast<int>(ctx->getStart()->getLine()));
             ActiveLocalEnumFunctionScope localEnumFunctionScope(compiler, fn->getName().str());
+            ConditionalCallMoveSlotFunctionScope conditionalCallMoveSlotScope(deferredConditionalCallMoveSlot_);
             compiler->InitializeBlock(&fn->front(), false);
             LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
             LLVMBackend::CppStructAccessScope cppStructAccessScope(compiler, structName);
@@ -8317,6 +8328,7 @@ void MainListener::ParseDestructorDefinition(CFlatParser::DestructorDefinitionCo
         compiler->RegisterDestructor(structName, fn);
 
         ActiveLocalEnumFunctionScope localEnumFunctionScope(compiler, fn->getName().str());
+        ConditionalCallMoveSlotFunctionScope conditionalCallMoveSlotScope(deferredConditionalCallMoveSlot_);
         compiler->InitializeBlock(&fn->front(), false);
         LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
         // Fresh straight-line for this function/lambda body; restore the enclosing walk's flag on
@@ -8370,6 +8382,7 @@ void MainListener::ParseProgramDestructorDefinition(CFlatParser::DestructorDefin
         compiler->RegisterDestructor(name, fn);
 
         ActiveLocalEnumFunctionScope localEnumFunctionScope(compiler, fn->getName().str());
+        ConditionalCallMoveSlotFunctionScope conditionalCallMoveSlotScope(deferredConditionalCallMoveSlot_);
         compiler->InitializeBlock(&fn->front(), false);
         LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
         // Fresh straight-line for this function/lambda body; restore the enclosing walk's flag on

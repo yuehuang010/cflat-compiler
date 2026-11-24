@@ -834,6 +834,11 @@ public:
         auto it = constDepths_.find(name);
         return it == constDepths_.end() ? 0 : it->second;
     }
+    void BindConstDepth(const std::string& name, int depth)
+    {
+        if (depth > 0) constDepths_[name] = depth;
+        else constDepths_.erase(name);
+    }
 private:
     std::unordered_map<std::string, int> constDepths_;
 };
@@ -3086,7 +3091,8 @@ private:
     LLVMBackend* compilerLLVM;
     std::function<void(antlr4::ParserRuleContext*, std::string)> savedContextualErrorReporter_;
     std::function<LLVMBackend::NamedVariable(const std::string&, size_t,
-        const LLVMBackend::TypeAndValue&)> savedCflatDefaultArgumentEvaluator_;
+        const LLVMBackend::TypeAndValue&,
+        std::vector<LLVMBackend::NamedVariable>&)> savedCflatDefaultArgumentEvaluator_;
     bool evaluatingCFlatDefaultArgument_ = false;
     std::vector<std::string> cflatDefaultInjectedGlobals_;
     std::string sourceFileName;
@@ -3200,6 +3206,9 @@ private:
     inline LLVMBackend* Compiler() { return compilerLLVM; }
     std::string BorrowedParameterCallName(
         const LLVMBackend::NamedVariable& source, llvm::Value* value);
+    bool IsOwnedUniqueInitializerSource(LLVMBackend* compiler,
+        const LLVMBackend::NamedVariable& source, llvm::Value* value,
+        bool additionalOwnedProof = false);
     const std::unordered_set<std::string>& FunctionLocalEnumNames(
         CFlatParser::FunctionDefinitionContext* function);
 
@@ -3973,6 +3982,18 @@ private:
         LogErrorContext(ctx, "expression or statement is nested too deeply; split it into named temporaries");
     }
     bool inCallArgument_ = false;
+    llvm::Value* deferredConditionalCallMoveSlot_ = nullptr;
+    struct ConditionalCallMoveSlotFunctionScope {
+        llvm::Value*& slot;
+        llvm::Value* saved;
+        bool active = true;
+        explicit ConditionalCallMoveSlotFunctionScope(llvm::Value*& value)
+            : slot(value), saved(value) { slot = nullptr; }
+        void Restore() { if (active) { slot = saved; active = false; } }
+        ~ConditionalCallMoveSlotFunctionScope() { Restore(); }
+    };
+    // The call argument's destination parameter is the only candidate (no overload set to rank).
+    bool callArgDestinationUnique_ = false;
     const CFlatParser::PostfixExpressionContext* directViewCallArgument_ = nullptr;
     bool inCxxCallArgument_ = false;
     // A call argument `?:` with a nested `?:` arm builds its slot in place (MIXRES).
@@ -4060,17 +4081,22 @@ private:
                                           CFlatParser::MoveExpressionContext* moveSite,
                                           bool destinationIsFresh,
                                           const LLVMBackend::OwnedTempMark& ownedTempMark);
+    // Every argument entry states whether its destination parameter is the only candidate
+    // (callArgDestinationUnique_), so a nested argument never inherits the enclosing call's answer.
     struct CallArgumentScope {
         bool& slot;
         int& ternaryDepth;
+        bool& uniqueSlot;
         bool saved;
         int savedTernaryDepth;
-        explicit CallArgumentScope(bool& s, int& d)
-            : slot(s), ternaryDepth(d), saved(s), savedTernaryDepth(d) {
+        bool savedUnique;
+        explicit CallArgumentScope(bool& s, int& d, bool& u, bool uniqueDestination)
+            : slot(s), ternaryDepth(d), uniqueSlot(u), saved(s), savedTernaryDepth(d), savedUnique(u) {
             slot = true;
             ternaryDepth = 0;
+            uniqueSlot = uniqueDestination;
         }
-        ~CallArgumentScope() { ternaryDepth = savedTernaryDepth; slot = saved; }
+        ~CallArgumentScope() { ternaryDepth = savedTernaryDepth; slot = saved; uniqueSlot = savedUnique; }
     };
 
     // A nested function body is NOT part of the enclosing expression: a ternary declared inside
@@ -5928,7 +5954,8 @@ public:
     LLVMBackend::NamedVariable ParseAssignmentExpressionNamed(CFlatParser::AssignmentExpressionContext* ctx,
                                                               ResultUse use = ResultUse::Value);
     LLVMBackend::NamedVariable EvaluateCFlatDefaultArgument(const std::string& functionName,
-        size_t parameterIndex, const LLVMBackend::TypeAndValue& parameterType);
+        size_t parameterIndex, const LLVMBackend::TypeAndValue& parameterType,
+        std::vector<LLVMBackend::NamedVariable>& earlierArguments);
     LLVMBackend::NamedVariable ParseAssignmentExpressionNamedBody(CFlatParser::AssignmentExpressionContext* ctx,
                                                                   ResultUse use);
     // BRACEPRV: a sole C++ class construction element, and a later element that cannot observe a
@@ -6551,7 +6578,8 @@ public:
                                          const std::function<void()>& atFalse);
     static void JoinTernaryPointerShape(LLVMBackend::TypedValue& result,
                                         const LLVMBackend::TypedValue& trueArm,
-                                        const LLVMBackend::TypedValue& falseArm);
+                                        const LLVMBackend::TypedValue& falseArm,
+                                        bool inCallArgument);
     // Appends a raw owning LOCAL pointer arm of a '?:' / '??' join as a conditional move source.
     // Returns false (nothing appended) for every other shape, which keeps the existing path.
     bool CollectOwningLocalPointerArm(const LLVMBackend::TypedValue& shape, llvm::Value* value,
@@ -7214,6 +7242,7 @@ public:
         llvm::Type* BaseType = nullptr;
         bool HasValue = false;
         bool IsStringLiteral = false;  // the value is a string literal's global
+        bool IsRvalue = false;
     };
     UnevaluatedOperandType EvaluateOperandTypeOnly(const std::function<LLVMBackend::NamedVariable()>& emit);
     llvm::Type* ResolveUnevaluatedOperandType(const UnevaluatedOperandType& operand,

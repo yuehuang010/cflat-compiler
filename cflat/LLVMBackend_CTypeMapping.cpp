@@ -517,11 +517,12 @@ bool LLVMBackend::RejectCxxRecordByValue(const CSigEntry& sig)
 
 void LLVMBackend::CheckPoisonedFunctionCalls()
 {
-        // Report poisoned functions reachable from live code first (a call inside an uncalled
-        // container method is the consequence), then in first-call order - never hash order:
+        // Report only poisoned functions reachable from live code (a call inside an uncalled
+        // container method never runs), in first-call order - never hash order:
         // the first error is the one an expect_error sees, and unordered_map iteration differs
         // between libc++ and MSVC STL.
-        auto reachable = [](llvm::Function* f) {
+        // Live = some caller chain reaches non-generic code, an exported function, or an address use.
+        auto reachable = [this](llvm::Function* f) {
             std::vector<llvm::Function*> work{f};
             std::unordered_set<llvm::Function*> seen{f};
             while (!work.empty())
@@ -529,6 +530,7 @@ void LLVMBackend::CheckPoisonedFunctionCalls()
                 llvm::Function* g = work.back();
                 work.pop_back();
                 if (!g->hasLocalLinkage()) return true;
+                if (g != f && genericBodyFunctions_.count(g) == 0) return true;
                 for (auto* u : g->materialized_users())
                 {
                     auto* call = llvm::dyn_cast<llvm::CallBase>(u);
@@ -567,6 +569,8 @@ void LLVMBackend::CheckPoisonedFunctionCalls()
         });
         for (const Called& c : called)
         {
+            // A call only from uncalled (eagerly instantiated) code never runs: not an error.
+            if (!c.Live) continue;
             // Point the diagnostic at the call site rather than wherever the walk ended.
             if (c.Site != nullptr) SetSourceLocation(c.Site->Line, c.Site->Column);
             LogRawError(*c.Msg);
@@ -1700,6 +1704,11 @@ bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndVal
                 && IsCxxRecord(ResolveTypeAlias(ptv.TypeName));
             fp.IsAlias = cxxPointerReference || cxxClassLvalueReference;
             fp.IsCxxLvalueRef = cxxLvalueReference;
+            // A flagged `T**&` / `T** const&` is stored at its referent depth; `T*&` counts the reference.
+            if (cxxPointerReference)
+                fp.CxxReferentDepth = ptv.IsCxxRefToPointer ? fp.PointerDepth : fp.PointerDepth - 1;
+            // A flagged one binds the caller's slot like a symbol-derived `T**&` (named `pp` included).
+            fp.IsCxxRefToPointer = cxxPointerReference && ptv.IsCxxRefToPointer;
             // Leading const qualifies the innermost pointee (`const void *`).
             fp.IsPointeeConst = ptv.Pointer && parameterSpelling.starts_with("const ");
             if (!cxxBoundary)
@@ -1709,7 +1718,8 @@ bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndVal
             }
             else if (fp.Pointer)
             {
-                const int valueDepth = fp.PointerDepth - (cxxPointerReference ? 1 : 0);
+                // A flagged `T**&` sits at its referent depth already: mask every referent level.
+                const int valueDepth = cxxPointerReference ? fp.CxxReferentDepth : fp.PointerDepth;
                 fp.ConstMask = CxxSpellingPointeeConstMask(parameterSpelling, valueDepth);
                 if (cxxPointerReference && CxxParamIsConstRefToPointer(parameterSpelling))
                     fp.ConstMask |= static_cast<int64_t>(LLVMBackend::TypeAndValue::ConstBitAt(fp.PointerDepth));

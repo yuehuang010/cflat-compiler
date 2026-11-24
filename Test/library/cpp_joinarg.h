@@ -18,3 +18,9 @@ inline int ja_ov4(JaA* p) { return 1; }
 inline int ja_ov4(JaD* p) { return 2; }
 inline int ja_ov6(JaD** p) { return 1; }
 inline int ja_ov6(JaB** p) { return 2; }
+// JOINARG2: C++ reference arms joined with pointer arms in a call argument.
+inline JaD ja_global_d;
+inline JaD& ja_ref_d() { return ja_global_d; }
+inline JaB& ja_ref_b() { return ja_global_d; }
+inline int ja_ov_ab(JaA* p) { return 1; }
+inline int ja_ov_ab(JaB* p) { return 2; }

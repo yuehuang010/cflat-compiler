@@ -35,8 +35,3 @@ Accepted since STATELEM, matching clang's counts, not legged: `sl.D g = c ? sl.D
 on master; element-selected `1 2 0 1 3`) and `sl.D g = c ? mkH(1).d : sl.D(2)` (refused on master;
 `1 1 0 1 2` / `2 1 0 0 1`).
 
-Same-class NRVO (not a derived-to-base item; master kept): `B b = B(6); return b;` and `D d = D(6);
-return d;` move on master, clang elides (0 moves). Same for `DC d; return d;` with a copy-only class.
-
-Not in this item: `B g = PR(D(x));` (prvalue D argument to a by-value D parameter, declaration init)
-copies once extra on master and fix (clang 0 copies); `return PR(D(x)).get();` matches clang.

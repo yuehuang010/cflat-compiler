@@ -1,6 +1,7 @@
 // Const phase 5b: a C++ const result never converts to a CFlat mutable pointer (init, assign,
 // return, argument), and a native const pointee never binds a mutable C++ parameter.
 import cpp "cpp_interop_proxy_assign.h";
+import cpp "cpp_const_join.hpp";
 
 // clang: cannot initialize return object of type 'int *' with an rvalue of type 'const int *'
 expect_error("cannot return '(const int)*' as 'int*': the conversion discards const") {
@@ -53,10 +54,51 @@ extern int main()
         int c5bTaken = cpppa.c5b_taker(c5bConstR);
     }
     // clang: no matching function for call to 'take'
-    expect_error("cannot pass C++ const pointer argument 1 ('c5bConstInt') to mutable C++ pointer parameter 'p'") {
+    expect_error("cannot pass const pointer argument 1 ('c5bConstInt') to mutable C++ pointer parameter 'p'") {
         int c5bValue = 1;
         (const int)* c5bConstInt = &c5bValue;
         int c5bTook = cpppa.c5b_take(c5bConstInt);
+    }
+    expect_error("cannot pass C++ const pointer argument") {
+        int c5bDirectVoidCall = cj.take_void(cj.getc_());
+    }
+    expect_error("cannot pass const pointer argument") {
+        const int* c5bFlatConstPointer = cj.getm_();
+        int c5bFlatConstVoidCall = cj.take_void(c5bFlatConstPointer);
+    }
+    expect_error("the conversion discards const") {
+        bool c5bStoreCondition = true;
+        void* c5bStoreMutable = cj.getm_();
+        void* c5bStoreJoin = c5bStoreCondition ? cj.getc_() : c5bStoreMutable;
+    }
+    expect_error("the conversion discards const") {
+        bool c5bAssignCondition = true;
+        void* c5bAssignMutable = cj.getm_();
+        c5bAssignMutable = c5bAssignCondition ? cj.getc_() : c5bAssignMutable;
+    }
+    expect_error("cannot pass C++ const pointer argument") {
+        bool c5bJoinCondition = true;
+        void* c5bJoinVoid = cj.getm_();
+        int c5bJoinedVoidCall = cj.take_void(
+            c5bJoinCondition ? cj.getc_() : c5bJoinVoid);
+    }
+    expect_error("the conversion discards const") {
+        bool c5bPointeeCondition = true;
+        int* c5bMutablePointee = cj.getm_();
+        int* c5bPointeeJoin = c5bPointeeCondition ? cj.getc_() : c5bMutablePointee;
+    }
+    expect_error("points to a const C++ object") {
+        bool c5bCtorCondition = true;
+        void* c5bCtorMutable = cj.getm_();
+        cj.CS c5bJoinedCtor = cj.CS(c5bCtorCondition ? cj.getc_() : c5bCtorMutable);
+    }
+    expect_error("the conversion discards const") {
+        int* c5bNull = nullptr;
+        int* c5bCoalesced = c5bNull ?? cj.getc_();
+    }
+    expect_error("the conversion discards const") {
+        void* c5bNullVoid = nullptr;
+        void* c5bCoalescedVoid = c5bNullVoid ?? cj.getc_();
     }
     return 0;
 }

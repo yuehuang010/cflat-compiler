@@ -1,0 +1,163 @@
+// A CFlat struct holding a trivially copyable C++ class whose copy constructor is deleted is not
+// copyable, like clang: a direct construct_at / copy() refuses at once, a generic container's
+// copy() only when called (the method is poisoned like compile_error), at the call site.
+// list<T> / queue<T> copy() take the construct_at arm, dictionary<K, V> copy() the copy() arm;
+// declaring the containers and last-use moves stay legal (test_cpp_interop.cb, 27489, 27490, 27492).
+import cpp "cppcopy5_deleted_trivial.h";
+import "list.cb";
+import "queue.cb";
+import "dictionary.cb";
+
+struct Cppcopy5SA { cppcopy5.A a = default; int z = 0; };
+
+expect_error("cannot copy struct 'Cppcopy5SA' because field 'a' contains C++ class 'cppcopy5.A' whose copy constructor is deleted") {
+    void Cppcopy5ConstructAt(Cppcopy5SA* slot)
+    {
+        Cppcopy5SA value = default;
+        construct_at(slot, value);
+        value.z = 1;
+    }
+}
+
+expect_error("cannot copy struct 'Cppcopy5SA' because field 'a' contains C++ class 'cppcopy5.A' whose copy constructor is deleted") {
+    int Cppcopy5CopyMethod()
+    {
+        Cppcopy5SA value = default;
+        Cppcopy5SA duplicate = value.copy();
+        return duplicate.z;
+    }
+}
+
+expect_error("cannot copy struct 'Cppcopy5SA' because field 'a' contains C++ class 'cppcopy5.A' whose copy constructor is deleted") {
+    int Cppcopy5LambdaLiveParam()
+    {
+        Lambda<int(Cppcopy5SA)> f = (Cppcopy5SA v) => { Cppcopy5SA w = v.copy(); return w.z + v.z; };
+        Cppcopy5SA arg = default;
+        return f(move arg);
+    }
+}
+
+int Cppcopy5Take(Cppcopy5SA v) { return v.z; }
+
+expect_error("cannot copy struct 'Cppcopy5SA' into parameter 'v' of 'Cppcopy5Take': field 'a' of C++ class 'cppcopy5.A' has a deleted copy constructor") {
+    int Cppcopy5LambdaCaptureBefore()
+    {
+        Lambda<int(Cppcopy5SA)> f = (Cppcopy5SA v) => { Lambda<int()> inner = () => { return v.z; }; int r = Cppcopy5Take(v); return r + inner(); };
+        Cppcopy5SA arg = default;
+        return f(move arg);
+    }
+}
+
+expect_error("cannot copy struct 'Cppcopy5SA' into parameter 'v' of 'Cppcopy5Take': field 'a' of C++ class 'cppcopy5.A' has a deleted copy constructor") {
+    int Cppcopy5LambdaCaptureAfter()
+    {
+        Lambda<int(Cppcopy5SA)> f = (Cppcopy5SA v) => { int r = Cppcopy5Take(v); Lambda<int()> inner = () => { return v.z; }; return r + inner(); };
+        Cppcopy5SA arg = default;
+        return f(move arg);
+    }
+}
+
+expect_error("cannot copy struct 'Cppcopy5SA' into parameter 'v' of 'Cppcopy5Take': field 'a' of C++ class 'cppcopy5.A' has a deleted copy constructor") {
+    int Cppcopy5LambdaParen()
+    {
+        Lambda<int(Cppcopy5SA)> f = (Cppcopy5SA v) => { int r = Cppcopy5Take(v); return r + (v).z; };
+        Cppcopy5SA arg = default;
+        return f(move arg);
+    }
+}
+
+expect_error("cannot copy struct 'Cppcopy5SA' because field 'a' contains C++ class 'cppcopy5.A' whose copy constructor is deleted") {
+    int Cppcopy5LambdaCapturedCopy()
+    {
+        Lambda<int(Cppcopy5SA)> f = (Cppcopy5SA v) => { Lambda<int()> inner = () => { return v.z; }; Cppcopy5SA w = v.copy(); return w.z + inner(); };
+        Cppcopy5SA arg = default;
+        return f(move arg);
+    }
+}
+
+expect_error("cannot copy struct 'Cppcopy5SA' into parameter 'v' of 'Cppcopy5Take': field 'a' of C++ class 'cppcopy5.A' has a deleted copy constructor") {
+    int Cppcopy5FnParen(Cppcopy5SA p)
+    {
+        int r = Cppcopy5Take(p); return r + (p).z;
+    }
+}
+
+expect_error("cannot copy struct 'Cppcopy5SA' into parameter 'v' of 'Cppcopy5Take': field 'a' of C++ class 'cppcopy5.A' has a deleted copy constructor") {
+    int Cppcopy5FnCapture(Cppcopy5SA p)
+    {
+        int r = Cppcopy5Take(p); Lambda<int()> inner = () => { return p.z; }; return r + inner();
+    }
+}
+
+Lambda<int()> Cppcopy5Relay(Lambda<int()> x) { return x; }
+struct Cppcopy5Slot { Lambda<int()> cb = default; };
+
+expect_error("cannot copy struct 'Cppcopy5SA' into parameter 'v' of 'Cppcopy5Take': field 'a' of C++ class 'cppcopy5.A' has a deleted copy constructor") {
+    int Cppcopy5ClosureAlias()
+    {
+        Lambda<int(Cppcopy5SA)> f = (Cppcopy5SA v) => { Lambda<int()> inner = () => { return v.z; }; Lambda<int()> alias = inner; int r = Cppcopy5Take(v); return r + alias(); };
+        Cppcopy5SA arg = default;
+        return f(move arg);
+    }
+}
+
+expect_error("cannot copy struct 'Cppcopy5SA' into parameter 'v' of 'Cppcopy5Take': field 'a' of C++ class 'cppcopy5.A' has a deleted copy constructor") {
+    int Cppcopy5ClosureRelay()
+    {
+        Lambda<int(Cppcopy5SA)> f = (Cppcopy5SA v) => { Lambda<int()> inner = () => { return v.z; }; Lambda<int()> alias = Cppcopy5Relay(inner); int r = Cppcopy5Take(v); return r + alias(); };
+        Cppcopy5SA arg = default;
+        return f(move arg);
+    }
+}
+
+expect_error("cannot copy struct 'Cppcopy5SA' into parameter 'v' of 'Cppcopy5Take': field 'a' of C++ class 'cppcopy5.A' has a deleted copy constructor") {
+    int Cppcopy5ClosureField()
+    {
+        Lambda<int(Cppcopy5SA)> f = (Cppcopy5SA v) => { Lambda<int()> inner = () => { return v.z; }; Cppcopy5Slot s = default; s.cb = inner; int r = Cppcopy5Take(v); return r + s.cb(); };
+        Cppcopy5SA arg = default;
+        return f(move arg);
+    }
+}
+
+expect_error("cannot copy struct 'Cppcopy5SA' into parameter 'v' of 'Cppcopy5Take': field 'a' of C++ class 'cppcopy5.A' has a deleted copy constructor") {
+    int Cppcopy5ClosureNested()
+    {
+        Lambda<int(Cppcopy5SA)> f = (Cppcopy5SA v) => { Lambda<int()> inner = () => { Lambda<int()> child = () => { return v.z; }; return child(); }; int r = Cppcopy5Take(v); return r + inner(); };
+        Cppcopy5SA arg = default;
+        return f(move arg);
+    }
+}
+
+expect_error("cannot copy struct 'Cppcopy5SA' into parameter 'v' of 'Cppcopy5Take': field 'a' of C++ class 'cppcopy5.A' has a deleted copy constructor") {
+    int Cppcopy5FnClosureAlias(Cppcopy5SA v)
+    {
+        Lambda<int()> inner = () => { return v.z; };
+        Lambda<int()> alias = inner;
+        int r = Cppcopy5Take(v);
+        return r + alias();
+    }
+}
+
+// A block-local's own initializer still reads the outer closure (its scope starts after it).
+expect_error("cannot copy struct 'Cppcopy5SA' into parameter 'v' of 'Cppcopy5Take': field 'a' of C++ class 'cppcopy5.A' has a deleted copy constructor") {
+    int Cppcopy5FnClosureSelfInit(Cppcopy5SA v)
+    {
+        Lambda<int()> inner = () => { return v.z; };
+        int r = Cppcopy5Take(v);
+        { int k = 0, inner = inner(); r = r + inner + k; }
+        return r;
+    }
+}
+
+// Deferred: reported at the end of the compile, so it takes the file-scope form.
+expect_error("cannot copy struct 'Cppcopy5SA' because field 'a' contains C++ class 'cppcopy5.A' whose copy constructor is deleted");
+extern int main()
+{
+    list<Cppcopy5SA> l = default;
+    queue<Cppcopy5SA> q = default;
+    dictionary<int, Cppcopy5SA> d = default;
+    Cppcopy5SA dv = default;
+    d.set(1, move dv);
+    dictionary<int, Cppcopy5SA> d2 = d.copy();
+    return l.count() + q.count() + d2.count();
+}

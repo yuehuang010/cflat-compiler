@@ -315,12 +315,32 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                     if (hasDefaultArg)
                         compiler->GetUniqueCxxConstructorValueParameter(typeName, argIndex,
                             ctorArgNodes.size(), argExpected);
+                    bool uniqueVoidConstructorDestination = false;
+                    auto* argConditional = argAssign->conditionalExpression();
+                    if (argConditional != nullptr
+                        && (argConditional->Question() != nullptr
+                            || argConditional->QuestionQuestion() != nullptr))
+                    {
+                        LLVMBackend::TypeAndValue ctorTarget;
+                        if (compiler->GetUniqueCxxConstructorParameter(typeName, argIndex,
+                                ctorArgNodes.size(), ctorTarget)
+                            && ctorTarget.Pointer && !ctorTarget.IsFunctionPointer
+                            && !ctorTarget.IsArrayView && !ctorTarget.IsInterface
+                            && !ctorTarget.IsInterfacePointer && !ctorTarget.IsSimd
+                            && ctorTarget.ValuePointerDepth() == 1 && !ctorTarget.ElemPointer
+                            && compiler->ResolveTypeAlias(ctorTarget.TypeName) == "void")
+                        {
+                            argExpected = ctorTarget;
+                            uniqueVoidConstructorDestination = true;
+                        }
+                    }
                     std::optional<DeclExpectedTypeScope> argExpectedScope;
                     if (!argExpected.TypeName.empty())
                         argExpectedScope.emplace(&declExpectedType, argExpected, true);
                     CxxCallArgumentExpectedTypeScope cxxArgumentExpected(
                         cxxCallArgumentExpectedType_, argExpected);
-                    CallArgumentScope callArgumentScope(inCallArgument_, ternaryCallArgumentDepth_);
+                    CallArgumentScope callArgumentScope(inCallArgument_, ternaryCallArgumentDepth_,
+                        callArgDestinationUnique_, uniqueVoidConstructorDestination);
                     CxxCallArgumentScope cxxNewArgumentScope(inCxxCallArgument_, true);
                     LLVMBackend::TypeAndValue ctorRefDest;
                     std::string ctorRefPlaceType;
@@ -1095,9 +1115,53 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                     // Preserve legacy value loading while retaining metadata for core unique args.
                     size_t savedCastOcc = compiler->BeginCastOccurrence();
                     size_t thisCastOcc = compiler->CurrentCastOccurrence();
+                    LLVMBackend::TypeAndValue ctorExpected;
+                    bool uniqueVoidConstructorDestination = false;
+                    auto* argConditional = namedArg->assignmentExpression() != nullptr
+                        ? namedArg->assignmentExpression()->conditionalExpression() : nullptr;
+                    if (argConditional != nullptr
+                        && (argConditional->Question() != nullptr
+                            || argConditional->QuestionQuestion() != nullptr))
+                    {
+                        auto candidates = compiler->functionTable.find(typeName);
+                        if (candidates != compiler->functionTable.end())
+                        {
+                            const size_t argumentCount = argList->argumentNamedExpression().size();
+                            const LLVMBackend::FunctionSymbol* uniqueConstructor = nullptr;
+                            size_t candidateCount = 0;
+                            for (const auto& candidate : candidates->second)
+                                if (!candidate.IsCxx && candidate.Parameters.size() == argumentCount)
+                                {
+                                    uniqueConstructor = &candidate;
+                                    ++candidateCount;
+                                }
+                            const size_t argIndex = ctorArgs.size();
+                            if (candidateCount == 1 && uniqueConstructor != nullptr
+                                && argIndex < uniqueConstructor->Parameters.size())
+                            {
+                                const auto& parameter = uniqueConstructor->Parameters[argIndex];
+                                if (parameter.Pointer && !parameter.IsFunctionPointer
+                                    && !parameter.IsArrayView && !parameter.IsInterface
+                                    && !parameter.IsInterfacePointer && !parameter.IsSimd
+                                    && parameter.ValuePointerDepth() == 1 && !parameter.ElemPointer
+                                    && compiler->ResolveTypeAlias(parameter.TypeName) == "void")
+                                {
+                                    ctorExpected = parameter;
+                                    uniqueVoidConstructorDestination = true;
+                                }
+                            }
+                        }
+                    }
+                    std::optional<DeclExpectedTypeScope> ctorExpectedScope;
+                    if (!ctorExpected.TypeName.empty())
+                        ctorExpectedScope.emplace(&declExpectedType, ctorExpected, true);
+                    std::optional<CallArgumentScope> ctorArgumentScope;
+                    if (uniqueVoidConstructorDestination)
+                        ctorArgumentScope.emplace(inCallArgument_, ternaryCallArgumentDepth_,
+                            callArgDestinationUnique_, true);
                     std::optional<CallArgumentScope> tupleArgumentScope;
                     if (IsTupleLiteralArgumentTree(namedArg->assignmentExpression()))
-                        tupleArgumentScope.emplace(inCallArgument_, ternaryCallArgumentDepth_);
+                        tupleArgumentScope.emplace(inCallArgument_, ternaryCallArgumentDepth_, callArgDestinationUnique_, false);
                     auto argNV = ParseAssignmentExpressionNamed(namedArg->assignmentExpression());
                     llvm::Value* argVal = argNV.Primary != nullptr
                         ? argNV.Primary : LoadNamedVariable(argNV);

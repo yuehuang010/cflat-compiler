@@ -3,7 +3,9 @@ import "unique.cb";
 struct TupsafeTupleOwner { int value = 0; ~TupsafeTupleOwner() { } };
 struct TupsafeTupleHolder { unique<TupsafeTupleOwner> a = default; };
 struct TupsafeRawTupleHolder { unique TupsafeTupleOwner* a = default; };
+struct TupsafeBorrowedTupleHolder { TupsafeTupleOwner* p = default; };
 unique<TupsafeTupleOwner> tupsafeGlobalTupleOwner = default;
+TupsafeTupleOwner* tupsafeBorrowedTupleGlobal = default;
 int tupsafeTakeUniqueTuple((unique<TupsafeTupleOwner>, int) value) { return value.item_1; }
 int tupsafeTakeUniquePair((unique<TupsafeTupleOwner>, unique<TupsafeTupleOwner>) value) { return 0; }
 int tupsafeTakeUniqueScalar(unique<TupsafeTupleOwner> value) { return value->value; }
@@ -87,6 +89,15 @@ expect_error("use of moved variable 'u'") {
     }
 }
 
+expect_error("cannot initialize unique<TupsafeTupleOwner> from borrowed value 'p'") {
+    void tupsafeTupleRawUniqueBorrow()
+    {
+        TupsafeTupleOwner value = default;
+        TupsafeTupleOwner* p = &value;
+        (unique TupsafeTupleOwner*, int) tuple = (p, 4);
+    }
+}
+
 expect_error("cannot consume owning value 'tupsafeGlobalTupleOwner' out of storage that outlives this function") {
     void tupsafeGlobalTupleCall()
     {
@@ -138,5 +149,90 @@ expect_error("use of moved variable 'holder.a'") {
         holder.a = new TupsafeTupleOwner();
         (unique TupsafeTupleOwner*, unique TupsafeTupleOwner*) tuple = default;
         tuple = (holder.a, holder.a);
+    }
+}
+
+// TUPOWN2 r2: every conditional joins a local owner with a borrowed pointer source.
+// The tuple slot must reject the whole join, independent of the condition.
+expect_error("borrowed value") {
+    void tupsafeTupleMixedParamDeclaration(TupsafeTupleOwner* p, bool choose)
+    {
+        TupsafeTupleOwner* r = new TupsafeTupleOwner();
+        (unique TupsafeTupleOwner*, int) tuple = (choose ? r : p, 4);
+    }
+}
+
+expect_error("borrowed value") {
+    void tupsafeTupleMixedFieldDeclaration(bool choose)
+    {
+        TupsafeBorrowedTupleHolder holder = default;
+        holder.p = new TupsafeTupleOwner();
+        TupsafeTupleOwner* r = new TupsafeTupleOwner();
+        (unique TupsafeTupleOwner*, int) tuple = (choose ? r : holder.p, 4);
+    }
+}
+
+expect_error("borrowed value") {
+    void tupsafeTupleMixedGlobalDeclaration(bool choose)
+    {
+        tupsafeBorrowedTupleGlobal = new TupsafeTupleOwner();
+        TupsafeTupleOwner* r = new TupsafeTupleOwner();
+        (unique TupsafeTupleOwner*, int) tuple = (choose ? r : tupsafeBorrowedTupleGlobal, 4);
+    }
+}
+
+expect_error("borrowed value") {
+    void tupsafeTupleMixedParamAssignment(TupsafeTupleOwner* p, bool choose)
+    {
+        TupsafeTupleOwner* r = new TupsafeTupleOwner();
+        (unique TupsafeTupleOwner*, int) tuple = default;
+        tuple = (choose ? r : p, 4);
+    }
+}
+
+expect_error("borrowed value") {
+    void tupsafeTupleMixedFieldAssignment(bool choose)
+    {
+        TupsafeBorrowedTupleHolder holder = default;
+        holder.p = new TupsafeTupleOwner();
+        TupsafeTupleOwner* r = new TupsafeTupleOwner();
+        (unique TupsafeTupleOwner*, int) tuple = default;
+        tuple = (choose ? r : holder.p, 4);
+    }
+}
+
+expect_error("borrowed value") {
+    void tupsafeTupleMixedGlobalAssignment(bool choose)
+    {
+        tupsafeBorrowedTupleGlobal = new TupsafeTupleOwner();
+        TupsafeTupleOwner* r = new TupsafeTupleOwner();
+        (unique TupsafeTupleOwner*, int) tuple = default;
+        tuple = (choose ? r : tupsafeBorrowedTupleGlobal, 4);
+    }
+}
+
+expect_error("borrowed value") {
+    (unique TupsafeTupleOwner*, int) tupsafeTupleMixedParamReturn(
+        TupsafeTupleOwner* p, bool choose)
+    {
+        TupsafeTupleOwner* r = new TupsafeTupleOwner();
+        return (choose ? r : p, 4);
+    }
+}
+
+expect_error("borrowed value") {
+    (unique TupsafeTupleOwner*, int) tupsafeTupleMixedFieldReturn(
+        TupsafeBorrowedTupleHolder holder, bool choose)
+    {
+        TupsafeTupleOwner* r = new TupsafeTupleOwner();
+        return (choose ? r : holder.p, 4);
+    }
+}
+
+expect_error("borrowed value") {
+    (unique TupsafeTupleOwner*, int) tupsafeTupleMixedGlobalReturn(bool choose)
+    {
+        TupsafeTupleOwner* r = new TupsafeTupleOwner();
+        return (choose ? r : tupsafeBorrowedTupleGlobal, 4);
     }
 }

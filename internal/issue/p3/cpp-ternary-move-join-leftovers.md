@@ -21,22 +21,25 @@ move ctor, user dtor; [cpp] struct ruling: no implicit copy), not a plain C++ st
   `h2.t.v = -2000` (its copy throws), `Take2(h2, k ? MkHT() : move h1)` under a C++ catch. CFlat evaluates the join
   (k=1: builds `MkHT()`, CntA c=3 d=4; k=0: moves `h1`, mv=1) before copying `h2`; clang copies `h2` first, throws,
   never evaluates arg 2 (c=2 d=3, mv=0). Root cause: by-value argument materialization runs after later arguments.
-- Const leaf across a nested prvalue join: `const cppbv.TernaryCnt* pc = &h2; k ? move h1 : (k ? *pc : move h3);`
-  k=1 copies `h1` (cp=1, h1=21); clang moves it (mv=1, h1=-1): the const leaf makes only the INNER join const, the
-  outer converts the xvalue to the const prvalue by the move ctor. k=0 matches. Same on master. Root cause:
-  JoinMoveLeafConst climbs to the outermost join and reads every leaf.
-- [cpp] struct mixed return refused: `LU f(bool k) { LU a = LU(7); return k ? move a : LU(5); }` is refused ("the
-  '?:' arms handle ownership differently"); with `a` a by-value parameter it is refused as a deleted copy. clang
-  (class as declared) moves `a` / builds `LU(5)` in the return slot. Same on master. Root cause not investigated.
 - Source reads after a join stay as master: imported classes allow `a.v` after `z = k ? move a : b` (frozen T263/T288
   legs read it, clang allows it); a lowered host refuses it like a direct move.
 - Const by-value parameter (`void f(const rv.C a)`): CFlat keeps no const on by-value params, so `z = k ? move a :
   move b` moves `a`; clang copies. Needs const carried on parameter signatures.
-- Discarded join with NO move leaf, an unmoved place arm and a prvalue arm: `k ? x : rv.C(9);` / `k ? *px : rv.C(9);`
-  (also as a for-increment) k=1 makes no copy; clang copies into a temp (cp=1, +1 dtor). Same on master.
-  armMoveLeaves returns 2|2, so discardedPrvalueJoin stays false (MainListener_Conditional.cpp ~3285). TERNREST review.
 - `_ = move w.lu` on a [cpp] struct FIELD (as for a [cpp] local) destroys in place, no move ctor (item.v 0); clang moves
   into a temp. movedCxxPlace excludes IsCppStructName on purpose (CFlat release design). Same on master.
+- Discarded `k ? x : cppbv.ternaryGetRvalue()` with a `T&&` call result, `k=false`: clang moves from the
+  referent (value -1, ct/cp/mv/dt=1/0/1/2); master and TERNLEFT3 round 2 leave it intact (3, 1/0/0/1).
+  The `k=true` copy case is fixed by round 2 (leg 99810). The sameDirectClassType category now admits the
+  reference join, but the selected rvalue-reference call is not materialized as a move in the discard path.
+  Fix direction: move the selected T&& referent into the discarded join temporary while preserving the
+  lvalue arm's copy.
+
+- TERNLEFT3 review 2 (2026-11-22, same on master): a join used as a CONDITION operand with its own direct const leaf,
+  `(k ? *pc : move h1).v > 0 ? ... : ...` at k=0, moves h1; clang copies it.
+- Same review: a discarded NESTED join of places next to a prvalue, `k ? mk(9) : (j ? *getp(&x) : px[idx()]);`,
+  makes no copy of the selected place; clang copies it (sameDirectClassType excludes nested arms on purpose).
+- Same review: CFlat refuses two joins clang accepts: `k ? px : gpref()` (`T*` against a `T*&` call) and
+  `k ? grv() : mk(9)` (a `T&&` call against a prvalue, "incompatible types 'pointer' and 'rv.T'").
 
 ## Out of scope here (unchanged, not re-measured)
 - By-value first-argument unwind leak (`take2T` with the FIRST argument's copy throwing), master the same.

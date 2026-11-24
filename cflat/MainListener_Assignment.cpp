@@ -417,6 +417,12 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
             }
             break;
         }
+        // A row `m[1]` of a multi-dimensional array passed whole is the one-dimensional array it
+        // is (`T[2]`), so parameter matching decays it like a named fixed array.
+        if (directCallArgument && result.TypeAndValue.ConstArraySize == 0
+            && !result.TypeAndValue.ConstInnerDimensions.empty()
+            && llvm::isa_and_nonnull<llvm::ArrayType>(result.BaseType))
+            result.TypeAndValue = LLVMBackend::RowAsFixedArray(result.TypeAndValue);
         const bool lenderSink = declarationInitializer || use == ResultUse::ReturnOperand
             || (HasAssignmentOperator(ctx) && IsSimpleAssignmentExpression(ctx));
         if (!result.CxxClosureLenders.empty() && !lenderSink)
@@ -766,8 +772,13 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFla
                 if (result.Primary)
                 {
                     result.BaseType = result.Primary->getType();
+                    const bool voidCompositeJoin = (inCallArgument_ || inCxxCallArgument_)
+                        && joinShape.hasSourceType
+                        && joinShape.sourceType.Pointer
+                        && joinShape.sourceType.TypeName == "void"
+                        && joinShape.sourceType.ValuePointerDepth() == 1;
                     if (joinShape.value == result.Primary && joinShape.hasSourceType
-                        && result.TypeAndValue.TypeName.empty())
+                        && (result.TypeAndValue.TypeName.empty() || voidCompositeJoin))
                         result.TypeAndValue = joinShape.sourceType;
                     if (std::string enumKey = compilerLLVM->ResolveEnumTypeName(tv.sourceTypeName);
                         !enumKey.empty() && compilerLLVM->importedEnumTypes_.count(enumKey) != 0)
@@ -965,12 +976,41 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamedBody(CFla
                         result.TypeAndValue.TypeName = inferred.TypeName;
                         result.TypeAndValue.Pointer = inferred.Pointer;
                         result.TypeAndValue.IsInterface = inferred.IsInterface;
+                        // Both arms proved this class at one depth: keep it, so a `D*` join never
+                        // ranks as a viable `D**` overload argument.
+                        if (joinShape.value == result.Primary && inferred.Pointer
+                            && joinShape.joinClassPointeeDepth >= 1 && result.TypeAndValue.PointerDepth == 0
+                            && compilerLLVM->ResolveTypeAlias(inferred.TypeName) == joinShape.joinClassPointee)
+                        {
+                            result.TypeAndValue.PointerDepth = joinShape.joinClassPointeeDepth;
+                            result.TypeAndValue.ElemPointer = joinShape.joinClassPointeeDepth > 1;
+                        }
                     }
                 }
-                result.TypeAndValue.SetPointeeConstBit(joinShape.value == result.Primary
-                    && joinShape.cxxPointeeConst && result.TypeAndValue.Pointer);
                 if (joinShape.value == result.Primary && joinShape.cxxSpelledCvrQualifier)
                     result.TypeAndValue.CxxSpelledCvrQualifier = true;
+            }
+            if (result.Primary != nullptr && joinShape.value == result.Primary
+                && joinShape.cxxPointeeConstMask != 0)
+            {
+                int pointerDepth = result.TypeAndValue.Pointer
+                    ? result.TypeAndValue.ValuePointerDepth() : 0;
+                if (pointerDepth == 0 && declExpectedType.Pointer)
+                    pointerDepth = declExpectedType.ValuePointerDepth();
+                if (pointerDepth == 0 && joinShape.hasSourceType)
+                    pointerDepth = joinShape.sourceType.ValuePointerDepth();
+                if (pointerDepth == 0) pointerDepth = joinShape.pointerDepth;
+                const uint32_t pointeeBits = pointerDepth > 0
+                    ? LLVMBackend::TypeAndValue::ConstBitsBelow(pointerDepth)
+                    : joinShape.cxxPointeeConstMask;
+                int sourceDepth = joinShape.pointerDepth;
+                if (sourceDepth == 0 && joinShape.hasSourceType && joinShape.sourceType.Pointer)
+                    sourceDepth = joinShape.sourceType.ValuePointerDepth();
+                if (sourceDepth == 0) sourceDepth = pointerDepth;
+                const uint32_t rebasedMask = LLVMBackend::TypeAndValue::RebasePointeeConstMask(
+                    joinShape.cxxPointeeConstMask, sourceDepth, pointerDepth);
+                result.TypeAndValue.ConstMask = (result.TypeAndValue.ConstMask & ~pointeeBits)
+                    | rebasedMask;
             }
             if (result.Primary != nullptr && compilerLLVM->IsTempFieldValue(result.Primary))
             {

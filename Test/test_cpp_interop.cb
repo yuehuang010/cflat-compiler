@@ -261,6 +261,7 @@ import cpp {"library/cpp_t497_compound.hpp", "library/t414_fnmove.hpp", "library
 import "library/cpp_t103_nullctor_c.h";
 import cpp {"library/cpp_t103_nullctor.hpp", "library/cpp_t110_varlink.hpp", "library/cpp_interop_t74.h", "library/cpp_dtorord.hpp", "library/t70_xvalue_overloads.h", "library/cpp_t105_conversion_operators.hpp", "library/cpp_ucv_user_conversions.hpp", "library/cpp_t97_fieldctor.h", "library/cpp_t68_intptr.hpp", "library/cpp_t62_static_auto.hpp", "library/cpp_t93_static_init.hpp", "library/cpp_t226_static_init.hpp", "library/cpp_u8_literal.hpp", "library/cpp_t43_char_types.hpp", "library/cpp_immovable.hpp", "library/cpp_t89_char_pointer.hpp", "library/cpp_t102_assign_routes.hpp", "library/cpp_t43_ref_ops.hpp", "library/cpp_mix15_ref_result.hpp", "library/cpp_t85_pointee.hpp", "library/cpp_t94_anon_typedef.hpp", "library/cpp_t95_deref.hpp", "library/t38_offsetof.hpp"};
 import cpp "library/cpp_interop_scoped_enum_collide.h";
+import cpp "library/cppcopy5_deleted_trivial.h";
 import cpp {"library/t20_abi_records.hpp", "library/cpp_interop_cwrapper_macros.hpp", "functional", "compare"};
 
 struct TSpaceshipWeakOuter
@@ -282,6 +283,9 @@ import cpp {"library/t25_csurface.hpp", "library/cpp_t14_template_functor.hpp", 
 import cpp "library/cpp_interop_demand_fail.h";
 import cpp {"library/cpp_interop_anon.h", "library/cpp_interop_explicit.h", "library/cpp_t496_ctorf2i.hpp", "library/cpp_t253_brace_move.hpp", "library/cpp_t261_named_unwind.hpp", "library/cpp_t470_braceunwind.hpp", "library/cpp_interop_refgate.h"};
 import cpp "library/cpp_joinarg.h";
+import cpp "library/cpp_const_join.hpp";
+import cpp "library/cpp_const_join_nested.hpp";
+import cpp "library/cpp_ovdepth.h";
 import cpp "library/cpp_interop_basic.cpp";
 import cpp {"library/cpp_interop_member_shadow.h", "library/cpp_interop_twin.h", "library/cpp_t24_argconv.hpp", "library/cpp_t35_ownerexpr.hpp", "library/cpp_t42_convref.hpp", "library/cpp_t48_nullptr.hpp", "library/cpp_t52_refnull.hpp", "library/cpp_t111_nullptr_t.hpp", "library/cpp_t98_macro_constant.hpp", "library/cpp_t98_macro_ref.hpp", "library/cpp_t28_fwdref.hpp", "library/cpp_t525_fnwrap_r3.hpp", "library/t84_conversion.hpp", "library/cpp_t27_ptrdiff.hpp", "library/cpp_interop_lastuse.h", "library/cpp_interop_refdef.hpp"};
 import cpp "library/cpp_interop_demand_fail.h";
@@ -4707,6 +4711,12 @@ int DefTmpCxxEarlierUnique(cppdefcls.Trace first,
 }
 int DefTmpCxxBrace(cppdefcls.Implicit d = {DefTmpCxxMk(7).value}) { return d.value; }
 int DefTmpCxxCallsite(cppdefcls.Trace d = cppdefcls.Trace(DefTmpCxxMk(6).value)) { return d.value; }
+struct DefTmpCxxHolder { cppdefcls.Trace item = default; };
+DefTmpCxxHolder DefTmpCxxMakeHolder() { return default; }
+int DefTmpCxxHolderValue(DefTmpCxxHolder h = DefTmpCxxMakeHolder())
+{
+    return h.item.value + 7;
+}
 
 interface IOvlRound1DerivedPointer
 {
@@ -6074,8 +6084,14 @@ int arrDepthTakeF(PtrSafeF* p) { return p->value; }
 JaD[2][2] jaGRows = default;
 JaB* jaRowRet() { return jaGRows[1]; }
 int jaCfTakeB(JaB* p) { return p->b; }
+int jaCfOv(JaB* p) { return 1; }
+int jaCfOv(JaD* p) { return 2; }
 interface IJaTake { int m(JaB* p); };
 class JaTakeImpl : IJaTake { int k = 0; int m(JaB* p) { return p->b; } };
+int ovdCf(OvD** p) { return 1; }
+int ovdCf(OvB* p) { return p->b; }
+interface IOvd { int m(OvD** p); int m(OvB* p); };
+class OvdImpl : IOvd { int k = 0; int m(OvD** p) { return 1; } int m(OvB* p) { return p->b; } };
 interface IConvPtr { int m(ConvPtrR r); int n(ConvPtrRN r); };
 class ConvPtrImpl : IConvPtr
 {
@@ -6148,6 +6164,25 @@ int Cppcopy3TakeEcm(cppcopy.ExplCopyMove b) { return b.v; }
 // CPPCOPY4: a holder of a move-only class fills a queue / dictionary (its copy() stays unused),
 // a forwarded parameter moves at its last use, and `return p;` of a deleted-copy class moves.
 struct Cppcopy4UpHost { std.unique_ptr<int> p = default; int z = 0; };
+// CPPCOPY5: generic sinks still accept last-use moves of a trivial deleted-copy field holder.
+struct Cppcopy5Holder { cppcopy5.A f = default; int z = 0; };
+// A helper copying T, called only from an uncalled method, never runs: declaring G<T> is legal.
+int Cppcopy5TakeHolder(Cppcopy5Holder v) { return v.z; }
+// `inner` only called (also as `(inner)()`) before the forward; same-named block / for-init
+// locals and lambda params are other bindings.
+int Cppcopy5NameLocal(Cppcopy5Holder v)
+{
+    Lambda<int()> inner = () => { return v.z; };
+    int before = (inner)();
+    before = before + inner() - inner();
+    for (int inner = 0; inner < 1; inner++) { before = before + inner; }
+    int r = Cppcopy5TakeHolder(v);
+    { int inner = 0; r = r + inner; }
+    for (int inner = 0; inner < 1; inner++) { r = r + inner; }
+    Lambda<int(int)> other = (int inner) => { return inner; };
+    return before + r + other(0);
+}
+struct Cppcopy5Gen<T> { int bad() { T v = default; T w = v.copy(); return w.z; } int unused() { return bad(); } };
 int Cppcopy4Fwd(queue<Cppcopy4UpHost>* q, Cppcopy4UpHost h, int k)
 {
     if (k == 0) { q.enqueue(h); return 1; }
@@ -6173,6 +6208,11 @@ class EtargAmbGImpl : IEtargAmbG
     int take(cppi_etarg.BG b) { return b.how * 10 + b.v; }
     int takeBY(cppi_etarg.BY b) { return b.v; }
 };
+
+void* cjDepth2Return(bool condition, void* mutableValue)
+{
+    return condition ? cj.getcpp_() : mutableValue;
+}
 
 extern int main()
 {
@@ -12447,6 +12487,10 @@ extern int main()
     defTmpCxxValue = DefTmpCxxCallsite();
     if (defTmpCxxValue != 6 || defTmpCxxLive != 0
         || cppdefcls.live_count() != defTmpCxxBase) return 86194;
+    int defTmpCxxHolderBase = cppdefcls.live_count();
+    defTmpCxxValue = DefTmpCxxHolderValue();
+    if (defTmpCxxValue != 7 || cppdefcls.live_count() != defTmpCxxHolderBase)
+        return 86195;
 
     // CDEFARG: an omitted by-value C++ class default is built in its parameter slot after the
     // explicit arguments (prvalue elided, lvalue copied, move moved) and lives to the end of the
@@ -19637,6 +19681,166 @@ extern int main()
     IJaTake jaTake = &jaTakeImpl;
     if (jaTake.m(jaC ? jaP1 : jaP2) != 2 || jaTake.m(jaPn ?? jaP1) != 2 || jaTake.m(jaP1) != 2
         || jaTake.m(&jaD1) != 2 || jaTake.m(jaRows[1]) != 2)                   return 9978;
+    // OVDEPTH: an unnamed `&object` / ?: / ?? join argument of depth 1 never binds a `T**`
+    // parameter; clang picks the `T*` / base `B*` overload. Pre-fix each picked the T** one (1).
+    bool ovC = true;
+    OvD ovD1 = default;
+    OvD ovD2 = default;
+    OvD* ovP1 = &ovD1;
+    OvD* ovP2 = &ovD2;
+    OvD* ovPn = nullptr;
+    int ovI = 5;
+    int* ovIp = &ovI;
+    OvdImpl ovdImpl = default;
+    IOvd ovdIf = &ovdImpl;
+    if (ovd_ov(&ovD1) != 2 || ovd_ov(ovC ? ovP1 : ovP2) != 2 || ovd_ov(ovPn ?? ovP1) != 2) return 9990;
+    if (ovd_ovA(&ovD1) != 11 || ovd_ovD(&ovD1) != 3 || ovd_ovD(ovC ? ovP1 : ovP2) != 3
+        || ovd_ip(&ovI) != 5)                                                  return 9991;
+    if (ovdCf(&ovD1) != 2 || ovdCf(ovC ? ovP1 : ovP2) != 2 || ovdCf(ovPn ?? ovP1) != 2) return 9992;
+    if (ovdIf.m(&ovD1) != 2 || ovdIf.m(ovC ? ovP1 : ovP2) != 2)               return 9993;
+    // OVDEPTH ACCEPT SET (passes pre-fix too): named depth-1 and real depth-2 arguments.
+    if (ovd_ov(ovP1) != 2 || ovd_ov(&ovP1) != 1 || ovd_ovD(&ovP1) != 1 || ovd_ip(&ovIp) != 1
+        || ovdCf(&ovP1) != 1 || ovdCf(ovP1) != 2 || ovdIf.m(&ovP1) != 1)     return 9994;
+    // OVDEPTH: C++ constructor viability. Pre-fix `OvChoice(&ovD1)` picked OvChoice(OvD**) (1).
+    OvChoice ovCh1 = OvChoice(&ovD1);
+    OvChoice ovCh2 = OvChoice(&ovP1);
+    OvChoice ovCh3 = OvChoice(ovP1);
+    if (ovCh1.v != 2 || ovCh2.v != 1 || ovCh3.v != 2)                         return 9995;
+    // JOINARG2: a C++ class pointer / void* join into a void* destination is void* (clang).
+    // Pre-fix every form was refused ("cannot join 'JaD*' and 'void*'").
+    void* jaVp = &jaD2;
+    void* jaVq = jaC ? jaP1 : jaVp;
+    void* jaVr = nullptr;
+    jaVr = jaC ? jaVp : jaP1;
+    if (ja_take_void(jaC ? jaP1 : jaVp) != 4 || ja_take_void(jaPn ?? jaVp) != 4
+        || jaVq != (void*)jaP1 || jaVr != jaVp)                                return 9979;
+    // JOINARG2: a C++ reference arm joined with a pointer arm in a call argument keeps the arms'
+    // composite class. Pre-fix it took the FIRST candidate's parameter class (each picked 1).
+    if (ja_ov4(jaC ? ja_ref_d() : jaP1) != 2 || ja_ov4(jaC ? jaP1 : ja_ref_d()) != 2
+        || jaCfOv(jaC ? ja_ref_d() : jaP1) != 2)                              return 9980;
+    // ACCEPT SET (passes pre-fix too): the join still converts to a base parameter with the
+    // JaB offset, a JaB& arm included (the composite is JaB*).
+    if (ja_take_b(jaC ? ja_ref_d() : jaP1) != 2 || jaCfTakeB(jaC ? ja_ref_d() : jaP1) != 2
+        || ja_take_b(jaC ? ja_ref_b() : jaP1) != 2 || ja_take_b(!jaC ? ja_ref_b() : jaP1) != 2
+        || jaCfTakeB(!jaC ? ja_ref_b() : jaP1) != 2)                          return 9981;
+    // CONSTJOIN accept-set: mutable-only arms keep their pointer values in every join consumer.
+    bool cjCond = true;
+    void* cjA = cj.getm_();
+    void* cjB = cj.getm_alt();
+    void* cjJoin = cjCond ? cjA : cjB;
+    if (cjJoin != cjA)                                                        return 2230;
+    cjJoin = !cjCond ? cjA : cjB;
+    if (cjJoin != cjB)                                                        return 2231;
+    if (cj.take_void(cjCond ? cjA : cjB) != 31
+        || cj.take_void(!cjCond ? cjA : cjB) != 32)                          return 2232;
+    int* cjRawA = cj.getm_();
+    void* cjRawJoin = cjCond ? cjRawA : cjB;
+    if (cjRawJoin != cjRawA)                                                  return 2241;
+    cjRawJoin = cjB;
+    cjRawJoin = !cjCond ? cjRawA : cjB;
+    if (cjRawJoin != cjB)                                                     return 2242;
+    if (cj.take_void(cjCond ? cjRawA : cjB) != 31
+        || cj.take_void(!cjCond ? cjRawA : cjB) != 32)                       return 2243;
+    cj.CS cjFirst = cj.CS(cjCond ? cjA : cjB);
+    cj.CS cjSecond = cj.CS(!cjCond ? cjA : cjB);
+    if (cjFirst.value != 41 || cjSecond.value != 42)                         return 2233;
+    int* cjIntA = cj.getm_();
+    int* cjIntB = cj.getm_alt();
+    cj.CS cjMixedCtorA = cj.CS(cjCond ? cjIntA : cjB);
+    cj.CS cjMixedCtorB = cj.CS(!cjCond ? cjIntA : cjB);
+    if (cjMixedCtorA.value != 41 || cjMixedCtorB.value != 42)                 return 2246;
+    int* cjIntJoin = cjCond ? cjIntA : cjIntB;
+    if (cjIntJoin != cjIntA)                                                  return 2234;
+    int* cjNullInt = nullptr;
+    int* cjIntFallback = cjNullInt ?? cjIntB;
+    if (cjIntFallback != cjIntB)                                               return 2235;
+    const int* cjConstIntFallback = cjNullInt ?? cj.getc_();
+    if (cjConstIntFallback != cj.getc_())                                     return 2244;
+    int* cjIntExisting = cjIntA;
+    int* cjIntPreferred = cjIntExisting ?? cjIntB;
+    if (cjIntPreferred != cjIntA)                                              return 2238;
+    void* cjNullVoid = nullptr;
+    void* cjVoidFallback = cjNullVoid ?? cjB;
+    if (cjVoidFallback != cjB)                                                 return 2236;
+    const void* cjConstVoidFallback = cjNullVoid ?? cj.getc_();
+    if (cjConstVoidFallback != cj.getc_())                                    return 2245;
+    const void* cjConstVoid = cjCond ? cj.getc_() : cjA;
+    const int* cjConstInt = cjCond ? cj.getc_() : cjIntA;
+    if (cjConstVoid != cj.getc_() || cjConstInt != cj.getc_())                return 2237;
+    // A depth-2 const mask rebases to the mutable pointer object passed as void*.
+    bool cjDepth2Cond = true;
+    void* cjDepth2Mutable = cj.getm_();
+    void* cjDepth2OrigMutable = cjDepth2Mutable;
+    void* cjDepth2Store = cjDepth2Cond ? cj.getcpp_() : cjDepth2Mutable;
+    if (!cj.is_cpp(cjDepth2Store))                                            return 2247;
+    void* cjDepth2Null = nullptr;
+    void* cjDepth2Fallback = cjDepth2Null ?? cj.getcpp_();
+    if (!cj.is_cpp(cjDepth2Fallback))                                         return 2248;
+    if (cj.take_void(cjDepth2Cond ? cj.getcpp_() : cjDepth2Mutable) != 39)   return 2249;
+    if (!cj.is_cpp(cjDepth2Return(cjDepth2Cond, cjDepth2Mutable)))            return 2250;
+    cjDepth2Mutable = cjDepth2Cond ? cj.getcpp_() : cjDepth2Mutable;
+    if (!cj.is_cpp(cjDepth2Mutable))                                          return 2251;
+    if (cj.pick_void(cjDepth2Store) != 1)                                     return 2252;
+    void* cjDepth2Reverse = !cjDepth2Cond ? cjDepth2OrigMutable : cj.getcpp_();
+    if (!cj.is_cpp(cjDepth2Reverse))                                          return 2253;
+    // A depth-1 const join has the C++ composite type const void* in nested and call contexts.
+    bool cjNestedOuter = true;
+    bool cjNestedInner = true;
+    const void* cjNestedConstVoid = cjNestedOuter
+        ? (cjNestedInner ? cj.getc_() : cjDepth2Mutable) : cjDepth2Mutable;
+    if (!cj.is_c(cjNestedConstVoid))                                          return 2254;
+    if (cj.pick_void(cjNestedInner ? cj.getc_() : cjDepth2Mutable) != 2)      return 2255;
+    void* cjNestedMutable = cj.getm_();
+    if (cj.pick_void(cjNestedOuter
+            ? (cjNestedInner ? cj.getc_() : cjNestedMutable) : cjNestedMutable) != 2) return 2256;
+    bool cjNestedReverseOuter = false;
+    bool cjNestedReverseInner = false;
+    if (cj.pick_void(cjNestedReverseOuter
+            ? cjNestedMutable : (cjNestedReverseInner ? cjNestedMutable : cj.getc_())) != 2) return 2257;
+    if (cj.pick_void(cjNestedOuter
+            ? (cjNestedInner ? cj.getc_() : cjNestedMutable)
+            : (cjNestedInner ? cjNestedMutable : cj.getc_())) != 2) return 2258;
+    cjnest.Method cjNestedMethod = default;
+    if (cjNestedMethod.pick(cjNestedOuter
+            ? (cjNestedInner ? cj.getc_() : cjNestedMutable) : cjNestedMutable) != 2) return 2259;
+    cjnest.Ctor cjNestedConstructed = cjnest.Ctor(cjNestedOuter
+        ? (cjNestedInner ? cj.getc_() : cjNestedMutable) : cjNestedMutable);
+    if (cjNestedConstructed.value != 2)                                       return 2260;
+    // OVDEPTH2: an imported function pointer taking a reference to a pointer. `&ovD1` binds a
+    // `T* const&` / `T*&&` temporary, `&ovP1` is the slot. Pre-fix the value forms read garbage (27, 37, 47, 57).
+    if (ovd_get_fc()(&ovD1) != 23 || ovd_get_fr()(&ovD1) != 33 || ovd_get_fc()(&ovP1) != 23
+        || ovd_get_fr()(&ovP1) != 33)                                          return 9996;
+    if (ovd_get_fl()(&ovP1) != 13 || ovd_get_fpc()(&ovP1) != 43 || ovd_get_fpr()(&ovP1) != 53) return 9997;
+    // OVDEPTH2: nullptr binds a null `T* const&` / `T*&&` temporary (pre-fix: null slot, exit 139), and a
+    // signature taken from the function symbol (`auto f = ovd_fc0`) binds like the getter's.
+    if (ovd_get_fc0()(nullptr) != 91 || ovd_get_fr0()(nullptr) != 92 || ovd_get_fpc0()(nullptr) != 93
+        || ovd_get_fpr0()(nullptr) != 94)                                      return 9998;
+    auto ovSymC = ovd_fc0;
+    auto ovSymR = ovd_fr0;
+    auto ovSymPC = ovd_fpc0;
+    if (ovSymC(&ovD1) != 23 || ovSymC(nullptr) != 91 || ovSymR(&ovD1) != 33 || ovSymR(nullptr) != 92
+        || ovSymPC(&ovP1) != 43)                                               return 9999;
+    // OVDEPTH3: the slot spelling `&pp` binds a reference to `T**` through getter and symbol-derived
+    // pointers, and a symbol-derived `T*&` / `T* const&` takes `&p`; callee writes reach the caller (pre-fix: refused).
+    OvD** ovPP1 = &ovP1;
+    if (ovd_get_fpc()(&ovPP1) != 43 || ovd_get_fpr()(&ovPP1) != 53 || ovd_get_fpl()(&ovPP1) != 63) return 9986;
+    auto ovSymPL = ovd_fpl;
+    auto ovSymPR = ovd_fpr;
+    if (ovSymPC(&ovPP1) != 43 || ovSymPR(&ovPP1) != 53 || ovSymPL(&ovPP1) != 63) return 9987;
+    auto ovSymFl = ovd_fl;
+    auto ovSymFc = ovd_fc;
+    auto ovSymFlw = ovd_flw;
+    if (ovSymFl(&ovP1) != 13 || ovSymFc(&ovP1) != 23)                          return 9988;
+    OvD* ovW1 = &ovD1;
+    OvD* ovW2 = &ovD1;
+    OvD** ovWP = &ovW2;
+    auto ovSymFpw = ovd_fpw;
+    if (ovSymFlw(&ovW1) != 73 || ovW1 != ovd_repl() || ovd_get_fpw()(&ovWP) != 83
+        || ovWP != ovd_repl_pp() || ovSymFpw(&ovWP) != 89 || ovWP != ovd_repl_pp()) return 9989;
+    // OVDEPTH3 r3: a getter `T**&` given a named `T**` binds its slot like the symbol form (pre-fix: exit 139).
+    OvD* ovW3 = &ovD1;
+    OvD** ovNP = &ovW3;
+    if (ovd_get_fpw()(ovNP) != 83 || ovNP != ovd_repl_pp() || ovd_get_fpl()(ovNP) != 69) return 9985;
     // ACCEPT SET (passes pre-fix too): an exact `const int*` overload beats the user-defined
     // conversion, and a spelled constructor argument already converted.
     if (cppexp.conv_ip_exact(&cipK) != 2 || cppexp.conv_ip_exact(cipP) != 2)   return 2272;
@@ -24869,6 +25073,56 @@ extern int main()
         if (tr[0] != -1 || tr[1] != 0 || tr[2] != 0 || tr[3] != 1 || tr[4] != 1 || tr[5] != 4 || tr[6] != 0 || tr[7] != 0) return 99703;
         TrFieldDiscard(5, tr);
         if (tr[0] != -1 || tr[1] != 0 || tr[2] != 0 || tr[3] != 1 || tr[4] != 1 || tr[5] != 4 || tr[6] != 0 || tr[7] != 0) return 99704;
+        // TERNLEFT3 A: only the nested join inherits the const leaf; the outer move still moves.
+        TlConstNested(true, tr);
+        if (tr[0] != 21 || tr[1] != -1 || tr[2] != 23 || tr[3] != 3 || tr[4] != 0 || tr[5] != 1 || tr[6] != 4) return 99789;
+        TlConstNested(false, tr);
+        if (tr[0] != 23 || tr[1] != 21 || tr[2] != 23 || tr[3] != 3 || tr[4] != 1 || tr[5] != 0 || tr[6] != 4) return 99790;
+        // TERNLEFT3 B: lowered [cpp] struct returns share declaration-slot ternary handling.
+        TrLuReturnProbe(true, 0, tr);
+        if (tr[0] != 7 || tr[3] != 1 || tr[4] != 0 || tr[5] != 1 || tr[6] != 2 || tr[7] != 2) return 99791;
+        TrLuReturnProbe(false, 0, tr);
+        if (tr[0] != 5 || tr[3] != 2 || tr[4] != 0 || tr[5] != 0 || tr[6] != 2 || tr[7] != 2) return 99792;
+        TrLuReturnProbe(true, 1, tr);
+        if (tr[0] != 8 || tr[3] != 1 || tr[4] != 0 || tr[5] != 2 || tr[6] != 3 || tr[7] != 3) return 99793;
+        TrLuReturnProbe(false, 1, tr);
+        if (tr[0] != 5 || tr[3] != 2 || tr[4] != 0 || tr[5] != 1 || tr[6] != 3 || tr[7] != 3) return 99794;
+        // TERNLEFT3 C: a place/prvalue join copies only when the place arm is selected.
+        TrDiscardPlacePrvalue(true, 0, tr);
+        if (tr[0] != 21 || tr[3] != 1 || tr[4] != 1 || tr[5] != 0 || tr[6] != 2) return 99795;
+        TrDiscardPlacePrvalue(true, 1, tr);
+        if (tr[0] != 21 || tr[3] != 1 || tr[4] != 1 || tr[5] != 0 || tr[6] != 2) return 99796;
+        TrDiscardPlacePrvalue(true, 2, tr);
+        if (tr[0] != 21 || tr[3] != 1 || tr[4] != 1 || tr[5] != 0 || tr[6] != 2) return 99797;
+        TrDiscardPlacePrvalue(false, 0, tr);
+        if (tr[0] != 21 || tr[3] != 2 || tr[4] != 0 || tr[5] != 0 || tr[6] != 2) return 99798;
+        TrDiscardPlacePrvalue(false, 1, tr);
+        if (tr[0] != 21 || tr[3] != 2 || tr[4] != 0 || tr[5] != 0 || tr[6] != 2) return 99799;
+        TrDiscardPlacePrvalue(false, 2, tr);
+        if (tr[0] != 21 || tr[3] != 2 || tr[4] != 0 || tr[5] != 0 || tr[6] != 2) return 99800;
+        // TERNLEFT3 round 2 A: an outer const leaf copies selected inner move leaves.
+        TlConstFlowsA4(false, false, tr);
+        if (tr[0] != 23 || tr[1] != 21 || tr[2] != 23 || tr[3] != 3 || tr[4] != 1 || tr[5] != 0 || tr[6] != 4) return 99801;
+        TlConstFlowsA4(false, true, tr);
+        if (tr[0] != 21 || tr[1] != 21 || tr[2] != 23 || tr[3] != 3 || tr[4] != 1 || tr[5] != 0 || tr[6] != 4) return 99802;
+        TlConstFlowsA5(false, false, false, tr);
+        if (tr[0] != 24 || tr[1] != 23 || tr[2] != 24 || tr[3] != 4 || tr[4] != 1 || tr[5] != 0 || tr[6] != 5) return 99803;
+        TlConstFlowsA5(false, false, true, tr);
+        if (tr[0] != 23 || tr[1] != 23 || tr[2] != 24 || tr[3] != 4 || tr[4] != 1 || tr[5] != 0 || tr[6] != 5) return 99804;
+        // TERNLEFT3 round 2 C: type-only probing must not execute unselected place calls.
+        TrDiscardSideEffect(false, 0, tr);
+        if (tr[0] != 21 || tr[1] != 1 || tr[3] != 1 || tr[4] != 1 || tr[5] != 0 || tr[6] != 2) return 99805;
+        TrDiscardSideEffect(true, 0, tr);
+        if (tr[0] != 21 || tr[1] != 0 || tr[3] != 2 || tr[4] != 0 || tr[6] != 2) return 99806;
+        TrDiscardSideEffect(false, 1, tr);
+        if (tr[0] != 21 || tr[1] != 1 || tr[3] != 1 || tr[4] != 1 || tr[5] != 0 || tr[6] != 2) return 99807;
+        TrDiscardSideEffect(true, 1, tr);
+        if (tr[0] != 21 || tr[1] != 0 || tr[3] != 2 || tr[4] != 0 || tr[6] != 2) return 99808;
+        // TERNLEFT3 round 2 C: T& and the T&& lvalue arm copy as clang does.
+        TrDiscardReferencePlace(false, 0, tr);
+        if (tr[0] != 21 || tr[1] != 33 || tr[3] != 1 || tr[4] != 1 || tr[5] != 0 || tr[6] != 2) return 99809;
+        TrDiscardReferencePlace(true, 1, tr);
+        if (tr[0] != 21 || tr[1] != 33 || tr[3] != 1 || tr[4] != 1 || tr[5] != 0 || tr[6] != 2) return 99810;
         // OBJOIN: an imported-class prvalue arm beside an unmoved place arm copies the place into
         // the prvalue join (was refused as a mixed-ownership join). clang++ -std=c++20 value + sig.
         if (ObjoinAddDefaultPlace(false) != 23 || cppobjoin.Obj.sig() != 110004 || cppobjoin.Obj.live != 0) return 99705;
@@ -27106,6 +27360,58 @@ extern int main()
         dhIns.z = 3;
         dhTree.insert(3, dhIns);
         if (dhArray.get(0).z != 4 || dhTree.count() != 3) return 27488;
+    }
+    {
+        // CPPCOPY5 accept-set: declarations stay lazy and last-use or explicit moves enter generic sinks.
+        list<Cppcopy5Holder> declList = default;
+        queue<Cppcopy5Holder> declQueue = default;
+        dictionary<int, Cppcopy5Holder> declDict = default;
+        if (declList.count() != 0 || declQueue.count() != 0 || declDict.count() != 0) return 27489;
+
+        list<Cppcopy5Holder> acceptedList = default;
+        Cppcopy5Holder listValue = default;
+        listValue.z = 31;
+        acceptedList.add(listValue);
+        queue<Cppcopy5Holder> acceptedQueue = default;
+        Cppcopy5Holder queueValue = default;
+        queueValue.z = 32;
+        acceptedQueue.enqueue(queueValue);
+        Cppcopy5Holder movedQueueValue = default;
+        movedQueueValue.z = 33;
+        acceptedQueue.enqueue(move movedQueueValue);
+        // btree.set over an existing key stores the value parameter at its last use (a move).
+        btree<int, EtargBDcHolder> overTree = default;
+        EtargBDcHolder overFirst = default;
+        overFirst.z = 5;
+        overTree.set(1, overFirst);
+        EtargBDcHolder overSecond = default;
+        overSecond.z = 6;
+        overTree.set(1, overSecond);
+        Cppcopy5Holder dictValue = default;
+        dictValue.z = 34;
+        declDict.set(1, dictValue);
+        if (overTree.count() != 1 || overTree.get(1).z != 6 || declDict[1].z != 34) return 27492;
+        // A lambda's own by-value parameter at its last use moves; an uncalled copy chain stays silent.
+        Cppcopy5Gen<Cppcopy5Holder> unusedGen = default;
+        int lambdaBias = 0;
+        Lambda<int(Cppcopy5Holder)> takeHolder = (Cppcopy5Holder h) => { Cppcopy5Holder w = h.copy(); return w.z + lambdaBias; };
+        Cppcopy5Holder lambdaArg = default;
+        lambdaArg.z = 7;
+        if (takeHolder(move lambdaArg) != 7) return 27493;
+        // An inner lambda's own parameter of the same name is another binding: h still moves.
+        Lambda<int(Cppcopy5Holder)> shadowHolder = (Cppcopy5Holder h) => {
+            Lambda<int(int)> h2 = (int h) => { return h; };
+            Cppcopy5Holder w = h.copy();
+            return w.z + h2(1);
+        };
+        Cppcopy5Holder shadowArg = default;
+        shadowArg.z = 7;
+        if (shadowHolder(move shadowArg) != 8) return 27494;
+        Cppcopy5Holder nameArg = default;
+        nameArg.z = 7;
+        if (Cppcopy5NameLocal(move nameArg) != 14) return 27495;
+        if (acceptedList[0].z != 31 || acceptedQueue.dequeue().z != 32
+            || acceptedQueue.dequeue().z != 33) return 27490;
     }
     cppf.Flex* flexTail = (cppf.Flex*)malloc((i64)sizeof(cppf.Flex) + 2 * (i64)sizeof(int));
     flexTail->data[0] = 73;
@@ -34206,6 +34512,22 @@ void TlConstJoin(bool k, int shape, int* o)
     o[2] = cppbv.TernaryCnt.copies; o[3] = cppbv.TernaryCnt.moves; o[4] = cppbv.TernaryCnt.dtors;
     o[5] = cppbv.CntA.copies; o[6] = cppbv.CntA.moves; o[7] = cppbv.CntA.dtors;
 }
+void TlConstNested(bool k, int* o)
+{
+    TrZero(o); cppbv.TernaryCnt.reset();
+    int value = 0, h1v = 0, h3v = 0;
+    {
+        cppbv.TernaryCnt h1 = cppbv.TernaryCnt(21);
+        cppbv.TernaryCnt h2 = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt h3 = cppbv.TernaryCnt(23);
+        const cppbv.TernaryCnt* pc = &h2;
+        cppbv.TernaryCnt result = k ? move h1 : (k ? *pc : move h3);
+        value = result.v; h1v = h1.v; h3v = h3.v;
+    }
+    o[0] = value; o[1] = h1v; o[2] = h3v;
+    o[3] = cppbv.TernaryCnt.ctors; o[4] = cppbv.TernaryCnt.copies;
+    o[5] = cppbv.TernaryCnt.moves; o[6] = cppbv.TernaryCnt.dtors;
+}
 // TERNREST helpers (legs 99653-99704): o = [v0, v1, v2, ctors, copies, moves, dtors, lu], counted
 // after the setup. A discarded mixed join (any depth) moves or copies the selected leaf into one
 // temporary; an all-move join names the selected source (clang++ -std=c++20).
@@ -34304,6 +34626,101 @@ void TrCppLu(bool k, int shape, int* o)
     }
     T249ReadCounts(o);
     o[7] = tr_lu_d;
+}
+TrLu TrLuReturnLocalFn(bool k)
+{
+    TrLu a = TrLu(7);
+    return k ? move a : TrLu(5);
+}
+TrLu TrLuReturnParamFn(bool k, TrLu a)
+{
+    return k ? move a : TrLu(5);
+}
+void TrLuReturnProbe(bool k, int byValueParam, int* o)
+{
+    TrZero(o); cppbv.CntA.reset(); tr_lu_d = 0;
+    if (byValueParam == 0)
+    {
+        { TrLu result = TrLuReturnLocalFn(k); o[0] = result.x; }
+    }
+    else
+    {
+        { TrLu input = TrLu(8); TrLu result = TrLuReturnParamFn(k, move input); o[0] = result.x; }
+    }
+    T249ReadCounts(o);
+    o[7] = tr_lu_d;
+}
+void TrDiscardPlacePrvalue(bool k, int shape, int* o)
+{
+    TrZero(o); cppbv.TernaryCnt.reset();
+    {
+        cppbv.TernaryCnt x = cppbv.TernaryCnt(21);
+        cppbv.TernaryCnt* px = &x;
+        if (shape == 0) k ? x : cppbv.TernaryCnt(9);
+        else if (shape == 1) k ? *px : cppbv.TernaryCnt(9);
+        else
+        {
+            int i = 0;
+            for (; i < 1; k ? *px : cppbv.TernaryCnt(9)) i = i + 1;
+        }
+        o[0] = x.v;
+    }
+    o[3] = cppbv.TernaryCnt.ctors; o[4] = cppbv.TernaryCnt.copies;
+    o[5] = cppbv.TernaryCnt.moves; o[6] = cppbv.TernaryCnt.dtors;
+}
+void TlConstFlowsA4(bool k, bool j, int* o)
+{
+    TrZero(o); cppbv.TernaryCnt.reset();
+    {
+        cppbv.TernaryCnt h1 = cppbv.TernaryCnt(21);
+        cppbv.TernaryCnt h2 = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt h3 = cppbv.TernaryCnt(23);
+        const cppbv.TernaryCnt* pc = &h2;
+        cppbv.TernaryCnt r = k ? *pc : (j ? move h1 : move h3);
+        o[0] = r.v; o[1] = h1.v; o[2] = h3.v;
+    }
+    o[3] = cppbv.TernaryCnt.ctors; o[4] = cppbv.TernaryCnt.copies;
+    o[5] = cppbv.TernaryCnt.moves; o[6] = cppbv.TernaryCnt.dtors;
+}
+void TlConstFlowsA5(bool k, bool j, bool m, int* o)
+{
+    TrZero(o); cppbv.TernaryCnt.reset();
+    {
+        cppbv.TernaryCnt h1 = cppbv.TernaryCnt(21);
+        cppbv.TernaryCnt h2 = cppbv.TernaryCnt(22);
+        cppbv.TernaryCnt h3 = cppbv.TernaryCnt(23);
+        cppbv.TernaryCnt h4 = cppbv.TernaryCnt(24);
+        const cppbv.TernaryCnt* pc = &h2;
+        cppbv.TernaryCnt r = k ? move h1 : (j ? *pc : (m ? move h3 : move h4));
+        o[0] = r.v; o[1] = h3.v; o[2] = h4.v;
+    }
+    o[3] = cppbv.TernaryCnt.ctors; o[4] = cppbv.TernaryCnt.copies;
+    o[5] = cppbv.TernaryCnt.moves; o[6] = cppbv.TernaryCnt.dtors;
+}
+void TrDiscardSideEffect(bool k, int shape, int* o)
+{
+    TrZero(o); cppbv.TernaryCnt.reset(); cppbv.resetTernaryPlaceCalls();
+    {
+        cppbv.TernaryCnt x = cppbv.TernaryCnt(21);
+        cppbv.TernaryCnt* px = &x;
+        if (shape == 0) k ? cppbv.TernaryCnt(9) : *cppbv.ternaryGetPlace(px);
+        else k ? cppbv.TernaryCnt(9) : px[cppbv.ternaryPlaceIndex()];
+        o[0] = x.v; o[1] = cppbv.ternaryPlaceCallCount();
+    }
+    o[3] = cppbv.TernaryCnt.ctors; o[4] = cppbv.TernaryCnt.copies;
+    o[5] = cppbv.TernaryCnt.moves; o[6] = cppbv.TernaryCnt.dtors;
+}
+void TrDiscardReferencePlace(bool k, int shape, int* o)
+{
+    TrZero(o); cppbv.setTernaryRefObject(33); cppbv.TernaryCnt.reset();
+    {
+        cppbv.TernaryCnt x = cppbv.TernaryCnt(21);
+        if (shape == 0) k ? cppbv.TernaryCnt(9) : cppbv.ternaryGetLvalue();
+        else k ? x : cppbv.ternaryGetRvalue();
+        o[0] = x.v; o[1] = cppbv.ternaryRefValue();
+    }
+    o[3] = cppbv.TernaryCnt.ctors; o[4] = cppbv.TernaryCnt.copies;
+    o[5] = cppbv.TernaryCnt.moves; o[6] = cppbv.TernaryCnt.dtors;
 }
 // `_ = move <C++ class place>` move-constructs a temporary and destroys it: clang's
 // `{ T t = std::move(p->f); }`. The source stays a valid moved-from object (v = -1).

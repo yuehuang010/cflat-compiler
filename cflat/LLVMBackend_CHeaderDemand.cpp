@@ -3881,6 +3881,44 @@ bool LLVMBackend::IsCxxFunctionTemplateParameterDirectType(const std::string& fu
         return sawCandidate;
 }
 
+bool LLVMBackend::GetUniqueCxxFunctionTemplateVoidPointerParameter(
+        const std::string& functionName, const std::string& ownerType,
+        size_t parameterIndex, size_t arity, TypeAndValue& out) const
+{
+        const std::string resolved = ownerType.empty()
+            ? functionName : ResolveCxxFunctionTemplateName(ownerType, functionName);
+        auto templates = cxxFunctionTemplates_.find(resolved);
+        if (templates == cxxFunctionTemplates_.end()) return false;
+        size_t candidateCount = 0;
+        for (const auto& candidate : templates->second)
+        {
+            const bool kindMatches = ownerType.empty()
+                ? candidate.kind == cflat_cinterop::RawFunctionTemplate::Free
+                    || candidate.kind == cflat_cinterop::RawFunctionTemplate::StaticMember
+                : candidate.kind == cflat_cinterop::RawFunctionTemplate::InstanceMember
+                    || candidate.kind == cflat_cinterop::RawFunctionTemplate::StaticMember;
+            if (!kindMatches || arity < candidate.minArity || arity > candidate.maxArity)
+                continue;
+            size_t index = parameterIndex;
+            if (candidate.hasParameterPack && !candidate.parameterTypes.empty()
+                && index >= candidate.parameterTypes.size() - 1)
+                index = candidate.parameterTypes.size() - 1;
+            if (index >= candidate.parameterTypes.size()) return false;
+            std::string parameterType = candidate.parameterTypes[index];
+            parameterType.erase(std::remove_if(parameterType.begin(), parameterType.end(),
+                [](unsigned char ch) { return std::isspace(ch); }), parameterType.end());
+            if (parameterType.ends_with("const")) parameterType.resize(parameterType.size() - 5);
+            if (parameterType.ends_with("volatile")) parameterType.resize(parameterType.size() - 8);
+            if (parameterType != "void*" || ++candidateCount > 1) return false;
+        }
+        if (candidateCount != 1) return false;
+        out = TypeAndValue{};
+        out.TypeName = "void";
+        out.Pointer = true;
+        out.PointerDepth = 1;
+        return true;
+}
+
 bool LLVMBackend::IsCxxStaticTemplateConstRefParameter(const std::string& qualifiedName,
                                                        size_t parameterIndex, size_t arity,
                                                        const std::string& placeType) const
@@ -4042,6 +4080,41 @@ bool LLVMBackend::GetUniqueCxxConstructorValueParameter(const std::string& typeN
         out = match->params[parameterIndex + 1];
         // A const reference is spelled as a pointer here; the caller reads only its class name.
         return !out.TypeName.empty() && (constRef || !out.Pointer);
+}
+
+bool LLVMBackend::GetUniqueCxxConstructorParameter(const std::string& typeName,
+                                                   size_t parameterIndex,
+                                                   size_t arity,
+                                                   TypeAndValue& out) const
+{
+        const auto* info = GetCxxClassInfoWithConstructors(typeName);
+        if (info == nullptr || info->hasCtorTemplate) return false;
+        const CxxClassInfo::Structor* match = nullptr;
+        for (const auto& ctor : info->constructors)
+        {
+            if (ctor.isDeleted || ctor.access != cflat_cinterop::AccessPublic
+                || ctor.isCopyCtor || ctor.isMoveCtor
+                || ctor.params.size() < arity + 1
+                || parameterIndex + 1 >= ctor.params.size())
+                continue;
+            const size_t parameterCount = ctor.params.size() - 1;
+            bool arityFits = true;
+            for (size_t index = arity; index < parameterCount; ++index)
+                if (index + 1 >= ctor.defaultArgs.size()
+                    || ctor.defaultArgs[index + 1].kind.empty())
+                {
+                    arityFits = false;
+                    break;
+                }
+            if (!arityFits) continue;
+            const auto& parameter = ctor.params[parameterIndex + 1];
+            if (parameter.IsAlias || parameter.IsRvalueRef || parameter.CxxConstRef()) continue;
+            if (match != nullptr) return false;
+            match = &ctor;
+        }
+        if (match == nullptr) return false;
+        out = match->params[parameterIndex + 1];
+        return !out.TypeName.empty();
 }
 
 static bool CxxTemplateHasForwardingReferenceParameter(

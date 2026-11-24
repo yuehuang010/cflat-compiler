@@ -457,6 +457,12 @@
       "f",
       "cppslice.BDelCopy"
     ],
+    "cannotcopystructarg0...opyconstructorisarg3898ecefb4f18cbdf": [
+      "Cppcopy5SA",
+      "a",
+      "cppcopy5.A",
+      "deleted"
+    ],
     "cannotcopystructarg0...siblecopyconstructor945280ed39131130": [
       "Cppcopy2PrivHost",
       "target",
@@ -2333,6 +2339,7 @@
     "cannotcopystructarg0...letedcopyconstructor7e8e0bd9076570e9": "cannot copy struct '{0}' into parameter '{1}' of '{2}': field '{3}' of C++ class '{4}' has a deleted copy constructor",
     "cannotcopystructarg0...letedcopyconstructor80e637e75404901c": "cannot copy struct '{0}' into element {1} of '{2}': field '{3}' of C++ class '{4}' has a deleted copy constructor",
     "cannotcopystructarg0...letedcopyconstructore499d96df5438647": "cannot copy struct '{0}' into the return slot: field '{1}' of C++ class '{2}' has a deleted copy constructor",
+    "cannotcopystructarg0...opyconstructorisarg3898ecefb4f18cbdf": "cannot copy struct '{0}' because field '{1}' contains C++ class '{2}' whose copy constructor is {3}",
     "cannotcopystructarg0...siblecopyconstructor945280ed39131130": "cannot copy struct '{0}' into local '{1}': field '{2}' of C++ class '{3}' has an inaccessible copy constructor",
     "cannotjoinanarrayvie...obotharmsmustshareit3d3e026ed1b69627": "cannot join an array view of '{0}' with an array view of '{1}' in a '?:' - a view indexes by its own element, so both arms must share it",
     "cannotlocatecflatbui...timedirectoryisunsetd6eb6b14f48bb579": "cannot locate cflat_builtins.c: runtime directory is unset.",

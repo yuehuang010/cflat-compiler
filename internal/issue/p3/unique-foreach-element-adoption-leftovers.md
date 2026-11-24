@@ -43,18 +43,6 @@ Open:
 5. Collections other than list<T> / array<T> / fixed arrays (C++ begin/end iterator protocol, other `_ptr`
    containers) get no slot clear (master behaviour). Not reproduced in native CFlat (no CFlat core container has
    begin()); needs a C++ header probe and a ruling on adopting out of a C++-owned container.
-6. Pre-existing, out of scope of the 2026-11-19 fix: `sink2(c ? p : nullptr, p->id)` (move sink first, a later
-   argument reads the element) is 134 on master, 139 after fix/foreachadopt. The shared conditional transfer
-   path nulls the source slot before the later arguments are evaluated, so `p->id` reads null; the owning-local
-   form `unique R* q = ...; sink2(c ? q : nullptr, q->id)` is 139 on master too. Plain `sink2(p, p->id)` runs
-   (d=1 s=101). Repro:
-
-   ```cflat
-   void sink2(move R* q, int id) { if (q != nullptr) sunk = sunk + q->id * 100 + id; }
-   list<unique R*> a = default; a.add(mk(1));
-   for (unique R* p in a) sink2(yes ? p : nullptr, p->id);   // 139: p->id reads the nulled slot
-   ```
-
 RULED 2026-11-18 (maintainer): items 2 and 3 are LEFT AS IS, C++ behaviour. Mutating the iterated container inside
 the loop body (removeAt / add / insert / clear / resize) invalidates the loop binding and is the user's bug, as
 iterator invalidation in C++; no compile-time refusal, no mutator list or attribute, no version counter. Prior art

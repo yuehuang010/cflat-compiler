@@ -85,8 +85,10 @@ static antlr4::tree::TerminalNode* PreviousTerminal(antlr4::tree::ParseTree* nod
 }
 
 bool LLVMBackend::IsImplicitIntegerPointeePointerConversion(
-    const TypeAndValue& from, const TypeAndValue& to, bool includeDepthMismatch) const
+    const TypeAndValue& row, const TypeAndValue& to, bool includeDepthMismatch) const
 {
+    // A multi-dimensional array's row converts as the one-dimensional array it is.
+    const TypeAndValue from = RowAsFixedArray(row);
     // Array-view destinations use their own element-compatibility diagnostic. A view or fixed
     // array source decays only when the destination is an ordinary pointer.
     if (to.IsArrayView) return false;
@@ -216,8 +218,9 @@ bool LLVMBackend::IsImplicitIntegerPointeePointerConversion(
 }
 
 std::string LLVMBackend::ImplicitIntegerPointeeConversionText(
-    const TypeAndValue& from, const TypeAndValue& to) const
+    const TypeAndValue& row, const TypeAndValue& to) const
 {
+    const TypeAndValue from = RowAsFixedArray(row);
     auto decayed = [](const TypeAndValue& value) {
         TypeAndValue result = value;
         const bool fixedArrayObject = result.ConstArraySize > 0 && !result.IsArrayView
@@ -264,6 +267,10 @@ std::string LLVMBackend::ImplicitIntegerPointeeConversionText(
         return result;
     };
     const std::string toType = spell(to);
+    if (from.Pointer && from.ConstArraySize > 0 && !from.ConstInnerDimensions.empty()
+        && !from.IsArrayView)
+        return std::format("cannot convert '{}' to '{}' implicitly: a multi-dimensional array "
+                           "decays to a pointer to its first row", spell(from), toType);
     if (fromDepth != toDepth)
     {
         const std::string fromType = spell(fromFixedArraySource ? from : fromPointer);
@@ -355,7 +362,8 @@ void LLVMBackend::RejectImplicitIntegerPointeePointerConversion(
 void LLVMBackend::RejectImplicitPointeePointerStore(const TypeAndValue& from, const TypeAndValue& to)
 {
     if (from.IsSimd || to.IsSimd) return;
-    if (IsImplicitIntegerPointeePointerConversion(from, to))
+    if (IsImplicitIntegerPointeePointerConversion(from, to)
+        || IsFixedArrayPointerDepthMismatch(RowAsFixedArray(from), to))
         LogError(ImplicitIntegerPointeeConversionText(from, to));
     else if (IsImplicitUnrelatedStructPointeeConversion(from, to))
         LogError(ImplicitIntegerPointeeConversionText(DecayedPointeeSource(from, to), to));
@@ -378,14 +386,36 @@ LLVMBackend::TypeAndValue LLVMBackend::RowAsFixedArray(const TypeAndValue& row)
 {
     // A row of a multi-dimensional array (`arr[1]` of `D[2][2]`) carries its own dimensions as
     // inner ones with no leading size; spell it as the array it is (`D[2]`).
+    // A pointer-element row (`pp[1]` of `int*[2][2]`) records its element depth.
     TypeAndValue value = row;
-    if (value.ConstArraySize == 0 && !value.ConstInnerDimensions.empty() && !value.Pointer
-        && !value.IsArrayView)
+    if (value.ConstArraySize == 0 && !value.ConstInnerDimensions.empty() && !value.IsArrayView
+        && (!value.Pointer || value.PointerDepth > 0 || value.ElemPointer))
     {
         value.ConstArraySize = value.ConstInnerDimensions.front();
         value.ConstInnerDimensions.erase(value.ConstInnerDimensions.begin());
     }
     return value;
+}
+
+bool LLVMBackend::IsFixedArrayPointerDepthMismatch(const TypeAndValue& array,
+                                                    const TypeAndValue& to) const
+{
+    const bool fixedArray = !array.IsArrayView && array.ConstArraySize > 0 && !array.IsSimd
+        && !array.IsInterface && !array.IsInterfacePointer && !array.IsFunctionPointer
+        && (!array.Pointer || array.PointerDepth > 0 || array.ElemPointer);
+    const bool plainPointer = to.Pointer && !to.IsArrayView && !to.IsFunctionPointer && !to.IsSimd
+        && !to.IsInterface && !to.IsInterfacePointer && !to.IsAlias && !to.IsRvalueRef
+        && !to.IsCxxRefToPointer && to.ConstArraySize == 0 && to.ConstInnerDimensions.empty();
+    if (!fixedArray || !plainPointer || array.TypeName.empty() || to.TypeName.empty()
+        || IsCoreUniqueType(ResolveTypeAlias(array.TypeName)))
+        return false;
+    const int toDepth = to.ValuePointerDepth();
+    if (toDepth == 1 && !to.ElemPointer && ResolveTypeAlias(to.TypeName) == "void") return false;
+    // A pointer-element array of arrays decays to a pointer to a row, never to `T**`.
+    if (array.Pointer && !array.ConstInnerDimensions.empty()) return true;
+    // A deeper array into a shallower pointer (`T*[2]` into `T*`) keeps its own depth diagnostic.
+    const int fromDepth = array.Pointer ? array.ElementPointerDepth() + 1 : 1;
+    return fromDepth < toDepth;
 }
 
 LLVMBackend::TypeAndValue LLVMBackend::ArrayDecayedPointer(const TypeAndValue& row)
@@ -1087,6 +1117,7 @@ bool LLVMBackend::UnrelatedPointeePair(const NamedVariable& arg, const FunctionS
     }
     if (IsImplicitIntegerPointeePointerConversion(from, to, /*includeDepthMismatch*/ false))
         return true;
+    if (IsFixedArrayPointerDepthMismatch(from, to)) return true;
     // A `D[2][2]` decays to a row pointer: no other C++ class pointer parameter takes it.
     if (IsCxxMultiDimArrayClassPointerConversion(to, from)) return true;
     // Native callees take the store rule's struct pointee arm; C++ callees its C++ record arms.
@@ -5062,7 +5093,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 }
                 if (result >= 0 && !coreUniqueAddressToRawSlot
                     && !(candidate.IsCxx && IsCxxNullTypedArgument(arg))
-                    && arg.TypeAndValue.PointerDepthRefuses(depthParam))
+                    && arg.ArgumentPointerDepthRefuses(depthParam))
                     result = -1;
 
                 // Constructor offers and conversion operators cannot re-grant a standard
@@ -7364,15 +7395,17 @@ bool LLVMBackend::CxxImplicitObjectViable(int receiverCv, bool receiverRvalue,
 
 std::string LLVMBackend::CxxConstPointerArgumentError(
         size_t argumentIndex, const std::string& argumentName,
-        const std::string& parameterName) const
+        const std::string& parameterName, bool cxxConstSource) const
 {
         const std::string parameter = parameterName.empty()
             ? std::string() : std::format(" '{}'", parameterName);
+        const char* sourceKind = cxxConstSource
+            ? "C++ const pointer argument" : "const pointer argument";
         return std::format(
-            "cannot pass C++ const pointer argument {} ('{}') to mutable C++ pointer "
+            "cannot pass {} {} ('{}') to mutable C++ pointer "
             "parameter{}: its pointer const qualifications are incompatible, so the parameter "
             "could write through read-only storage",
-            argumentIndex, argumentName, parameter);
+            sourceKind, argumentIndex, argumentName, parameter);
 }
 
 bool LLVMBackend::ConvertTupleArgument(NamedVariable& argument, const TypeAndValue& parameter)
@@ -8268,6 +8301,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 for (size_t i = 0; i < declaration.Parameters.size(); ++i)
                 {
                     if (supplied[i]) continue;
+                    if (activeCFlatDefaultArgumentEvaluations.contains(
+                            { declaration.UniqueName, i }))
+                        return false;
                     if (i >= declaration.DefaultArguments.size()
                         || declaration.DefaultArguments[i].kind != "cflat_callsite")
                     {
@@ -8296,6 +8332,33 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 ? cxxArguments : arguments;
             if (usesImplicitReceiver(candidate))
                 candidateArguments.insert(candidateArguments.begin(), *implicitReceiver);
+            if (!activeCFlatDefaultArgumentEvaluations.empty()
+                && !isCFlatDefaultParamWrapper(candidate))
+            {
+                std::vector<std::string> argumentNames;
+                argumentNames.reserve(candidateArguments.size());
+                for (const NamedVariable& argument : candidateArguments)
+                    argumentNames.push_back(argument.TypeAndValue.VariableName);
+                const ArgumentBinding binding = ComputeArgumentPositions(
+                    argumentNames, candidate.Parameters, candidate.Variadic, 0,
+                    &candidate.DefaultArguments);
+                if (binding.Ok)
+                {
+                    std::vector<bool> supplied(candidate.Parameters.size(), false);
+                    for (int64_t position : binding.PosMap)
+                        if (position >= 0 && static_cast<size_t>(position) < supplied.size())
+                            supplied[static_cast<size_t>(position)] = true;
+                    bool reentersDefault = false;
+                    for (size_t i = 0; i < supplied.size(); ++i)
+                        if (!supplied[i] && activeCFlatDefaultArgumentEvaluations.contains(
+                                { candidate.UniqueName, i }))
+                        {
+                            reentersDefault = true;
+                            break;
+                        }
+                    if (reentersDefault) continue;
+                }
+            }
             if (isCFlatDefaultParamWrapper(candidate)
                 && hasCallerEvaluableClassDefault(candidate, candidateArguments))
                 continue;
@@ -8433,7 +8496,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         const std::string sourceName = !arg.CallerName.empty()
                             ? arg.CallerName : arg.TypeAndValue.VariableName;
                         LogError(CxxConstPointerArgumentError(i + 1, sourceName,
-                                                              param.VariableName));
+                            param.VariableName));
                     }
                     if (!param.IsCxxRefToPointer || param.CxxConstRef() || param.IsRvalueRef
                         || param.TypeName != arg.TypeAndValue.TypeName)
@@ -9703,10 +9766,25 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     // Per-shape wording: "data type" is false at the scalar cell the variadic arm
                     // also judges, and a rejection's message must be true where it fires.
                     if (ParameterStoresData(*pi))
-                        msg += std::format("  [{}] parameter {} is a data type ('{}') and the argument is "
-                            "a function-pointer or closure VALUE - code does not convert to a data "
-                            "pointer.\n", SpellFunctionSymbol(*this, c.UniqueName), i,
-                            displayParameterType(*pi));
+                    {
+                        const bool voidPointer = pi->Pointer && pi->ValuePointerDepth() == 1
+                            && !pi->ElemPointer && ResolveTypeAlias(pi->TypeName) == "void";
+                        const bool conditionalJoin = arguments[i].Primary != nullptr
+                            && FindNullCoalesceJoin(arguments[i].Primary) != nullptr
+                            && JoinCarriesCodeValue(arguments[i].Primary,
+                                arguments[i].CastOccurrenceId);
+                        if (voidPointer && conditionalJoin)
+                        {
+                            const std::string spelling = displayParameterType(*pi);
+                            msg += std::format("  [{}] {}\n", SpellFunctionSymbol(*this, c.UniqueName),
+                                DescribeCodeValueIntoData(spelling, "initialize", spelling));
+                        }
+                        else
+                            msg += std::format("  [{}] parameter {} is a data type ('{}') and the argument is "
+                                "a function-pointer or closure VALUE - code does not convert to a data "
+                                "pointer.\n", SpellFunctionSymbol(*this, c.UniqueName), i,
+                                displayParameterType(*pi));
+                    }
                     else
                         msg += std::format("  [{}] parameter {} has type '{}' and the argument is a "
                             "function-pointer or closure VALUE - code does not convert to a "
@@ -9731,7 +9809,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 {
                     const int argumentDepth = arguments[i].TypeAndValue.EffectiveProvenPointerDepth();
                     const int parameterDepth = pi->ProvenPointerDepth();
-                    if (!arguments[i].TypeAndValue.PointerDepthRefuses(*pi)) continue;
+                    if (!arguments[i].ArgumentPointerDepthRefuses(*pi)) continue;
                     const bool tooDeep = argumentDepth > parameterDepth;
                     const bool legacyTooDeep = tooDeep && argumentDepth == 2 && parameterDepth == 1;
                     const bool legacyTooShallow = !tooDeep && argumentDepth == 1 && parameterDepth == 2;
@@ -9960,13 +10038,26 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 value.TypeAndValue.VariableName = candidate.Parameters[i].VariableName;
                 if (def.kind == "cflat_callsite")
                 {
+                    if (activeCFlatDefaultArgumentEvaluations.contains(
+                            { candidate.UniqueName, i }))
+                        return CreateOverloadedFunctionCall(
+                            functionNameIn, inputArguments, forceRoot, displayName,
+                            cxxMemberReceiver, postfixMemberCall, enclosingFunctionName,
+                            allowOperatorAliasReturnStringTemp, operatorReceiverStorage,
+                            implicitReceiver, lexicalAggregateScopes, additionalCandidate,
+                            reportNullPointerTemplateAmbiguity, argumentContexts);
                     value.IsDefaultParamForward = true;
-                    auto hasInlineDefaultExpression = [&]() {
+                    auto hasInlineDefaultInitializer = [&]() {
                         auto contexts = cflatDefaultArgumentContexts.find(candidate.UniqueName);
-                        return contexts != cflatDefaultArgumentContexts.end()
-                            && i < contexts->second.size()
-                            && contexts->second[i].Initializer != nullptr
-                            && contexts->second[i].Initializer->assignmentExpression() != nullptr;
+                        if (contexts == cflatDefaultArgumentContexts.end()
+                            || i >= contexts->second.size()
+                            || contexts->second[i].Initializer == nullptr)
+                            return false;
+                        auto* initializer = contexts->second[i].Initializer;
+                        return initializer->assignmentExpression() != nullptr
+                            || (IsNativeCallSiteDefaultParam(candidate.Parameters[i])
+                                && (initializer->Default() != nullptr
+                                    || initializer->LeftBrace() != nullptr));
                     };
                     bool deferFactory = false;
                     for (size_t argIndex = 0; argIndex < matched.size()
@@ -9986,15 +10077,15 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     if (deferFactory)
                     {
                         value.CallerName = def.value;
-                        value.CxxDefaultInitIndex = hasInlineDefaultExpression() ? -3 : -2;
+                        value.CxxDefaultInitIndex = hasInlineDefaultInitializer() ? -3 : -2;
                     }
                     else
                     {
                         bool evaluatedInline = false;
-                        if (hasInlineDefaultExpression() && cflatDefaultArgumentEvaluator)
+                        if (hasInlineDefaultInitializer() && cflatDefaultArgumentEvaluator)
                         {
                             auto parsed = cflatDefaultArgumentEvaluator(
-                                candidate.UniqueName, i, candidate.Parameters[i]);
+                                candidate.UniqueName, i, candidate.Parameters[i], matched);
                             if (parsed.Primary != nullptr || parsed.Storage != nullptr)
                             {
                                 parsed.IsDefaultParamForward = parsed.IsRvalue || parsed.IsCxxPrvalueTemp;
@@ -10605,8 +10696,14 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     const std::string sourceName = !arg.CallerName.empty()
                         ? arg.CallerName : source.VariableName.empty()
                             ? "<argument>" : source.VariableName;
+                    std::string cxxGlobalName;
+                    const bool cxxConstSource = source.CxxSpelledCvrQualifier
+                        || IsCxxRecord(ResolveTypeAlias(source.TypeName))
+                        || (IsCConstObjectArgument(arg, &cxxGlobalName)
+                            && !cxxGlobalName.empty())
+                        || arg.Storage == nullptr;
                     LogError(CxxConstPointerArgumentError(argIndex + 1, sourceName,
-                                                          param.VariableName));
+                        param.VariableName, cxxConstSource));
                 }
                 else if (CxxDeepClassPointerArgInvalid(candidate, argIndex, arg, param))
                 {
@@ -11854,6 +11951,12 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         if (candidate.Function != nullptr)
             firstCallLocation_.emplace(candidate.Function->getName().str(), FirstCallSite{
                 currentLine, currentColumn, firstCallLocation_.size()});
+        // A caller in an eagerly instantiated generic body is live only when it is reached itself.
+        if (candidate.Function != nullptr && gts.activeInstantiationOrigin.valid
+            && builder->GetInsertBlock() != nullptr && builder->GetInsertBlock()->getParent() != nullptr
+            && (gts.genericStructTemplates.count(gts.activeInstantiationOrigin.templateName) != 0
+                || gts.genericClassTemplates.count(gts.activeInstantiationOrigin.templateName) != 0))
+            genericBodyFunctions_.insert(builder->GetInsertBlock()->getParent());
 
         // The pointer arm holds for a CFlat callee too: overload scoring accepts a derived C++
         // pointer for any public-base parameter, so the argument must arrive adjusted either way.
@@ -12124,7 +12227,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     NamedVariable parsed;
                     if (cflatDefaultArgumentEvaluator)
                         parsed = cflatDefaultArgumentEvaluator(
-                            candidate.UniqueName, i, candidate.Parameters[i]);
+                            candidate.UniqueName, i, candidate.Parameters[i], matched);
                     if (parsed.Primary == nullptr && parsed.Storage == nullptr)
                     {
                         llvm::Value* generated =
@@ -13702,12 +13805,9 @@ bool LLVMBackend::IsCoreUniqueType(const std::string& typeName) const
 
 bool LLVMBackend::IsNativeCallSiteDefaultParam(const TypeAndValue& param) const
 {
-        if (param.IsRvalueRef || param.IsFunctionPointer || param.TypeName.empty()) return false;
-        if (GetEncodedClosureType(param.TypeName) != nullptr) return false;
+        if (param.IsRvalueRef || param.TypeName.empty()) return false;
         if (!param.Pointer && !param.IsAlias && param.IsPrimitive()) return false;
-        // unique<T> is a sink the callee owns; its raw `new` / nullptr default stays in the wrapper.
-        if (!param.Pointer && IsCoreUniqueType(param.TypeName)) return false;
-        return !HasCxxClassMember(param.TypeName) && !IsCxxRecord(param.TypeName);
+        return !IsCxxRecord(param.TypeName);
 }
 
 bool LLVMBackend::TypeCanCarryBorrow(const TypeAndValue& type, int depth) const

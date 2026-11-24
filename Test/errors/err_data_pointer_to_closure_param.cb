@@ -1,5 +1,6 @@
 import "function.cb";
 import "list.cb";
+import cpp "cpp_const_join.hpp";
 
 // A fat `Lambda<>` parameter reached through a VIRTUAL slot widens a named function or a
 // `function<>` value into a {code, null} closure. Under opaque pointers every data pointer has
@@ -1161,6 +1162,7 @@ struct JoinRec { int a = default; int b = default; };
 double joinRo(double x) { return x + 1000.0; }
 double joinR2(double x) { return x + 2000.0; }
 int joinLam(JoinRec* p) { p->a = 11; return p->a; }
+int joinVoidTake(void* p) { return p != nullptr ? 1 : 0; }
 
 // The DECLARATOR, both join spellings. '??' arms are unrecoverable from the IR, so this leg is the
 // one that proves the nullCoalesceJoins_ ledger (not the PHI walk) answers.
@@ -1320,6 +1322,236 @@ expect_error("cannot initialize a function-pointer or closure VALUE into data ty
         void* n = nullptr;
         void* v = c > 0 ? w : n;
         return v == nullptr ? 0 : 1;
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'void*'") {
+    int ternaryIntoVoidFreeCall(int c)
+    {
+        int value = 1; int* pointer = &value;
+        return joinVoidTake(c ? pointer : &joinLam);
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'void*'") {
+    struct FpjHost { int take(void* p) { return p != nullptr ? 1 : 0; } };
+    int ternaryIntoVoidMethod(int c)
+    {
+        int value = 1; int* pointer = &value; FpjHost host = default;
+        return host.take(c ? pointer : &joinLam);
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'void*'") {
+    struct FpjCtor { FpjCtor(void* p) {} };
+    int ternaryIntoVoidCtor(int c)
+    {
+        int value = 1; int* pointer = &value;
+        FpjCtor item = FpjCtor(c ? pointer : &joinLam);
+        return 1;
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'void*'") {
+    struct FpjNewCtor { FpjNewCtor(void* p) {} };
+    int ternaryIntoVoidNew(int c)
+    {
+        int value = 1; int* pointer = &value;
+        FpjNewCtor* item = new FpjNewCtor(c ? pointer : &joinLam);
+        delete item;
+        return 1;
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'void*'") {
+    struct FpjAgg { void* p = default; };
+    int ternaryIntoVoidBrace(int c)
+    {
+        int value = 1; int* pointer = &value;
+        FpjAgg item = { p = c ? pointer : &joinLam };
+        return item.p != nullptr ? 1 : 0;
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'void*'") {
+    int fpjDefault(void* p, int extra = 4) { return p != nullptr ? extra : 0; }
+    int ternaryIntoVoidDefault(int c)
+    {
+        int value = 1; int* pointer = &value;
+        return fpjDefault(c ? pointer : &joinLam);
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'void*'") {
+    int fpjGeneric<T>(T marker, void* p) { return p != nullptr ? (int)marker : 0; }
+    int ternaryIntoVoidGeneric(int c)
+    {
+        int value = 1; int* pointer = &value;
+        return fpjGeneric(7, c ? pointer : &joinLam);
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'void*'") {
+    int nullCoalesceIntoVoidCall()
+    {
+        void* pointer = nullptr;
+        return joinVoidTake(pointer ?? &joinLam);
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'void*'") {
+    struct FpjCoalesceHost { int take(void* p) { return p != nullptr ? 1 : 0; } };
+    int nullCoalesceIntoVoidMethod()
+    {
+        void* pointer = nullptr; FpjCoalesceHost host = default;
+        return host.take(pointer ?? &joinLam);
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'void*'") {
+    struct FpjCoalesceCtor { FpjCoalesceCtor(void* p) {} };
+    int nullCoalesceIntoVoidCtor()
+    {
+        void* pointer = nullptr;
+        FpjCoalesceCtor item = FpjCoalesceCtor(pointer ?? &joinLam);
+        return 1;
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'void*'") {
+    struct FpjCoalesceNew { FpjCoalesceNew(void* p) {} };
+    int nullCoalesceIntoVoidNew()
+    {
+        void* pointer = nullptr;
+        FpjCoalesceNew* item = new FpjCoalesceNew(pointer ?? &joinLam);
+        delete item;
+        return 1;
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'void*'") {
+    struct FpjCoalesceAgg { void* p = default; };
+    int nullCoalesceIntoVoidBrace()
+    {
+        void* pointer = nullptr;
+        FpjCoalesceAgg item = { p = pointer ?? &joinLam };
+        return item.p != nullptr ? 1 : 0;
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'void*'") {
+    int fpjCoalesceDefault(void* p, int extra = 4) { return p != nullptr ? extra : 0; }
+    int nullCoalesceIntoVoidDefault()
+    {
+        void* pointer = nullptr;
+        return fpjCoalesceDefault(pointer ?? &joinLam);
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'void*'") {
+    int fpjCoalesceGeneric<T>(T marker, void* p) { return p != nullptr ? (int)marker : 0; }
+    int nullCoalesceIntoVoidGeneric()
+    {
+        void* pointer = nullptr;
+        return fpjCoalesceGeneric(7, pointer ?? &joinLam);
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'void*'") {
+    int ternaryIntoCppVoidCall(int c)
+    {
+        int value = 1; int* pointer = &value;
+        return cj.take_void(c ? pointer : &joinLam);
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type") {
+    int ternaryIntoCppConstVoidCall(int c)
+    {
+        int value = 1; const int* pointer = &value;
+        return cj.is_c(c ? pointer : &joinLam);
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'void*'") {
+    int ternaryIntoCppVoidMethod(int c)
+    {
+        cj.JoinMethodHost rj = default;
+        return rj.take_void(c ? rj.m() : &joinLam);
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type") {
+    int ternaryIntoCppConstVoidMethod(int c)
+    {
+        cj.JoinMethodHost rj = default;
+        return rj.take_cvoid(c ? rj.c() : &joinLam);
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'void*'") {
+    int ternaryIntoCppCtor(int c)
+    {
+        int value = 1; int* pointer = &value;
+        cj.CS item = cj.CS(c ? pointer : &joinLam);
+        return item.value;
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'void*'") {
+    int ternaryIntoCppNew(int c)
+    {
+        int value = 1; int* pointer = &value;
+        cj.CS* item = new cj.CS(c ? pointer : &joinLam);
+        int result = item.value;
+        delete item;
+        return result;
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'void*'") {
+    int nullCoalesceIntoCppCtor()
+    {
+        void* pointer = nullptr;
+        cj.CS item = cj.CS(pointer ?? &joinLam);
+        return item.value;
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'void*'") {
+    int nullCoalesceIntoCppNew()
+    {
+        void* pointer = nullptr;
+        cj.CS* item = new cj.CS(pointer ?? &joinLam);
+        int value = item.value;
+        delete item;
+        return value;
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'void*'") {
+    int nullCoalesceIntoCppVoidCall()
+    {
+        void* pointer = nullptr;
+        return cj.take_void(pointer ?? &joinLam);
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type 'void*'") {
+    int nullCoalesceIntoCppVoidMethod()
+    {
+        cj.JoinMethodHost rj = default;
+        void* pointer = rj.m();
+        return rj.take_void(pointer ?? &joinLam);
+    }
+}
+
+expect_error("cannot initialize a function-pointer or closure VALUE into data type") {
+    int nullCoalesceIntoCppConstVoidMethod()
+    {
+        cj.JoinMethodHost rj = default;
+        const int* pointer = rj.c();
+        return rj.take_cvoid(pointer ?? &joinLam);
     }
 }
 
@@ -2340,4 +2572,247 @@ expect_error("cannot bind function 'retBindPd' to function-pointer type 'int(int
 
     function<int(int*)> retPointerDepth() { return retBindPd; }
     int retBindPdCall() { function<int(int*)> g = retPointerDepth(); int v = 0; return g(&v); }
+}
+
+// A whole-join cast does not make mixed data/code operands compatible in C++20. The diagnostic
+// points to the arm mismatch and tells the user to cast the code arm itself.
+expect_error("the '?:' arms join a data pointer and a function pointer; cast the function-pointer arm to 'void*'") {
+    int fpjoinR2MixedFn(int x) { return x; }
+    int fpjoinR2MixedTernary()
+    {
+        bool c = true;
+        int i = 3;
+        int* ip = &i;
+        void* v = (void*)(c ? ip : &fpjoinR2MixedFn);
+        return v == nullptr ? 1 : 0;
+    }
+}
+
+expect_error("the '??' arms join a data pointer and a function pointer; cast the function-pointer arm to 'void*'") {
+    int fpjoinR2MixedCoalesceFn(int x) { return x; }
+    int tcvR2Mixed(void* p) { return p == nullptr ? 1 : 0; }
+    int fpjoinR2MixedCoalesce()
+    {
+        int* np = nullptr;
+        function<int(int)> fp = fpjoinR2MixedCoalesceFn;
+        return tcvR2Mixed((void*)(np ?? fp));
+    }
+}
+
+// A whole-join cast cannot make mixed data/code arms compatible in C++20, regardless of the cast
+// target. The advised arm type is the data-pointer type, so the conditional itself is well-typed.
+expect_error("the '?:' arms join a data pointer and a function pointer; cast the function-pointer arm to 'int*'") {
+    int fpjoin2IntTernaryFn(int x) { return x; }
+    int fpjoin2IntTernary()
+    {
+        bool c = true;
+        int value = 3;
+        int* ip = &value;
+        int* q = (int*)(c ? ip : &fpjoin2IntTernaryFn);
+        return q == nullptr ? 1 : 0;
+    }
+}
+
+expect_error("the '?:' arms join a data pointer and a function pointer; cast the function-pointer arm to 'char*'") {
+    int fpjoin2CharTernaryFn(int x) { return x; }
+    int fpjoin2CharTernary()
+    {
+        bool c = true;
+        char value = 'a';
+        char* cp = &value;
+        char* q = (char*)(c ? cp : &fpjoin2CharTernaryFn);
+        return q == nullptr ? 1 : 0;
+    }
+}
+
+expect_error("the '?:' arms join a data pointer and a function pointer; cast the function-pointer arm to 'int*'") {
+    int fpjoin2LongTernaryFn(int x) { return x; }
+    int fpjoin2LongTernary()
+    {
+        bool c = true;
+        int value = 3;
+        int* ip = &value;
+        long q = (long)(c ? ip : &fpjoin2LongTernaryFn);
+        return q == 0 ? 1 : 0;
+    }
+}
+
+expect_error("the '??' arms join a data pointer and a function pointer; cast the function-pointer arm to 'int*'") {
+    int fpjoin2IntCoalesceFn(int x) { return x; }
+    int fpjoin2IntCoalesce()
+    {
+        int* np = nullptr;
+        function<int(int)> fp = fpjoin2IntCoalesceFn;
+        int* q = (int*)(np ?? fp);
+        return q == nullptr ? 1 : 0;
+    }
+}
+
+expect_error("the '??' arms join a data pointer and a function pointer; cast the function-pointer arm to 'char*'") {
+    int fpjoin2CharCoalesceFn(int x) { return x; }
+    int fpjoin2CharCoalesce()
+    {
+        char* np = nullptr;
+        function<int(int)> fp = fpjoin2CharCoalesceFn;
+        char* q = (char*)(np ?? fp);
+        return q == nullptr ? 1 : 0;
+    }
+}
+
+expect_error("the '??' arms join a data pointer and a function pointer; cast the function-pointer arm to 'int*'") {
+    int fpjoin2LongCoalesceFn(int x) { return x; }
+    int fpjoin2LongCoalesce()
+    {
+        int* np = nullptr;
+        function<int(int)> fp = fpjoin2LongCoalesceFn;
+        long q = (long)(np ?? fp);
+        return q == 0 ? 1 : 0;
+    }
+}
+
+expect_error("the '?:' arms join a data pointer and a function pointer; cast the function-pointer arm to 'int*'") {
+    int fpjoin2FnVarFn(int x) { return x; }
+    int fpjoin2FnVarTernary()
+    {
+        bool c = true;
+        int value = 3;
+        int* ip = &value;
+        function<int(int)> fp = fpjoin2FnVarFn;
+        int* q = (int*)(c ? ip : fp);
+        return q == nullptr ? 1 : 0;
+    }
+}
+
+expect_error("the '?:' arms join a data pointer and a function pointer; cast the function-pointer arm to 'int*'") {
+    int fpjoin2ReverseFn(int x) { return x; }
+    int fpjoin2ReverseTernary()
+    {
+        bool c = true;
+        int value = 3;
+        int* ip = &value;
+        int* q = (int*)(c ? &fpjoin2ReverseFn : ip);
+        return q == nullptr ? 1 : 0;
+    }
+}
+
+expect_error("the '?:' arms join a data pointer and a function pointer; cast the function-pointer arm to 'int*'") {
+    int fpjoin2ParenFn(int x) { return x; }
+    int fpjoin2ParenTernary()
+    {
+        bool c = true;
+        int value = 3;
+        int* ip = &value;
+        int* q = (int*)((c ? ip : &fpjoin2ParenFn));
+        return q == nullptr ? 1 : 0;
+    }
+}
+
+expect_error("the '??' arms join a data pointer and a function pointer; cast the function-pointer arm to 'int*'") {
+    int fpjoin2ParenCoalesceFn(int x) { return x; }
+    int fpjoin2ParenCoalesce()
+    {
+        int* np = nullptr;
+        function<int(int)> fp = fpjoin2ParenCoalesceFn;
+        int* q = (int*)((np ?? fp));
+        return q == nullptr ? 1 : 0;
+    }
+}
+
+// Each outer join arm contains the mixed result; the other arm is a data pointer.
+// These pin both ternary arms, both ?? operands, and both inner join spellings.
+expect_error("the '?:' arms join a data pointer and a function pointer; cast the function-pointer arm to 'int*'") {
+    int fpjoin2NestedTernaryFn(int x) { return x; }
+    int fpjoin2NestedTernary()
+    {
+        bool c = true; bool d = false;
+        int value = 3; int* ip = &value;
+        int* q = (int*)(c ? (d ? ip : &fpjoin2NestedTernaryFn) : ip);
+        return q == nullptr ? 1 : 0;
+    }
+}
+
+expect_error("the '?:' arms join a data pointer and a function pointer; cast the function-pointer arm to 'int*'") {
+    int fpjoin2NestedTernaryLongFn(int x) { return x; }
+    int fpjoin2NestedTernaryLong()
+    {
+        bool c = true; bool d = false;
+        int value = 3; int* ip = &value;
+        long q = (long)(c ? (d ? ip : &fpjoin2NestedTernaryLongFn) : ip);
+        return q == 0 ? 1 : 0;
+    }
+}
+
+expect_error("the '?:' arms join a data pointer and a function pointer; cast the function-pointer arm to 'int*'") {
+    int fpjoin2NestedTernaryCoalesceRhsFn(int x) { return x; }
+    int fpjoin2NestedTernaryCoalesceRhs()
+    {
+        bool d = false; int value = 3; int* ip = &value; int* np = nullptr;
+        int* q = (int*)(np ?? (d ? ip : &fpjoin2NestedTernaryCoalesceRhsFn));
+        return q == nullptr ? 1 : 0;
+    }
+}
+
+expect_error("the '?:' arms join a data pointer and a function pointer; cast the function-pointer arm to 'int*'") {
+    int fpjoin2NestedFalseFn(int x) { return x; }
+    int fpjoin2NestedFalse()
+    {
+        bool c = true; bool d = false;
+        int value = 3; int* ip = &value;
+        int* q = (int*)(c ? ip : (d ? ip : &fpjoin2NestedFalseFn));
+        return q == nullptr ? 1 : 0;
+    }
+}
+
+expect_error("the '??' arms join a data pointer and a function pointer; cast the function-pointer arm to 'int*'") {
+    int fpjoin2NestedCoalesceTernaryFn(int x) { return x; }
+    int fpjoin2NestedCoalesceTernary()
+    {
+        bool c = true; int value = 3; int* ip = &value; int* np = nullptr;
+        function<int(int)> fp = fpjoin2NestedCoalesceTernaryFn;
+        int* q = (int*)(c ? (np ?? fp) : ip);
+        return q == nullptr ? 1 : 0;
+    }
+}
+
+expect_error("the '??' arms join a data pointer and a function pointer; cast the function-pointer arm to 'int*'") {
+    int fpjoin2NestedCoalesceRhsFn(int x) { return x; }
+    int fpjoin2NestedCoalesceRhs()
+    {
+        int* outer = nullptr; int* inner = nullptr;
+        function<int(int)> fp = fpjoin2NestedCoalesceRhsFn;
+        int* q = (int*)(outer ?? (inner ?? fp));
+        return q == nullptr ? 1 : 0;
+    }
+}
+
+expect_error("the '??' arms join a data pointer and a function pointer; cast the function-pointer arm to 'int*'") {
+    int fpjoin2NestedCoalesceLhsFn(int x) { return x; }
+    int fpjoin2NestedCoalesceLhs()
+    {
+        int* inner = nullptr; int* outer = nullptr;
+        function<int(int)> fp = fpjoin2NestedCoalesceLhsFn;
+        int* q = (int*)((inner ?? fp) ?? outer);
+        return q == nullptr ? 1 : 0;
+    }
+}
+
+expect_error("the '?:' arms join a data pointer and a function pointer; cast the function-pointer arm to 'int*'") {
+    int fpjoin2NestedTernaryCoalesceLhsFn(int x) { return x; }
+    int fpjoin2NestedTernaryCoalesceLhs()
+    {
+        bool d = false; int value = 3; int* ip = &value;
+        int* q = (int*)((d ? ip : &fpjoin2NestedTernaryCoalesceLhsFn) ?? ip);
+        return q == nullptr ? 1 : 0;
+    }
+}
+
+expect_error("the '??' arms join a data pointer and a function pointer; cast the function-pointer arm to 'int*'") {
+    int fpjoin2NestedCoalesceTernaryFalseFn(int x) { return x; }
+    int fpjoin2NestedCoalesceTernaryFalse()
+    {
+        bool c = true; int value = 3; int* ip = &value; int* np = nullptr;
+        function<int(int)> fp = fpjoin2NestedCoalesceTernaryFalseFn;
+        int* q = (int*)(c ? ip : (np ?? fp));
+        return q == nullptr ? 1 : 0;
+    }
 }

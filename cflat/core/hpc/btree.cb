@@ -514,21 +514,20 @@ struct btree<K, V>
             {
                 btree_node<K, V>* n = _descendSplitting(key);
                 int s = _leafFind(n, key);
-                if (s >= 0)
-                {
-                    // Release the old value, then store the new one (same arms as _leafInsertNew -
-                    // see there for why a value type needs an explicit `.copy()` here).
-                    _ = move n->values[s];
-                    if const (is_unique(V))         n->values[s] = move value;
-                    else if const (is_pointer(V))   n->values[s] = value;
-                    else if const (is_primitive(V)) n->values[s] = value;
-                    else                             n->values[s] = value.copy();
-                }
-                else
+                // Insert path first and return, so `value.copy()` below is value's last use.
+                if (s < 0)
                 {
                     _leafInsertNew(n, key, value);
                     _count++;
+                    return;
                 }
+                // Release the old value, then store the new one (same arms as _leafInsertNew -
+                // see there for why a value type needs an explicit `.copy()` here).
+                _ = move n->values[s];
+                if const (is_unique(V))         n->values[s] = move value;
+                else if const (is_pointer(V))   n->values[s] = value;
+                else if const (is_primitive(V)) n->values[s] = value;
+                else                             n->values[s] = value.copy();
             }
         }
         else if const (!is_assignable(K)) compile_error("btree<K, V>.set(): key type K has a const field and cannot be assigned");

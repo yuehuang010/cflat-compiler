@@ -6216,6 +6216,137 @@ bool testTernaryArmKinds()
     return result;
 }
 
+int fpjoinR2Fn(int a) { return a + 1; }
+int fpjoinR2Fn2(int a) { return a + 2; }
+int fpjoinR2Check(void* p, int a)
+{
+    function<int(int)> f = (function<int(int)>)p;
+    return f(a);
+}
+
+bool testExplicitVoidCastOfPureFunctionJoins()
+{
+    bool result = true;
+    bool yes = true;
+    bool no = false;
+    void* ternary = (void*)(yes ? &fpjoinR2Fn : &fpjoinR2Fn2);
+    result &= Test("explicit void* cast of pure ?: join declaration",
+        fpjoinR2Check(ternary, 10), 11);
+    result &= Test("explicit void* cast of pure ?: join argument",
+        fpjoinR2Check((void*)(no ? &fpjoinR2Fn : &fpjoinR2Fn2), 10), 12);
+
+    function<int(int)> absent = nullptr;
+    function<int(int)> second = fpjoinR2Fn2;
+    void* coalesced = (void*)(absent ?? second);
+    result &= Test("explicit void* cast of pure ?? join declaration",
+        fpjoinR2Check(coalesced, 10), 12);
+    function<int(int)> first = fpjoinR2Fn;
+    result &= Test("explicit void* cast of pure ?? join argument",
+        fpjoinR2Check((void*)(first ?? second), 10), 11);
+    return result;
+}
+
+// FPJOIN2 accept set: a whole-join cast of two code arms stays legal for pointer, integer, and
+// function<> targets, and an explicit cast on the code arm still makes a mixed join compatible.
+bool testExplicitNonVoidCastOfPureFunctionJoins()
+{
+    bool result = true;
+    bool yes = true;
+    bool no = false;
+    int value = 7;
+    int* ip = &value;
+
+    int* pureInt = (int*)(yes ? &fpjoinR2Fn : &fpjoinR2Fn2);
+    char* pureChar = (char*)(no ? &fpjoinR2Fn : &fpjoinR2Fn2);
+    long pureLong = (long)(no ? &fpjoinR2Fn : &fpjoinR2Fn2);
+    function<int(int)> pureFunction =
+        (function<int(int)>)(no ? &fpjoinR2Fn : &fpjoinR2Fn2);
+    int* expectedInt = yes ? (int*)&fpjoinR2Fn : (int*)&fpjoinR2Fn2;
+    char* expectedChar = no ? (char*)&fpjoinR2Fn : (char*)&fpjoinR2Fn2;
+    long expectedLong = (long)(yes ? &fpjoinR2Fn2 : &fpjoinR2Fn);
+    result &= Test("FPJOIN2 pure int* cast selects first function",
+        pureInt == expectedInt, true);
+    result &= Test("FPJOIN2 pure char* cast selects second function",
+        pureChar == expectedChar, true);
+    result &= Test("FPJOIN2 pure long cast selects second function",
+        pureLong == expectedLong, true);
+    result &= Test("FPJOIN2 pure function<> cast calls second function",
+        pureFunction(10), 12);
+
+    function<int(int)> first = fpjoinR2Fn;
+    function<int(int)> second = fpjoinR2Fn2;
+    function<int(int)> pureCoalesced =
+        (function<int(int)>)(first ?? second);
+    result &= Test("FPJOIN2 pure ?? function<> cast calls left function",
+        pureCoalesced(10), 11);
+
+    int* codeArmTrue = yes ? ip : (int*)&fpjoinR2Fn;
+    int* codeArmFalse = no ? ip : (int*)&fpjoinR2Fn;
+    result &= Test("FPJOIN2 explicit code-arm cast keeps data arm", codeArmTrue == ip, true);
+    result &= Test("FPJOIN2 explicit code-arm cast selects code arm",
+        codeArmFalse == expectedInt, true);
+    return result;
+}
+
+int fpjoin2NestedPick(int* value, int* expected) { return value == expected ? 11 : 10; }
+int fpjoin2NestedPick(char* value, char* expected) { return value == expected ? 21 : 20; }
+int fpjoin2NestedPick(long value, long expected) { return value == expected ? 31 : 30; }
+int fpjoin2NestedPick(function<int(int)> value) { return 40 + value(10); }
+
+bool testExplicitCastOfNestedFunctionJoins()
+{
+    bool result = true;
+    bool yes = true;
+    bool no = false;
+    int value = 7;
+    int* ip = &value;
+
+    int* pureInt = (int*)(yes ? (no ? &fpjoinR2Fn : &fpjoinR2Fn2) : &fpjoinR2Fn);
+    char* pureChar = (char*)(yes ? (no ? &fpjoinR2Fn : &fpjoinR2Fn2) : &fpjoinR2Fn);
+    long pureLong = (long)(yes ? (no ? &fpjoinR2Fn2 : &fpjoinR2Fn) : &fpjoinR2Fn2);
+    function<int(int)> pureFunction = (function<int(int)>)
+        (yes ? (no ? &fpjoinR2Fn : &fpjoinR2Fn2) : &fpjoinR2Fn);
+    int* expectedInt = yes ? (no ? (int*)&fpjoinR2Fn : (int*)&fpjoinR2Fn2) : (int*)&fpjoinR2Fn;
+    char* expectedChar = yes ? (no ? (char*)&fpjoinR2Fn : (char*)&fpjoinR2Fn2) : (char*)&fpjoinR2Fn;
+    long expectedLong = (long)(yes ? (no ? &fpjoinR2Fn2 : &fpjoinR2Fn) : &fpjoinR2Fn2);
+    int* mixedArmCast = (int*)(yes ? (no ? ip : (int*)&fpjoinR2Fn2) : ip);
+    int* expectedArmCast = yes ? (no ? ip : (int*)&fpjoinR2Fn2) : ip;
+    int* mixedCondition = (int*)((no ? ip : &fpjoinR2Fn) ? ip : nullptr);
+    function<int(int)> first = nullptr;
+    function<int(int)> second = fpjoinR2Fn2;
+    function<int(int)> third = fpjoinR2Fn;
+    int* pureCoalesceInt = (int*)(first ?? (second ?? third));
+    char* pureCoalesceChar = (char*)(first ?? (second ?? third));
+    long pureCoalesceLong = (long)(first ?? (second ?? third));
+    function<int(int)> pureCoalesceFunction =
+        (function<int(int)>)(first ?? (second ?? third));
+    int* expectedCoalesceInt = (int*)(second ?? third);
+    char* expectedCoalesceChar = (char*)(second ?? third);
+    long expectedCoalesceLong = (long)(second ?? third);
+
+    result &= Test("FPJOIN2-R2 nested pure int* cast and overload",
+        fpjoin2NestedPick(pureInt, expectedInt), 11);
+    result &= Test("FPJOIN2-R2 nested pure char* cast and overload",
+        fpjoin2NestedPick(pureChar, expectedChar), 21);
+    result &= Test("FPJOIN2-R2 nested pure long cast and overload",
+        fpjoin2NestedPick(pureLong, expectedLong), 31);
+    result &= Test("FPJOIN2-R2 nested pure function<> cast and overload",
+        fpjoin2NestedPick(pureFunction), 52);
+    result &= Test("FPJOIN2-R2 nested join with a code-arm cast",
+        fpjoin2NestedPick(mixedArmCast, expectedArmCast), 11);
+    result &= Test("FPJOIN2-R2 mixed join in condition position",
+        mixedCondition == ip && fpjoin2NestedPick(mixedCondition, ip) == 11, true);
+    result &= Test("FPJOIN2-R2 nested pure ?? int* cast and overload",
+        fpjoin2NestedPick(pureCoalesceInt, expectedCoalesceInt), 11);
+    result &= Test("FPJOIN2-R2 nested pure ?? char* cast and overload",
+        fpjoin2NestedPick(pureCoalesceChar, expectedCoalesceChar), 21);
+    result &= Test("FPJOIN2-R2 nested pure ?? long cast and overload",
+        fpjoin2NestedPick(pureCoalesceLong, expectedCoalesceLong), 31);
+    result &= Test("FPJOIN2-R2 nested pure ?? function<> cast and overload",
+        fpjoin2NestedPick(pureCoalesceFunction), 52);
+    return result;
+}
+
 // T188: a closure arm joined with a named function or thin function<> arm of the same signature is
 // lifted into the closure form, in either order, for a capturing or a plain lambda.
 int t188Inc(int a) { return a + 1; }
@@ -8249,6 +8380,58 @@ bool testFunctionValueByValueTempDestroyedOnce()
     return result;
 }
 
+int parencallSelectedOverload = 0;
+int parencallStatementCalls = 0;
+int parencallClosureCalls = 0;
+int parencallSeven() { return 7; }
+int parencallChoose(int a, int b) { parencallSelectedOverload = 1; return a + b; }
+int parencallChoose(float a, float b) { parencallSelectedOverload = 2; return 90; }
+int parencallTriple(int x) { return x * 3; }
+int parencallCount() { parencallStatementCalls++; return 0; }
+struct ParencallValue { int value = default; };
+
+bool testParenthesizedCalleeCalls()
+{
+    bool result = true;
+    result &= Test("parencall named function +", (parencallSeven)() + 1, 8);
+
+    parencallClosureCalls = 0;
+    Lambda<int()> inner = () => { parencallClosureCalls++; return 7; };
+    result &= Test("parencall closure *", (inner)() * 2, 14);
+    result &= Test("parencall closure on right of +", 1 + (inner)(), 8);
+    int alone = (inner)();
+    result &= Test("parencall closure initializer", alone, 7);
+    parencallClosureCalls = 0;
+    (inner)();
+    result &= Test("parencall closure statement", parencallClosureCalls, 1);
+
+    parencallStatementCalls = 0;
+    function<int()> statement = parencallCount;
+    (statement)();
+    result &= Test("parencall statement call", parencallStatementCalls, 1);
+
+    parencallSelectedOverload = 0;
+    int multi = (parencallChoose)(3, 4) + 1;
+    result &= Test("parencall two args and overload", multi * 10 + parencallSelectedOverload, 81);
+
+    result &= Test("parencall nested callee", ((parencallSeven))() + 1, 8);
+    function<int(int)> fp = parencallTriple;
+    result &= Test("parencall function pointer variable", (fp)(3) - 1, 8);
+
+    int a = 2;
+    float b = 3.0f;
+    result &= Test("parencall int cast", (int)(a) + 1, 3);
+    result &= Test("parencall float cast", (float)(a) * b, 6.0f);
+    ParencallValue value = default;
+    value.value = 5;
+    ParencallValue copy = (ParencallValue)(value);
+    result &= Test("parencall struct cast", copy.value, 5);
+    ParencallValue* p = &value;
+    ParencallValue* q = (ParencallValue*)(p);
+    result &= Test("parencall pointer cast", q->value, 5);
+    return result;
+}
+
 extern int main(int argc, char** argv)
 {
     // The tooling regression harness passes one argument and calls this twice. The second call
@@ -8275,6 +8458,7 @@ extern int main(int argc, char** argv)
     total++; passed += testT370ConstAndAggregateViews() ? 1 : 0;
     total++; passed += testT370R2AcceptSet() ? 1 : 0;
     total++; passed += testExplicitFunctionPointer()   ? 1 : 0;
+    total++; passed += testParenthesizedCalleeCalls()   ? 1 : 0;
     total++; passed += testBareFunctionPointer()       ? 1 : 0;
     total++; passed += testFunctionPointerAsArgument() ? 1 : 0;
     total++; passed += testFunctionValueImplicitStructBorrow() ? 1 : 0;
@@ -8472,6 +8656,9 @@ extern int main(int argc, char** argv)
     total++; passed += testTernaryNativePointeeConstFunctionValues() ? 1 : 0;
     total++; passed += testInferTernaryVariadicFunctionPointer() ? 1 : 0;
     total++; passed += testTernaryArmKinds()               ? 1 : 0;
+    total++; passed += testExplicitVoidCastOfPureFunctionJoins() ? 1 : 0;
+    total++; passed += testExplicitNonVoidCastOfPureFunctionJoins() ? 1 : 0;
+    total++; passed += testExplicitCastOfNestedFunctionJoins() ? 1 : 0;
     total++; passed += testFunctionSlotAccepts()           ? 1 : 0;
     total++; passed += testFunctionSlotNullMacro()         ? 1 : 0;
     total++; passed += testFunctionSlotDataNullAccept()    ? 1 : 0;

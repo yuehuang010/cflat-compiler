@@ -652,7 +652,7 @@ typeName
 // A top-level const needs a declarator, so `(const T)` never opens a cast and `(const T)*`
 // always starts a type.
 castTypeName
-    : typeSpecifier* abstractDeclarator?
+    : typeSpecifier+ abstractDeclarator?
     | typeQualifier typeSpecifier* abstractDeclarator
     ;
 

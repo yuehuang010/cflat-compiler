@@ -1310,7 +1310,23 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                     && FuncPtrSignatureOf(got, gotSignature))
                     return !FuncPtrSignaturesProvablyDiffer(want, got);
             }
-            if (want.TypeName == got.TypeName && want.Pointer == got.Pointer) return true;
+            if (want.TypeName == got.TypeName && want.Pointer == got.Pointer)
+            {
+                if (!want.Pointer) return true;
+                const uint32_t sourceMask = got.PointeeConstMask();
+                const uint32_t targetMask = want.PointeeConstMask();
+                if ((sourceMask & ~targetMask) != 0) return false;
+                const uint32_t addedMask = targetMask & ~sourceMask;
+                const int depth = std::max(got.ValuePointerDepth(), want.ValuePointerDepth());
+                for (int level = 0; level < depth; ++level)
+                {
+                    if ((addedMask & TypeAndValue::ConstBitAt(level)) == 0) continue;
+                    const uint32_t higherLevels = TypeAndValue::ConstBitsBelow(depth)
+                        & ~TypeAndValue::ConstBitsThrough(level);
+                    if ((targetMask & higherLevels) != higherLevels) return false;
+                }
+                return true;
+            }
             if (want.Pointer && got.Pointer && (IsCxxDerivedToBasePointer(got, want)
                                                 || IsCxxDerivedToClangBasePointer(got, want)))
                 return true;                 // a public derived pointer converts to Base*
@@ -2006,6 +2022,11 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                     || (fixedArrayPointerParam
                         ? fixedArrayPointerCompatible(c, i + 1, want, (*argVars)[i])
                         : compatible(want, got));
+                // `&object` proves depth 1: it never binds a `T**` constructor parameter (clang).
+                if (compatibleArg && argVars != nullptr && i < argVars->size() && !want.IsCxxRefToPointer
+                    && !(want.IsRvalueRef && want.ElemPointer)
+                    && (*argVars)[i].AddressOfObjectDepthRefuses(want))
+                    { ok = false; break; }
                 // The slice ties like any by-value base, but refuses when C++ picks it.
                 if (compatibleArg && !want.Pointer && !got.Pointer && want.TypeName != got.TypeName
                     && IsCxxRecord(want.TypeName) && IsCxxDerivedToBaseValue(got, want, nullptr))
