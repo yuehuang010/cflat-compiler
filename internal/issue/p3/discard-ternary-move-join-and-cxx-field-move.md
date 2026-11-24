@@ -3,7 +3,7 @@
 Severity p3. Found by the T352 review (2026-10-20). The native `?:` move-join leaks (MIX19 residue: mixed
 string joins, nested all-move joins, string assignment from a join, struct-with-dtor `_ =` joins, bare
 `c ? move a : move b;` statements) were fixed in STRJOIN; legs Test/test_move.cb testStrjoinTernaryMoveJoin.
-The C++ `_ = move p->c` item was fixed in TERNREST (3c95a46e2).
+The C++ `_ = move p->c` item was fixed in TERNREST (c6d973843).
 
 3. Not fixed in MIX19 (by design, not a fix candidate). `_ = move o.raw;` where the user dtor deletes the raw field leaks.
    Root cause (MIX19): a raw `Val*` owns nothing (raw lifetimes are untracked, memory-safety-function-boundaries-only ruling).

@@ -312,11 +312,11 @@ copies (~12-13 GB).
 ## 2026-11-18 - grouped test_cpp_interop.cb: 11.9 GB cold
 
 After the grouping pass (95 import lines, 23 grouped runs; runs 4, 8, 14, 19 kept single, blocked by
-two grouping bugs, both fixed 2026-11-18: system-header-first groups 27a5911f1, dependency prelude 80a853e9a):
+two grouping bugs, both fixed 2026-11-18: system-header-first groups e1c9f2121, dependency prelude e1c9f2121):
 cold `-o` compile with a fresh CFLAT_CACHE_DIR, Mac Release, rc 0, peak footprint 11.9 GB, 121 header groups
 parsed (was ~20 GB cold on the one-import-per-line layout). The remaining cost is the dependency prelude copies
 and the four single-line runs; the full grouping waited on those two fixes.
 
 Reverted 2026-11-18: the grouped layout failed the cold header-parse budget (the dependency prelude
-re-parse, since fixed). Regrouped with that fix in 80a853e9a: 85 import lines (32 grouped), cold `-o` with a fresh
+re-parse, since fixed). Regrouped with that fix in e1c9f2121: 85 import lines (32 grouped), cold `-o` with a fresh
 CFLAT_CACHE_DIR peaks at 9.51 GB, 88 header groups, budget cold 1 / warm 0 met.

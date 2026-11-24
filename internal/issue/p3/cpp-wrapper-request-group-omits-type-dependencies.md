@@ -5,13 +5,13 @@
 The key defect is closed. Every request group built from a type owner now carries the dependency
 groups of the request that registered that type (`cxxTypeOwnerDependencyGroups_`, written by
 `NoteCxxTypeOwner`, read by `CollectCxxTypeOwnerGroups`), and the free-call wrapper
-(`__cflat_free_*`) collects owners recursively. Measured on master 496b9392e: `b * 4` on
+(`__cflat_free_*`) collects owners recursively. Measured on master e1c9f2121: `b * 4` on
 `ckab.Box<ckal.Leaf>` (free operator template in one header, Leaf in another import line) was
 keyed on the box header alone; two files pairing that header with two different `ckal::Leaf`
 headers shared the key and the second printed garbage (clang 22.00). Legs: "CACHE-KEY" in
 Test/test_cpp_interop_template.cb (int Leaf, 57150) and Test/test_cpp_interop_bridge.cb (double
 Leaf, 44750). The originally filed `true == bits[0]` wrapper was already keyed sfinae + vector on
-496b9392e.
+e1c9f2121.
 
 ## Still open: the refusal guard
 
